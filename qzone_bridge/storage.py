@@ -32,7 +32,7 @@ class StateStore:
 
     def write(self, state: BridgeState) -> None:
         payload = json.dumps(state.to_dict(), ensure_ascii=False, indent=2, sort_keys=True)
-        tmp = self.path.with_suffix(".tmp")
+        tmp = self.path.with_name(f"{self.path.name}.tmp.{secrets.token_hex(4)}")
         tmp.write_text(payload, encoding="utf-8")
         tmp.replace(self.path)
 
@@ -48,4 +48,3 @@ def ensure_state_secret(state: BridgeState) -> BridgeState:
         state.runtime.secret = secrets.token_urlsafe(32)
         state.runtime.started_at = state.runtime.started_at or now_iso()
     return state
-

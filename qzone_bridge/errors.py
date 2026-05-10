@@ -34,7 +34,11 @@ class QzoneParseError(QzoneBridgeError):
         super().__init__(message, code="QZONE_PARSE", detail=detail)
 
 
+class QzoneCookieAcquireError(QzoneBridgeError):
+    def __init__(self, message: str, *, detail=None):
+        super().__init__(message, code="QZONE_COOKIE", detail=detail)
+
+
 class DaemonUnavailableError(QzoneBridgeError):
     def __init__(self, message: str = "Qzone daemon is unavailable", *, detail=None):
         super().__init__(message, code="DAEMON_UNAVAILABLE", detail=detail)
-

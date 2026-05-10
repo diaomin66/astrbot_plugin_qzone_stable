@@ -31,6 +31,7 @@ def format_status(status: dict) -> str:
         "QQ空间状态",
         f"- daemon: {status.get('daemon_state', 'unknown')}",
         f"- login: {status.get('login_uin') or '-'}",
+        f"- source: {status.get('session_source') or '-'}",
         f"- cookie: {status.get('cookie_summary', '-')}",
         f"- needs_rebind: {status.get('needs_rebind', False)}",
         f"- last_ok: {status.get('last_ok_at') or '-'}",
