@@ -16,10 +16,10 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 from qzone_bridge.controller import QzoneDaemonController
-from qzone_bridge.errors import DaemonUnavailableError, QzoneBridgeError, QzoneCookieAcquireError
+from qzone_bridge.errors import DaemonUnavailableError, QzoneBridgeError, QzoneCookieAcquireError, QzoneNeedsRebind
 from qzone_bridge.models import FeedEntry
-from qzone_bridge.parser import normalize_uin, parse_cookie_text
 from qzone_bridge.onebot_cookie import fetch_cookie_text
+from qzone_bridge.parser import normalize_uin, parse_cookie_text
 from qzone_bridge.render import format_action_result, format_feed_detail, format_feed_list, format_status
 from qzone_bridge.settings import PluginSettings
 from qzone_bridge.utils import truncate
@@ -68,18 +68,36 @@ class QzoneStablePlugin(Star):
         return self._sender_id(event) in set(self.settings.admin_uins)
 
     def _error_text(self, exc: QzoneBridgeError) -> str:
-        detail = ""
-        if exc.detail:
-            detail = f"\n{exc.detail}"
-        return f"{exc.message}{detail}"
+        if not exc.detail:
+            return exc.message
+        if isinstance(exc.detail, dict):
+            parts: list[str] = []
+            status_code = exc.detail.get("status_code")
+            if status_code is not None:
+                parts.append(f"HTTP {status_code}")
+            location = exc.detail.get("location")
+            if location:
+                parts.append(f"跳转 {location}")
+            url = exc.detail.get("url")
+            if url:
+                parts.append(f"来源 {url}")
+            if parts:
+                return f"{exc.message}（{', '.join(parts)}）"
+        return f"{exc.message}\n{exc.detail}"
 
-    async def _ensure_daemon(self) -> None:
-        if self.settings.auto_start_daemon:
-            await self.controller.ensure_running()
-        else:
-            status = await self.controller.get_status()
+    async def _ensure_daemon(self, *, allow_needs_rebind: bool = False) -> None:
+        status = await self.controller.get_status()
+        if status.get("needs_rebind") and not allow_needs_rebind:
+            raise QzoneNeedsRebind("QQ空间登录失效，请重新绑定 Cookie")
+        if allow_needs_rebind:
             if status.get("daemon_state") != "ready":
-                raise DaemonUnavailableError("daemon 未就绪")
+                await self.controller.ensure_running()
+            return
+        if self.settings.auto_start_daemon:
+            if status.get("daemon_state") != "ready":
+                await self.controller.ensure_running()
+        elif status.get("daemon_state") != "ready":
+            raise DaemonUnavailableError("daemon 未运行")
 
     def _limit(self, limit: int | None) -> int:
         if not limit or limit <= 0:
@@ -146,7 +164,13 @@ class QzoneStablePlugin(Star):
     def _cookie_binding_hint(self) -> str:
         return "请确认 AstrBot 正在使用 aiocqhttp(OneBot v11) 平台，或手动使用 /qzone bind 绑定 Cookie。"
 
-    async def _auto_bind_cookie(self, event: AstrMessageEvent | None = None, *, force: bool = False, source: str = "aiocqhttp") -> dict[str, Any]:
+    async def _auto_bind_cookie(
+        self,
+        event: AstrMessageEvent | None = None,
+        *,
+        force: bool = False,
+        source: str = "aiocqhttp",
+    ) -> dict[str, Any]:
         async with self._get_cookie_lock():
             if not self.settings.auto_bind_cookie and not force:
                 raise QzoneCookieAcquireError("自动获取 Cookie 已关闭。请手动绑定。")
@@ -174,7 +198,13 @@ class QzoneStablePlugin(Star):
             payload = await self.controller.bind_cookie_local(cookie_text, uin=cookie_uin, source=source)
             return payload
 
-    async def _ensure_cookie_ready(self, event: AstrMessageEvent | None = None, *, force: bool = False, source: str = "aiocqhttp") -> dict[str, Any] | None:
+    async def _ensure_cookie_ready(
+        self,
+        event: AstrMessageEvent | None = None,
+        *,
+        force: bool = False,
+        source: str = "aiocqhttp",
+    ) -> dict[str, Any] | None:
         try:
             status = await self.controller.get_status()
         except QzoneBridgeError:
@@ -274,8 +304,7 @@ class QzoneStablePlugin(Star):
             yield event.plain_result("仅管理员可解绑。")
             return
         try:
-            await self._ensure_daemon()
-            payload = await self.controller.unbind()
+            payload = await self.controller.unbind_local()
         except QzoneBridgeError as exc:
             yield event.plain_result(self._error_text(exc))
             return
@@ -284,8 +313,8 @@ class QzoneStablePlugin(Star):
     @qzone.command("feed")
     async def qzone_feed(self, event: AstrMessageEvent, hostuin: int = 0, limit: int = 0, cursor: str = ""):
         try:
-            await self._ensure_daemon()
             await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
             payload = await self.controller.list_feeds(
                 hostuin=hostuin,
                 limit=self._limit(limit),
@@ -301,8 +330,8 @@ class QzoneStablePlugin(Star):
     @qzone.command("detail")
     async def qzone_detail(self, event: AstrMessageEvent, hostuin: int, fid: str, appid: int = 311):
         try:
-            await self._ensure_daemon()
             await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
             payload = await self.controller.detail_feed(hostuin=hostuin, fid=fid, appid=appid)
         except QzoneBridgeError as exc:
             yield event.plain_result(self._error_text(exc))
@@ -315,8 +344,8 @@ class QzoneStablePlugin(Star):
             yield event.plain_result("仅管理员可发说说。")
             return
         try:
-            await self._ensure_daemon()
             await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
             payload = await self.controller.publish_post(content=content)
         except QzoneBridgeError as exc:
             yield event.plain_result(self._error_text(exc))
@@ -329,8 +358,8 @@ class QzoneStablePlugin(Star):
             yield event.plain_result("仅管理员可评论。")
             return
         try:
-            await self._ensure_daemon()
             await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
             payload = await self.controller.comment_post(hostuin=hostuin, fid=fid, content=content)
         except QzoneBridgeError as exc:
             yield event.plain_result(self._error_text(exc))
@@ -343,8 +372,8 @@ class QzoneStablePlugin(Star):
             yield event.plain_result("仅管理员可点赞。")
             return
         try:
-            await self._ensure_daemon()
             await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
             payload = await self.controller.like_post(hostuin=hostuin, fid=fid, appid=appid, unlike=unlike)
         except QzoneBridgeError as exc:
             yield event.plain_result(self._error_text(exc))
@@ -379,8 +408,8 @@ class QzoneStablePlugin(Star):
             scope (string): self 或 profile。
         """
         try:
-            await self._ensure_daemon()
             await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
             payload = await self.controller.list_feeds(
                 hostuin=hostuin,
                 limit=self._limit(limit),
@@ -403,8 +432,8 @@ class QzoneStablePlugin(Star):
             appid (number): 应用 id，默认 311。
         """
         try:
-            await self._ensure_daemon()
             await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
             payload = await self.controller.detail_feed(hostuin=hostuin, fid=fid, appid=appid)
         except QzoneBridgeError as exc:
             yield event.plain_result(self._error_text(exc))
@@ -423,12 +452,12 @@ class QzoneStablePlugin(Star):
         if not self._is_admin(event):
             yield event.plain_result("仅管理员可发布说说。")
             return
-        if not confirm:
+        if self.settings.preview_writes and not confirm:
             yield event.plain_result(f"待发布草稿: {truncate(content, 120)}。确认后将执行。")
             return
         try:
-            await self._ensure_daemon()
             await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
             payload = await self.controller.publish_post(content=content, sync_weibo=sync_weibo)
         except QzoneBridgeError as exc:
             yield event.plain_result(self._error_text(exc))
@@ -459,14 +488,14 @@ class QzoneStablePlugin(Star):
         if not self._is_admin(event):
             yield event.plain_result("仅管理员可评论。")
             return
-        if not confirm:
+        if self.settings.preview_writes and not confirm:
             yield event.plain_result(
                 f"待评论草稿: hostuin={hostuin}, fid={fid}, content={truncate(content, 120)}。确认后将执行。"
             )
             return
         try:
-            await self._ensure_daemon()
             await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
             payload = await self.controller.comment_post(
                 hostuin=hostuin,
                 fid=fid,
@@ -501,13 +530,13 @@ class QzoneStablePlugin(Star):
         if not self._is_admin(event):
             yield event.plain_result("仅管理员可点赞。")
             return
-        if not confirm:
+        if self.settings.preview_writes and not confirm:
             action = "取消点赞" if unlike else "点赞"
             yield event.plain_result(f"待执行草稿: {action} hostuin={hostuin}, fid={fid}。确认后将执行。")
             return
         try:
-            await self._ensure_daemon()
             await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
             payload = await self.controller.like_post(hostuin=hostuin, fid=fid, appid=appid, unlike=unlike)
         except QzoneBridgeError as exc:
             yield event.plain_result(self._error_text(exc))
@@ -515,4 +544,7 @@ class QzoneStablePlugin(Star):
         yield event.plain_result(format_action_result("点赞成功", payload))
 
     async def terminate(self):
-        await self.controller.close()
+        try:
+            await self.controller.close()
+        except Exception as exc:
+            logger.exception("qzone controller close failed: %s", exc)

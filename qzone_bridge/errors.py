@@ -13,6 +13,11 @@ class QzoneBridgeError(Exception):
         self.detail = detail
 
 
+class QzoneCookieAcquireError(QzoneBridgeError):
+    def __init__(self, message: str = "无法获取 QQ 空间 Cookie", *, detail=None):
+        super().__init__(message, code="QZONE_COOKIE_ACQUIRE", detail=detail)
+
+
 class QzoneAuthError(QzoneBridgeError):
     def __init__(self, message: str, *, detail=None):
         super().__init__(message, code="QZONE_AUTH", detail=detail)

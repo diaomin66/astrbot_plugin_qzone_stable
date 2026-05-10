@@ -41,6 +41,20 @@ def _pick(mapping: dict[str, Any], key: str, default: Any) -> Any:
     return default
 
 
+def _as_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(value)
+
+
 @dataclass(slots=True)
 class PluginSettings:
     daemon_port: int = 18999
@@ -71,11 +85,11 @@ class PluginSettings:
             start_timeout=float(_pick(mapping, "start_timeout", 20.0) or 20.0),
             public_feed_limit=int(_pick(mapping, "public_feed_limit", 5) or 5),
             max_feed_limit=int(_pick(mapping, "max_feed_limit", 20) or 20),
-            auto_start_daemon=bool(_pick(mapping, "auto_start_daemon", True)),
-            auto_bind_cookie=bool(_pick(mapping, "auto_bind_cookie", True)),
+            auto_start_daemon=_as_bool(_pick(mapping, "auto_start_daemon", True), True),
+            auto_bind_cookie=_as_bool(_pick(mapping, "auto_bind_cookie", True), True),
             cookie_domain=str(_pick(mapping, "cookie_domain", "user.qzone.qq.com") or "user.qzone.qq.com").strip()
             or "user.qzone.qq.com",
             admin_uins=[int(v) for v in admin_uins if str(v).isdigit()],
             user_agent=str(_pick(mapping, "user_agent", DEFAULT_USER_AGENT) or DEFAULT_USER_AGENT),
-            preview_writes=bool(_pick(mapping, "preview_writes", True)),
+            preview_writes=_as_bool(_pick(mapping, "preview_writes", True), True),
         )

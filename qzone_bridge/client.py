@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 
-from .errors import QzoneAuthError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
+from .errors import QzoneNeedsRebind, QzoneParseError, QzoneRequestError
 from .models import FeedEntry, SessionState
 from .parser import (
     cookie_header,
@@ -18,8 +18,8 @@ from .parser import (
     compute_unikey,
     extract_feed_entry,
     extract_feed_page,
-    normalize_cookie_fields,
     normalize_uin,
+    normalize_cookie_fields,
     parse_index_html,
     parse_profile_html,
     unwrap_payload,
@@ -28,6 +28,9 @@ from .render import cookie_summary
 from .utils import extract_callback_json, now_iso
 
 log = logging.getLogger(__name__)
+
+AUTH_ERROR_CODES = {-3000}
+AUTH_ERROR_KEYWORDS = ("登录", "失效", "请先登录", "skey", "g_tk", "cookie", "expired", "login")
 
 
 @dataclass(slots=True)
@@ -50,7 +53,7 @@ class QzoneClient:
         max_retries: int = 3,
     ) -> None:
         self.session = session
-        self.session.cookies = normalize_cookie_fields(self.session.cookies)
+        self._normalize_session()
         self.timeout = timeout
         self.max_retries = max(1, int(max_retries))
         self.user_agent = user_agent or (
@@ -65,6 +68,10 @@ class QzoneClient:
             headers={"User-Agent": self.user_agent},
         )
         self.feed_cache: dict[tuple[int, str], FeedEntry] = {}
+
+    def _normalize_session(self) -> None:
+        self.session.cookies = normalize_cookie_fields(dict(self.session.cookies or {}))
+        self.session.uin = normalize_uin(self.session.cookies, override=self.session.uin) or self.session.uin
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -90,12 +97,31 @@ class QzoneClient:
 
     def update_session(self, session: SessionState) -> None:
         self.session = session
+        self._normalize_session()
+
+    @staticmethod
+    def _payload_needs_rebind(code: int, message: str) -> bool:
+        if code in AUTH_ERROR_CODES:
+            return True
+        normalized = message.lower()
+        return any(keyword in message or keyword in normalized for keyword in AUTH_ERROR_KEYWORDS)
+
+    @staticmethod
+    def _response_detail(response: httpx.Response) -> dict[str, Any]:
+        detail: dict[str, Any] = {
+            "status_code": response.status_code,
+            "url": str(response.request.url),
+        }
+        location = response.headers.get("location") or response.headers.get("Location")
+        if location:
+            detail["location"] = location
+        return detail
 
     def _persist_cookie_response(self, response: httpx.Response) -> None:
         for key, value in response.cookies.items():
             if value is not None:
                 self.session.cookies[key] = value
-        self.session.cookies = normalize_cookie_fields(self.session.cookies)
+        self.session.cookies = normalize_cookie_fields(dict(self.session.cookies))
         if self.session.cookies:
             self.session.updated_at = now_iso()
 
@@ -146,7 +172,7 @@ class QzoneClient:
         if login_required and not self.session.cookies:
             raise QzoneNeedsRebind()
         if login_required and self.gtk == 0:
-            raise QzoneNeedsRebind("Cookie 中缺少 p_skey/skey，且没有可用的 g_tk/bkn，无法访问 QQ 空间")
+            raise QzoneNeedsRebind("Cookie 中缺少 p_skey 或 skey，无法计算 g_tk")
 
         params = self._merge_params(params, hostuin=hostuin, attach_token=attach_token)
         last_exc: Exception | None = None
@@ -161,10 +187,16 @@ class QzoneClient:
                     headers=self._headers(referer=referer, origin=origin),
                 )
                 self._persist_cookie_response(response)
-                if response.status_code in (302, 401, 403):
-                    raise QzoneAuthError(
-                        f"QQ空间返回登录失效状态码 {response.status_code}",
-                        detail={"status_code": response.status_code, "url": url},
+                if response.status_code in (301, 302, 303, 307, 308, 401):
+                    raise QzoneNeedsRebind(
+                        "QQ空间登录失效，请重新绑定 Cookie",
+                        detail=self._response_detail(response),
+                    )
+                if response.status_code == 403:
+                    raise QzoneRequestError(
+                        "QQ空间访问受限或权限不足",
+                        status_code=response.status_code,
+                        detail=self._response_detail(response),
                     )
                 if response.status_code == 429:
                     raise QzoneRequestError(
@@ -246,11 +278,16 @@ class QzoneClient:
         if isinstance(payload, dict):
             for key in ("ret", "code", "err", "error"):
                 if key in payload and payload.get(key) not in (0, "0", None):
-                    code = int(payload.get(key) or 0)
+                    raw_code = payload.get(key)
+                    try:
+                        code = int(raw_code or 0)
+                    except (TypeError, ValueError):
+                        code = 0
                     message = str(payload.get("msg") or payload.get("message") or payload.get("text") or "")
-                    if code in (-3000, -10000):
+                    if self._payload_needs_rebind(code, message):
                         raise QzoneNeedsRebind(message or "QQ空间登录态已失效", detail=payload)
-                    raise QzoneRequestError(message or f"QQ空间返回错误码 {code}", status_code=response.status_code, detail=payload)
+                    code_text = raw_code if raw_code not in (None, "") else code
+                    raise QzoneRequestError(message or f"QQ空间返回错误码 {code_text}", status_code=response.status_code, detail=payload)
         return payload if isinstance(payload, dict) else {"data": payload}
 
     def _extract_index_or_profile(self, response_text: str, *, profile: bool = False) -> dict[str, Any]:
@@ -470,6 +507,7 @@ class QzoneClient:
     def status_snapshot(self) -> dict[str, Any]:
         return {
             "login_uin": self.login_uin,
+            "session_source": self.session.source,
             "cookie_summary": self.cookie_summary(),
             "cookie_count": self.cookie_count,
             "needs_rebind": self.session.needs_rebind or not bool(self.session.cookies),

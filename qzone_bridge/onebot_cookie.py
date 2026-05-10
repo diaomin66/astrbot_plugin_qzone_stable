@@ -1,4 +1,4 @@
-"""Helpers for acquiring QQ空间 cookies from OneBot clients."""
+"""Helpers for acquiring QQ 空间 cookies from OneBot clients."""
 
 from __future__ import annotations
 
@@ -335,29 +335,27 @@ async def fetch_cookie_text(bot: Any, *, domain: str) -> str:
     login_uin: int | None = None
     for action in COOKIE_ACTIONS:
         for candidate_domain in iter_cookie_domains(domain):
-            for call_kwargs in (
-                {"domain": candidate_domain},
-                {},
-            ):
+            for call_kwargs in ({"domain": candidate_domain}, {}):
                 try:
                     payload = await call_onebot_action(bot, action, **call_kwargs)
                 except Exception:
                     continue
                 cookie_text = extract_cookie_text(payload)
-                if cookie_text:
-                    try:
-                        cookies = parse_cookie_text(cookie_text)
-                    except Exception:
-                        cookies = {}
-                    if not normalize_uin(cookies):
-                        if login_uin is None:
-                            login_uin = await fetch_login_uin(bot)
-                        if login_uin:
-                            cookie_text = _inject_login_uin(cookie_text, login_uin)
-                            try:
-                                cookies = parse_cookie_text(cookie_text)
-                            except Exception:
-                                cookies = {}
-                    if normalize_uin(cookies) and cookie_gtk(cookies):
-                        return cookie_header(cookies)
+                if not cookie_text:
+                    continue
+                try:
+                    cookies = parse_cookie_text(cookie_text)
+                except Exception:
+                    cookies = {}
+                if not normalize_uin(cookies):
+                    if login_uin is None:
+                        login_uin = await fetch_login_uin(bot)
+                    if login_uin:
+                        cookie_text = _inject_login_uin(cookie_text, login_uin)
+                        try:
+                            cookies = parse_cookie_text(cookie_text)
+                        except Exception:
+                            cookies = {}
+                if normalize_uin(cookies) and cookie_gtk(cookies):
+                    return cookie_header(cookies)
     return ""
