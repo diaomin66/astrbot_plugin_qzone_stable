@@ -1,0 +1,63 @@
+{
+  "daemon_port": {
+    "description": "Local daemon port",
+    "type": "int",
+    "default": 18999,
+    "hint": "守护进程监听的本地端口，默认 18999。"
+  },
+  "keepalive_interval": {
+    "description": "Keepalive interval",
+    "type": "int",
+    "default": 120,
+    "hint": "守护进程的保活间隔，单位秒。"
+  },
+  "request_timeout": {
+    "description": "Request timeout",
+    "type": "float",
+    "default": 15.0,
+    "hint": "向 QQ 空间和 daemon 发请求的超时时间。"
+  },
+  "start_timeout": {
+    "description": "Startup timeout",
+    "type": "float",
+    "default": 20.0,
+    "hint": "等待 daemon 启动成功的最长时间。"
+  },
+  "public_feed_limit": {
+    "description": "Default feed limit",
+    "type": "int",
+    "default": 5,
+    "hint": "未指定条数时，默认返回的说说数量。"
+  },
+  "max_feed_limit": {
+    "description": "Max feed limit",
+    "type": "int",
+    "default": 20,
+    "hint": "单次最多允许拉取的说说数量。"
+  },
+  "auto_start_daemon": {
+    "description": "Auto start daemon",
+    "type": "bool",
+    "default": true,
+    "hint": "是否在第一次使用时自动启动本地 daemon。"
+  },
+  "admin_uins": {
+    "description": "Admin QQ numbers",
+    "type": "text",
+    "default": "",
+    "hint": "可选，多个 QQ 号用英文逗号分隔；这些账号将被当作管理员。"
+  },
+  "user_agent": {
+    "description": "Custom user-agent",
+    "type": "text",
+    "default": "",
+    "hint": "可选，自定义 QQ 空间请求头里的 User-Agent。"
+  },
+  "preview_writes": {
+    "description": "Preview write tools",
+    "type": "bool",
+    "default": true,
+    "hint": "LLM 工具写操作是否默认先输出草稿预览。"
+  }
+}
+

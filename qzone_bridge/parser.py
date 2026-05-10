@@ -1,0 +1,276 @@
+"""Parsing helpers for QQ空间 payloads."""
+
+from __future__ import annotations
+
+import json
+import re
+from typing import Any
+
+from .models import FeedEntry
+from .utils import entire_closing, extract_scripts, firstn, json_loads, truncate
+
+
+def _dig(value: Any, *keys: str) -> Any:
+    current = value
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        if key in current:
+            current = current[key]
+            continue
+        return None
+    return current
+
+
+def _text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, list):
+        return "".join(_text(item) for item in value)
+    if isinstance(value, dict):
+        for key in ("summary", "content", "text", "msg", "title"):
+            if key in value:
+                result = _text(value.get(key))
+                if result:
+                    return result
+        return ""
+    return str(value)
+
+
+def parse_cookie_text(cookie_text: str) -> dict[str, str]:
+    cookie_text = cookie_text.strip()
+    if not cookie_text:
+        return {}
+    if cookie_text.startswith("{") or cookie_text.startswith("["):
+        payload = json.loads(cookie_text)
+        if isinstance(payload, dict):
+            return {str(k): str(v) for k, v in payload.items()}
+        raise ValueError("cookie JSON must be an object")
+
+    cookie_text = cookie_text.replace("\n", ";")
+    cookie_text = cookie_text.replace("\r", ";")
+    if cookie_text.lower().startswith("cookie:"):
+        cookie_text = cookie_text.split(":", 1)[1].strip()
+
+    cookies: dict[str, str] = {}
+    for part in cookie_text.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"')
+        if key:
+            cookies[key] = value
+    return cookies
+
+
+def normalize_uin(cookies: dict[str, str], override: int | None = None) -> int:
+    if override:
+        return int(override)
+    candidates = [
+        cookies.get("uin"),
+        cookies.get("p_uin"),
+        cookies.get("ptui_loginuin"),
+        cookies.get("luin"),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        cleaned = str(candidate).strip().lstrip("oO")
+        if cleaned.isdigit():
+            return int(cleaned)
+    return 0
+
+
+def cookie_header(cookies: dict[str, str]) -> str:
+    return "; ".join(f"{key}={value}" for key, value in cookies.items())
+
+
+def compute_unikey(appid: int, hostuin: int, fid: str) -> str:
+    if appid == 311:
+        return f"https://user.qzone.qq.com/{hostuin}/mood/{fid}"
+    return f"https://user.qzone.qq.com/{hostuin}/app/{appid}/{fid}"
+
+
+def topic_id(appid: int, hostuin: int, fid: str, created_at: int = 0) -> str:
+    if appid == 311:
+        return f"{hostuin}_{fid}__1"
+    return f"{hostuin}_{created_at}"
+
+
+def parse_index_html(html_text: str) -> dict[str, Any]:
+    scripts = extract_scripts(html_text)
+    script = firstn(scripts, lambda item: "shine0callback" in item)
+    if not script:
+        raise ValueError("index page script not found")
+
+    match = re.search(r'window\.shine0callback.*return "([0-9a-f]+?)";', script)
+    if not match:
+        raise ValueError("qzonetoken not found")
+    qzonetoken = match.group(1)
+
+    match = re.search(r"var FrontPage =.*?data\s*:\s*\{", script, re.S)
+    if not match:
+        raise ValueError("index page data not found")
+    data = script[match.end() - 1 : match.end() + entire_closing(script[match.end() - 1 :])]
+    payload = json_loads(data)
+    if not isinstance(payload, dict):
+        raise ValueError("unexpected index payload")
+    if isinstance(payload.get("data"), dict):
+        payload["data"]["qzonetoken"] = qzonetoken
+    else:
+        payload["qzonetoken"] = qzonetoken
+    return payload
+
+
+def parse_profile_html(html_text: str) -> dict[str, Any]:
+    scripts = extract_scripts(html_text)
+    script = firstn(scripts, lambda item: "shine0callback" in item)
+    if not script:
+        raise ValueError("profile page script not found")
+
+    match = re.search(r'window\.shine0callback.*return "([0-9a-f]+?)";', script)
+    if not match:
+        raise ValueError("profile qzonetoken not found")
+    qzonetoken = match.group(1)
+
+    match = re.search(r"var FrontPage =.*?data\s*:\s*\[", script, re.S)
+    if not match:
+        raise ValueError("profile page data not found")
+    data = script[match.end() - 1 : match.end() + entire_closing(script[match.end() - 1 :], "[")]
+    data = re.sub(r",,\]$", "]", data)
+    payload = json_loads(data)
+    if not isinstance(payload, list):
+        raise ValueError("unexpected profile payload")
+    if len(payload) < 2:
+        raise ValueError("profile payload incomplete")
+    info = unwrap_payload(payload[0]) if isinstance(payload[0], dict) else payload[0]
+    feedpage = unwrap_payload(payload[1]) if isinstance(payload[1], dict) else payload[1]
+    return {"info": info, "feedpage": feedpage, "qzonetoken": qzonetoken}
+
+
+def unwrap_payload(payload: Any) -> Any:
+    if isinstance(payload, dict) and "data" in payload and payload["data"] is not None:
+        return payload["data"]
+    return payload
+
+
+def extract_hostuin(feed_item: dict[str, Any], default: int = 0) -> int:
+    candidate = _dig(feed_item, "userinfo", "uin")
+    if candidate is None:
+        candidate = _dig(feed_item, "user", "uin")
+    if candidate is None:
+        candidate = _dig(feed_item, "userinfo", "user", "uin")
+    if candidate is None:
+        candidate = default
+    try:
+        return int(candidate or 0)
+    except Exception:
+        return default
+
+
+def extract_fid(feed_item: dict[str, Any]) -> str:
+    candidates = [
+        feed_item.get("fid"),
+        feed_item.get("cellid"),
+        _dig(feed_item, "id", "cellid"),
+        _dig(feed_item, "common", "ugcrightkey"),
+        _dig(feed_item, "common", "ugckey"),
+    ]
+    for candidate in candidates:
+        if candidate:
+            return str(candidate)
+    return ""
+
+
+def extract_summary_text(feed_item: dict[str, Any]) -> str:
+    candidates = [
+        _dig(feed_item, "summary", "summary"),
+        _text(feed_item.get("summary")),
+        _dig(feed_item, "original", "summary", "summary"),
+        _text(feed_item.get("content")),
+        _text(feed_item.get("text")),
+    ]
+    for candidate in candidates:
+        if candidate:
+            return truncate(str(candidate).strip(), 500)
+    return ""
+
+
+def extract_feed_entry(feed_item: dict[str, Any], *, default_hostuin: int = 0) -> FeedEntry:
+    common = feed_item.get("common") or feed_item.get("cell_comm") or {}
+    if not isinstance(common, dict):
+        common = {}
+    userinfo = feed_item.get("userinfo") or feed_item.get("user") or {}
+    if not isinstance(userinfo, dict):
+        userinfo = {}
+    like = feed_item.get("like") or {}
+    if not isinstance(like, dict):
+        like = {}
+    comment = feed_item.get("comment") or {}
+    if not isinstance(comment, dict):
+        comment = {}
+    operation = feed_item.get("operation") or {}
+    if not isinstance(operation, dict):
+        operation = {}
+    original = feed_item.get("original") or {}
+    if not isinstance(original, dict):
+        original = {}
+
+    hostuin = extract_hostuin(feed_item, default_hostuin)
+    appid = int(common.get("appid") or feed_item.get("appid") or 311)
+    fid = extract_fid(feed_item)
+    created_at = int(common.get("time") or feed_item.get("abstime") or 0)
+    summary = extract_summary_text(feed_item)
+    if not summary:
+        summary = extract_summary_text(original)
+
+    curkey = str(
+        common.get("curkey")
+        or common.get("curlikekey")
+        or feed_item.get("curkey")
+        or feed_item.get("curlikekey")
+        or ""
+    )
+    unikey = compute_unikey(appid, hostuin, fid)
+    topic = topic_id(appid, hostuin, fid, created_at)
+    nickname = str(userinfo.get("nickname") or userinfo.get("name") or "")
+    like_count = int(like.get("num") or like.get("likeNum") or like.get("count") or 0)
+    comment_count = int(comment.get("num") or comment.get("commentcount") or 0)
+    liked = bool(like.get("isliked") or like.get("ismylike") or False)
+    busi_param = operation.get("busi_param") or {}
+    if not isinstance(busi_param, dict):
+        busi_param = {}
+
+    return FeedEntry(
+        hostuin=hostuin,
+        fid=fid,
+        appid=appid,
+        summary=summary,
+        nickname=nickname,
+        created_at=created_at,
+        like_count=like_count,
+        comment_count=comment_count,
+        liked=liked,
+        curkey=curkey,
+        unikey=unikey,
+        busi_param=busi_param,
+        topic_id=topic,
+        raw=feed_item,
+    )
+
+
+def extract_feed_page(payload: dict[str, Any], *, default_hostuin: int = 0) -> tuple[dict[str, Any], list[FeedEntry]]:
+    feedpage = payload.get("feedpage") if isinstance(payload.get("feedpage"), dict) else payload
+    if not isinstance(feedpage, dict):
+        return {}, []
+    raw_feeds = feedpage.get("vFeeds") or feedpage.get("vfeeds") or []
+    if not isinstance(raw_feeds, list):
+        raw_feeds = []
+    items = [extract_feed_entry(item, default_hostuin=default_hostuin) for item in raw_feeds if isinstance(item, dict)]
+    return feedpage, items
