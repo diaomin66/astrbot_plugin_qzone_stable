@@ -50,6 +50,8 @@ class PluginSettings:
     public_feed_limit: int = 5
     max_feed_limit: int = 20
     auto_start_daemon: bool = True
+    auto_bind_cookie: bool = True
+    cookie_domain: str = "user.qzone.qq.com"
     admin_uins: list[int] = field(default_factory=list)
     user_agent: str = DEFAULT_USER_AGENT
     preview_writes: bool = True
@@ -70,6 +72,9 @@ class PluginSettings:
             public_feed_limit=int(_pick(mapping, "public_feed_limit", 5) or 5),
             max_feed_limit=int(_pick(mapping, "max_feed_limit", 20) or 20),
             auto_start_daemon=bool(_pick(mapping, "auto_start_daemon", True)),
+            auto_bind_cookie=bool(_pick(mapping, "auto_bind_cookie", True)),
+            cookie_domain=str(_pick(mapping, "cookie_domain", "user.qzone.qq.com") or "user.qzone.qq.com").strip()
+            or "user.qzone.qq.com",
             admin_uins=[int(v) for v in admin_uins if str(v).isdigit()],
             user_agent=str(_pick(mapping, "user_agent", DEFAULT_USER_AGENT) or DEFAULT_USER_AGENT),
             preview_writes=bool(_pick(mapping, "preview_writes", True)),

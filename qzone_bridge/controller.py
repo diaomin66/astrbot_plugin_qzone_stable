@@ -13,7 +13,8 @@ from typing import Any
 import httpx
 
 from .errors import DaemonUnavailableError, QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
-from .models import BridgeState
+from .models import BridgeState, SessionState
+from .parser import normalize_uin, parse_cookie_text
 from .protocol import SECRET_HEADER
 from .storage import StateStore, ensure_state_secret
 from .utils import now_iso
@@ -40,6 +41,7 @@ class QzoneDaemonController:
         start_timeout: float = 20.0,
         keepalive_interval: int = 120,
         user_agent: str = "",
+        auto_start_daemon: bool = True,
     ) -> None:
         self.plugin_root = plugin_root
         self.data_dir = data_dir
@@ -49,19 +51,20 @@ class QzoneDaemonController:
         self.start_timeout = start_timeout
         self.keepalive_interval = keepalive_interval
         self.user_agent = user_agent
+        self.auto_start_daemon = auto_start_daemon
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(request_timeout), trust_env=False)
         self._lock = asyncio.Lock()
         self._process: subprocess.Popen | None = None
 
     def _runtime(self):
-        state = ensure_state_secret(self.store.read())
+        state = self.store.read()
+        changed = not bool(state.runtime.secret)
+        state = ensure_state_secret(state)
         if not state.runtime.daemon_port:
             state.runtime.daemon_port = self.default_port
-        if not state.runtime.secret:
-            import secrets
-
-            state.runtime.secret = secrets.token_urlsafe(32)
-        self.store.write(state)
+            changed = True
+        if changed:
+            self.store.write(state)
         return state.runtime
 
     def _base_url(self, port: int | None = None) -> str:
@@ -125,11 +128,15 @@ class QzoneDaemonController:
 
             if not _port_is_free(port):
                 candidate = port
+                found = False
                 for _ in range(32):
                     candidate += 1
                     if _port_is_free(candidate):
                         port = candidate
+                        found = True
                         break
+                if not found:
+                    raise DaemonUnavailableError("没有可用的本地端口启动 daemon")
                 state = self.store.read()
                 state.runtime.daemon_port = port
                 self.store.write(state)
@@ -164,7 +171,12 @@ class QzoneDaemonController:
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
     ) -> Any:
-        await self.ensure_running()
+        if self.auto_start_daemon:
+            await self.ensure_running()
+        else:
+            runtime = self._runtime()
+            if not await self._probe_health(runtime.daemon_port):
+                raise DaemonUnavailableError("daemon 未运行")
         runtime = self._runtime()
         response = await self._client.request(
             method,
@@ -196,7 +208,7 @@ class QzoneDaemonController:
         runtime = state.runtime
         daemon_state = "offline"
         if runtime.daemon_port and await self._probe_health(runtime.daemon_port):
-            daemon_state = "ready"
+            daemon_state = "needs_rebind" if state.session.needs_rebind or not bool(state.session.cookies) else "ready"
         elif state.session.cookies:
             daemon_state = "degraded"
         return {
@@ -207,6 +219,7 @@ class QzoneDaemonController:
             "started_at": runtime.started_at,
             "last_seen_at": runtime.last_seen_at,
             "login_uin": state.session.uin,
+            "session_source": state.session.source,
             "cookie_summary": self.cookie_summary(state.session.cookies),
             "cookie_count": len(state.session.cookies),
             "needs_rebind": state.session.needs_rebind or not bool(state.session.cookies),
@@ -227,6 +240,36 @@ class QzoneDaemonController:
 
     async def bind_cookie(self, cookie_text: str, *, uin: int = 0, source: str = "manual") -> dict[str, Any]:
         return await self._request("POST", "/bind", json_body={"cookie_text": cookie_text, "uin": uin, "source": source})
+
+    async def bind_cookie_local(self, cookie_text: str, *, uin: int = 0, source: str = "manual") -> dict[str, Any]:
+        """Bind cookies directly into the persistent store, with daemon sync when available."""
+
+        try:
+            return await self.bind_cookie(cookie_text, uin=uin, source=source)
+        except DaemonUnavailableError:
+            cookies = parse_cookie_text(cookie_text)
+            if not cookies:
+                raise QzoneParseError("Cookie 为空，无法绑定")
+            resolved_uin = normalize_uin(cookies, override=uin)
+            if not resolved_uin:
+                raise QzoneParseError("Cookie 中未找到 uin / p_uin，请补齐后重试")
+
+            state = self.store.read()
+            runtime = self._runtime()
+            state.runtime = runtime
+            state.session = SessionState(
+                uin=resolved_uin,
+                cookies=cookies,
+                qzonetokens={},
+                source=source,
+                updated_at=now_iso(),
+                last_ok_at="",
+                last_error=None,
+                revision=state.session.revision + 1,
+                needs_rebind=False,
+            )
+            self.store.write(state)
+            return await self.get_status()
 
     async def unbind(self) -> dict[str, Any]:
         return await self._request("POST", "/unbind", json_body={})

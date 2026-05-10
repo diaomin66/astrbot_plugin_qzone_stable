@@ -1,4 +1,4 @@
-"""Process entry point for the QQ??? daemon."""
+"""Process entry point for the Qzone daemon."""
 
 from __future__ import annotations
 

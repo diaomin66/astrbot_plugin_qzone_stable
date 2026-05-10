@@ -24,13 +24,16 @@ class StorageSettingsTests(unittest.TestCase):
                 "daemon_port": 19001,
                 "admin_uins": "123, 456",
                 "public_feed_limit": 7,
+                "auto_bind_cookie": False,
+                "cookie_domain": "https://user.qzone.qq.com/",
             }
         )
         self.assertEqual(settings.daemon_port, 19001)
         self.assertEqual(settings.admin_uins, [123, 456])
         self.assertEqual(settings.public_feed_limit, 7)
+        self.assertFalse(settings.auto_bind_cookie)
+        self.assertEqual(settings.cookie_domain, "https://user.qzone.qq.com/")
 
 
 if __name__ == "__main__":
     unittest.main()
-
