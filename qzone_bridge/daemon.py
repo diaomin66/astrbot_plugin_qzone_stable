@@ -105,6 +105,7 @@ class QzoneDaemonService:
             "last_seen_at": runtime.last_seen_at,
             "uptime_seconds": uptime,
             "login_uin": session.uin,
+            "session_source": session.source,
             "cookie_summary": self.client.cookie_summary(),
             "cookie_count": self.client.cookie_count,
             "needs_rebind": session.needs_rebind or not bool(session.cookies),

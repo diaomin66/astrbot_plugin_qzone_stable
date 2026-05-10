@@ -14,16 +14,18 @@ from .errors import QzoneNeedsRebind, QzoneParseError, QzoneRequestError
 from .models import FeedEntry, SessionState
 from .parser import (
     cookie_header,
+    cookie_gtk,
     compute_unikey,
     extract_feed_entry,
     extract_feed_page,
     normalize_uin,
+    normalize_cookie_fields,
     parse_index_html,
     parse_profile_html,
     unwrap_payload,
 )
 from .render import cookie_summary
-from .utils import extract_callback_json, gtk, now_iso
+from .utils import extract_callback_json, now_iso
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +53,7 @@ class QzoneClient:
         max_retries: int = 3,
     ) -> None:
         self.session = session
+        self._normalize_session()
         self.timeout = timeout
         self.max_retries = max(1, int(max_retries))
         self.user_agent = user_agent or (
@@ -65,6 +68,10 @@ class QzoneClient:
             headers={"User-Agent": self.user_agent},
         )
         self.feed_cache: dict[tuple[int, str], FeedEntry] = {}
+
+    def _normalize_session(self) -> None:
+        self.session.cookies = normalize_cookie_fields(dict(self.session.cookies or {}))
+        self.session.uin = normalize_uin(self.session.cookies, override=self.session.uin) or self.session.uin
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -83,13 +90,14 @@ class QzoneClient:
 
     @property
     def gtk(self) -> int:
-        return gtk(self.session.cookies.get("p_skey") or self.session.cookies.get("skey"))
+        return cookie_gtk(self.session.cookies)
 
     def cookie_summary(self) -> str:
         return cookie_summary(self.session.cookies)
 
     def update_session(self, session: SessionState) -> None:
         self.session = session
+        self._normalize_session()
 
     @staticmethod
     def _payload_needs_rebind(code: int, message: str) -> bool:
@@ -113,6 +121,7 @@ class QzoneClient:
         for key, value in response.cookies.items():
             if value is not None:
                 self.session.cookies[key] = value
+        self.session.cookies = normalize_cookie_fields(dict(self.session.cookies))
         if self.session.cookies:
             self.session.updated_at = now_iso()
 
@@ -498,6 +507,7 @@ class QzoneClient:
     def status_snapshot(self) -> dict[str, Any]:
         return {
             "login_uin": self.login_uin,
+            "session_source": self.session.source,
             "cookie_summary": self.cookie_summary(),
             "cookie_count": self.cookie_count,
             "needs_rebind": self.session.needs_rebind or not bool(self.session.cookies),

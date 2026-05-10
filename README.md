@@ -1,12 +1,13 @@
 # AstrBot QQ空间 Stable Bridge
 
-一个更稳的 QQ 空间插件方案。
+更稳定的 QQ 空间插件方案。
 
 ## 特点
 
 - 本地 daemon 承担登录态、请求、保活和重试
-- AstrBot 只负责命令、LLM tools 和展示
-- Cookie 持久化，断线后自动恢复可观测
+- AstrBot 负责命令、LLM tools 和展示
+- Cookie 持久化，断线后可自动恢复
+- 支持从 OneBot v11 平台自动获取 Cookie
 
 ## 使用
 
@@ -15,6 +16,7 @@
 3. 用 `/qzone bind <cookie>` 绑定 Cookie。
 4. 常用命令：
    - `/qzone status`
+   - `/qzone autobind`
    - `/qzone feed`
    - `/qzone detail <hostuin> <fid>`
    - `/qzone post <content>`

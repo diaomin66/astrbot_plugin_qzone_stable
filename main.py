@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -9,9 +11,15 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 
+PLUGIN_ROOT = Path(__file__).resolve().parent
+if str(PLUGIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+
 from qzone_bridge.controller import QzoneDaemonController
-from qzone_bridge.errors import DaemonUnavailableError, QzoneBridgeError, QzoneNeedsRebind
+from qzone_bridge.errors import DaemonUnavailableError, QzoneBridgeError, QzoneCookieAcquireError, QzoneNeedsRebind
 from qzone_bridge.models import FeedEntry
+from qzone_bridge.onebot_cookie import fetch_cookie_text
+from qzone_bridge.parser import normalize_uin, parse_cookie_text
 from qzone_bridge.render import format_action_result, format_feed_detail, format_feed_list, format_status
 from qzone_bridge.settings import PluginSettings
 from qzone_bridge.utils import truncate
@@ -20,10 +28,13 @@ from qzone_bridge.utils import truncate
 class QzoneStablePlugin(Star):
     def __init__(self, context: Context, config: Any | None = None):
         super().__init__(context)
+        self._context = context
         raw_config = config if config is not None else getattr(context, "get_config", lambda: {})()
         self.settings = PluginSettings.from_mapping(raw_config)
         self.root = Path(__file__).resolve().parent
         self.data_dir = self.root / "data" / "qzone"
+        self._onebot_client: Any | None = None
+        self._cookie_lock: asyncio.Lock | None = None
         self.controller = QzoneDaemonController(
             plugin_root=self.root,
             data_dir=self.data_dir,
@@ -32,7 +43,9 @@ class QzoneStablePlugin(Star):
             start_timeout=self.settings.start_timeout,
             keepalive_interval=self.settings.keepalive_interval,
             user_agent=self.settings.user_agent,
+            auto_start_daemon=self.settings.auto_start_daemon,
         )
+        self._capture_onebot_client_from_context()
 
     def _sender_id(self, event: AstrMessageEvent) -> int:
         try:
@@ -83,7 +96,7 @@ class QzoneStablePlugin(Star):
         if self.settings.auto_start_daemon:
             if status.get("daemon_state") != "ready":
                 await self.controller.ensure_running()
-        elif status.get("daemon_state") == "offline":
+        elif status.get("daemon_state") != "ready":
             raise DaemonUnavailableError("daemon 未运行")
 
     def _limit(self, limit: int | None) -> int:
@@ -112,9 +125,114 @@ class QzoneStablePlugin(Star):
             return "\n".join(lines)
         return text
 
+    def _get_cookie_lock(self) -> asyncio.Lock:
+        if self._cookie_lock is None:
+            self._cookie_lock = asyncio.Lock()
+        return self._cookie_lock
+
+    def _capture_onebot_client_from_context(self) -> Any | None:
+        context = getattr(self, "_context", None) or getattr(self, "context", None)
+        platform = None
+        if context is not None:
+            try:
+                platform = context.get_platform("aiocqhttp")
+            except Exception:
+                platform = None
+            if platform is None:
+                try:
+                    platform_manager = getattr(context, "platform_manager", None)
+                    for candidate in getattr(platform_manager, "platform_insts", []):
+                        meta = candidate.meta()
+                        if getattr(meta, "name", "") == "aiocqhttp":
+                            platform = candidate
+                            break
+                except Exception:
+                    platform = None
+        if platform is not None:
+            bot = getattr(platform, "bot", None)
+            if bot is not None:
+                self._onebot_client = bot
+        return self._onebot_client
+
+    def _capture_onebot_client(self, event: AstrMessageEvent | None = None) -> Any | None:
+        bot = getattr(event, "bot", None) if event is not None else None
+        if bot is not None:
+            self._onebot_client = bot
+            return bot
+        return self._capture_onebot_client_from_context()
+
+    def _cookie_binding_hint(self) -> str:
+        return "请确认 AstrBot 正在使用 aiocqhttp(OneBot v11) 平台，或手动使用 /qzone bind 绑定 Cookie。"
+
+    async def _auto_bind_cookie(
+        self,
+        event: AstrMessageEvent | None = None,
+        *,
+        force: bool = False,
+        source: str = "aiocqhttp",
+    ) -> dict[str, Any]:
+        async with self._get_cookie_lock():
+            if not self.settings.auto_bind_cookie and not force:
+                raise QzoneCookieAcquireError("自动获取 Cookie 已关闭。请手动绑定。")
+
+            bot = self._capture_onebot_client(event)
+            if bot is None:
+                raise QzoneCookieAcquireError(f"未捕获到 OneBot 客户端，无法自动获取 Cookie。{self._cookie_binding_hint()}")
+
+            try:
+                status = await self.controller.get_status()
+            except QzoneBridgeError:
+                status = {}
+
+            if not force and status and int(status.get("cookie_count") or 0) > 0 and not bool(status.get("needs_rebind")):
+                return status
+
+            cookie_text = await fetch_cookie_text(bot, domain=self.settings.cookie_domain)
+            if not cookie_text:
+                raise QzoneCookieAcquireError(f"OneBot 未返回可用 Cookie。{self._cookie_binding_hint()}")
+
+            try:
+                cookie_uin = normalize_uin(parse_cookie_text(cookie_text))
+            except Exception:
+                cookie_uin = 0
+            payload = await self.controller.bind_cookie_local(cookie_text, uin=cookie_uin, source=source)
+            return payload
+
+    async def _ensure_cookie_ready(
+        self,
+        event: AstrMessageEvent | None = None,
+        *,
+        force: bool = False,
+        source: str = "aiocqhttp",
+    ) -> dict[str, Any] | None:
+        try:
+            status = await self.controller.get_status()
+        except QzoneBridgeError:
+            status = {}
+        if not force and status and int(status.get("cookie_count") or 0) > 0 and not bool(status.get("needs_rebind")):
+            return status
+        return await self._auto_bind_cookie(event, force=force, source=source)
+
+    async def _bootstrap_auto_bind(self, trigger: str) -> None:
+        client = self._capture_onebot_client_from_context()
+        if client is None or not self.settings.auto_bind_cookie:
+            return
+        try:
+            await self._ensure_cookie_ready(source="aiocqhttp")
+        except QzoneBridgeError as exc:
+            logger.warning("qzone auto bind on %s failed: %s", trigger, exc)
+
     @filter.command_group("qzone")
     def qzone(self):
         pass
+
+    @filter.on_platform_loaded()
+    async def qzone_on_platform_loaded(self):
+        await self._bootstrap_auto_bind("platform load")
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    async def qzone_capture_aiocqhttp_client(self, event: AstrMessageEvent):
+        self._capture_onebot_client(event)
 
     @qzone.command("help")
     async def qzone_help(self, event: AstrMessageEvent):
@@ -123,6 +241,7 @@ class QzoneStablePlugin(Star):
                 "QQ空间插件",
                 "/qzone status",
                 "/qzone bind <cookie>",
+                "/qzone autobind",
                 "/qzone unbind",
                 "/qzone feed [hostuin] [limit] [cursor]",
                 "/qzone detail <hostuin> <fid> [appid]",
@@ -159,10 +278,22 @@ class QzoneStablePlugin(Star):
             yield event.plain_result("仅管理员可绑定 Cookie。")
             return
         try:
-            await self._ensure_daemon(allow_needs_rebind=True)
-            payload = await self.controller.bind_cookie(cookie)
+            payload = await self.controller.bind_cookie_local(cookie)
         except QzoneBridgeError as exc:
             logger.warning("qzone bind failed: %s", exc)
+            yield event.plain_result(self._error_text(exc))
+            return
+        yield event.plain_result(format_status(payload))
+
+    @qzone.command("autobind")
+    async def qzone_autobind(self, event: AstrMessageEvent):
+        if not self._is_admin(event):
+            yield event.plain_result("仅管理员可自动绑定 Cookie。")
+            return
+        try:
+            payload = await self._auto_bind_cookie(event, force=True, source="aiocqhttp")
+        except QzoneBridgeError as exc:
+            logger.warning("qzone autobind failed: %s", exc)
             yield event.plain_result(self._error_text(exc))
             return
         yield event.plain_result(format_status(payload))
@@ -173,8 +304,7 @@ class QzoneStablePlugin(Star):
             yield event.plain_result("仅管理员可解绑。")
             return
         try:
-            await self._ensure_daemon(allow_needs_rebind=True)
-            payload = await self.controller.unbind()
+            payload = await self.controller.unbind_local()
         except QzoneBridgeError as exc:
             yield event.plain_result(self._error_text(exc))
             return
@@ -183,6 +313,7 @@ class QzoneStablePlugin(Star):
     @qzone.command("feed")
     async def qzone_feed(self, event: AstrMessageEvent, hostuin: int = 0, limit: int = 0, cursor: str = ""):
         try:
+            await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
             payload = await self.controller.list_feeds(
                 hostuin=hostuin,
@@ -199,6 +330,7 @@ class QzoneStablePlugin(Star):
     @qzone.command("detail")
     async def qzone_detail(self, event: AstrMessageEvent, hostuin: int, fid: str, appid: int = 311):
         try:
+            await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
             payload = await self.controller.detail_feed(hostuin=hostuin, fid=fid, appid=appid)
         except QzoneBridgeError as exc:
@@ -212,6 +344,7 @@ class QzoneStablePlugin(Star):
             yield event.plain_result("仅管理员可发说说。")
             return
         try:
+            await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
             payload = await self.controller.publish_post(content=content)
         except QzoneBridgeError as exc:
@@ -225,6 +358,7 @@ class QzoneStablePlugin(Star):
             yield event.plain_result("仅管理员可评论。")
             return
         try:
+            await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
             payload = await self.controller.comment_post(hostuin=hostuin, fid=fid, content=content)
         except QzoneBridgeError as exc:
@@ -238,6 +372,7 @@ class QzoneStablePlugin(Star):
             yield event.plain_result("仅管理员可点赞。")
             return
         try:
+            await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
             payload = await self.controller.like_post(hostuin=hostuin, fid=fid, appid=appid, unlike=unlike)
         except QzoneBridgeError as exc:
@@ -273,6 +408,7 @@ class QzoneStablePlugin(Star):
             scope (string): self 或 profile。
         """
         try:
+            await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
             payload = await self.controller.list_feeds(
                 hostuin=hostuin,
@@ -296,6 +432,7 @@ class QzoneStablePlugin(Star):
             appid (number): 应用 id，默认 311。
         """
         try:
+            await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
             payload = await self.controller.detail_feed(hostuin=hostuin, fid=fid, appid=appid)
         except QzoneBridgeError as exc:
@@ -319,6 +456,7 @@ class QzoneStablePlugin(Star):
             yield event.plain_result(f"待发布草稿: {truncate(content, 120)}。确认后将执行。")
             return
         try:
+            await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
             payload = await self.controller.publish_post(content=content, sync_weibo=sync_weibo)
         except QzoneBridgeError as exc:
@@ -356,6 +494,7 @@ class QzoneStablePlugin(Star):
             )
             return
         try:
+            await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
             payload = await self.controller.comment_post(
                 hostuin=hostuin,
@@ -396,6 +535,7 @@ class QzoneStablePlugin(Star):
             yield event.plain_result(f"待执行草稿: {action} hostuin={hostuin}, fid={fid}。确认后将执行。")
             return
         try:
+            await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
             payload = await self.controller.like_post(hostuin=hostuin, fid=fid, appid=appid, unlike=unlike)
         except QzoneBridgeError as exc:
