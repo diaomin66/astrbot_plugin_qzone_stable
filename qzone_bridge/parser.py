@@ -7,7 +7,18 @@ import re
 from typing import Any
 
 from .models import FeedEntry
-from .utils import entire_closing, extract_scripts, firstn, json_loads, truncate
+from .utils import entire_closing, extract_scripts, firstn, gtk, json_loads, truncate
+
+
+COOKIE_SECRET_KEYS = ("p_skey", "skey", "pskey", "skey2")
+COOKIE_GTK_KEYS = ("g_tk", "gtk", "bkn", "csrf_token")
+COOKIE_KEY_ALIASES = {
+    "p_skey": "p_skey",
+    "pskey": "p_skey",
+    "gtk": "g_tk",
+    "bkn": "g_tk",
+    "csrf_token": "g_tk",
+}
 
 
 def _dig(value: Any, *keys: str) -> Any:
@@ -48,7 +59,7 @@ def parse_cookie_text(cookie_text: str) -> dict[str, str]:
     if cookie_text.startswith("{") or cookie_text.startswith("["):
         payload = json.loads(cookie_text)
         if isinstance(payload, dict):
-            return {str(k): str(v) for k, v in payload.items()}
+            return normalize_cookie_fields(payload)
         raise ValueError("cookie JSON must be an object")
 
     cookie_text = cookie_text.replace("\n", ";")
@@ -66,7 +77,51 @@ def parse_cookie_text(cookie_text: str) -> dict[str, str]:
         value = value.strip().strip('"')
         if key:
             cookies[key] = value
-    return cookies
+    return normalize_cookie_fields(cookies)
+
+
+def normalize_cookie_fields(cookies: dict[str, Any]) -> dict[str, str]:
+    """Normalize OneBot/browser cookie aliases into Qzone-compatible keys."""
+
+    normalized: dict[str, str] = {}
+    for key, value in cookies.items():
+        if value in (None, ""):
+            continue
+        original = str(key).strip()
+        if not original:
+            continue
+        cookie_value = str(value).strip().strip('"')
+        if not cookie_value:
+            continue
+
+        alias_key = original.lower().replace("-", "_")
+        canonical = COOKIE_KEY_ALIASES.get(alias_key, original)
+        normalized.setdefault(original, cookie_value)
+        normalized.setdefault(canonical, cookie_value)
+
+    if "uin" in normalized and "p_uin" not in normalized:
+        normalized["p_uin"] = normalized["uin"]
+    if "p_uin" in normalized and "uin" not in normalized:
+        normalized["uin"] = normalized["p_uin"]
+    return normalized
+
+
+def cookie_gtk(cookies: dict[str, str]) -> int:
+    """Return a usable g_tk from skey-like cookies or direct OneBot tokens."""
+
+    normalized = normalize_cookie_fields(cookies)
+    for key in COOKIE_SECRET_KEYS:
+        value = normalized.get(key)
+        if value:
+            return gtk(value)
+    for key in COOKIE_GTK_KEYS:
+        value = normalized.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text.isdigit():
+            return int(text)
+    return 0
 
 
 def normalize_uin(cookies: dict[str, str], override: int | None = None) -> int:

@@ -234,7 +234,7 @@ class QzoneDaemonController:
     def cookie_summary(cookies: dict[str, str]) -> str:
         if not cookies:
             return "未绑定"
-        keys = ["uin", "p_uin", "skey", "p_skey", "pt4_token", "pt_key"]
+        keys = ["uin", "p_uin", "skey", "p_skey", "pskey", "g_tk", "gtk", "bkn", "csrf_token", "pt4_token", "pt_key"]
         found = [key for key in keys if key in cookies]
         return f"{len(cookies)}个字段: " + ", ".join(found or ["未知字段"])
 

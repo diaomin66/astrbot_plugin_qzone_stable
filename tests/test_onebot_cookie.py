@@ -1,6 +1,7 @@
 import unittest
 
 from qzone_bridge.onebot_cookie import extract_cookie_text, fetch_cookie_text, iter_cookie_domains
+from qzone_bridge.parser import cookie_gtk, parse_cookie_text
 
 
 class DirectCookieClient:
@@ -36,6 +37,17 @@ class LoginInfoCookieClient:
     async def get_login_info(self):
         self.calls.append(("get_login_info", None))
         return self.login_payload
+
+
+class DomainAwareCookieClient:
+    def __init__(self):
+        self.calls = []
+
+    async def get_cookies(self, domain=None):
+        self.calls.append(("get_cookies", domain))
+        if domain == "user.qzone.qq.com":
+            return {"cookies": "uin=o123456; p_uin=o123456"}
+        return {"cookies": "uin=o123456; p_uin=o123456; pskey=domain-secret"}
 
 
 class OneBotCookieTests(unittest.IsolatedAsyncioTestCase):
@@ -86,6 +98,30 @@ class OneBotCookieTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("uin=o123456", text)
         self.assertIn("p_uin=o123456", text)
         self.assertTrue(client.calls)
+
+    def test_extract_cookie_text_merges_credentials_token(self):
+        payload = {
+            "cookies": "uin=o123456; p_uin=o123456",
+            "csrf_token": 123456789,
+        }
+        text = extract_cookie_text(payload)
+        cookies = parse_cookie_text(text)
+        self.assertEqual(cookies["g_tk"], "123456789")
+        self.assertEqual(cookie_gtk(cookies), 123456789)
+
+    async def test_fetch_cookie_text_accepts_pskey_alias(self):
+        client = DirectCookieClient({"cookies": {"uin": "o123456", "p_uin": "o123456", "pskey": "domain-secret"}})
+        text = await fetch_cookie_text(client, domain="user.qzone.qq.com")
+        cookies = parse_cookie_text(text)
+        self.assertEqual(cookies["p_skey"], "domain-secret")
+        self.assertGreater(cookie_gtk(cookies), 0)
+
+    async def test_fetch_cookie_text_skips_cookie_without_auth_token(self):
+        client = DomainAwareCookieClient()
+        text = await fetch_cookie_text(client, domain="user.qzone.qq.com")
+        cookies = parse_cookie_text(text)
+        self.assertEqual(cookies["p_skey"], "domain-secret")
+        self.assertGreater(len(client.calls), 1)
 
 
 if __name__ == "__main__":

@@ -14,16 +14,18 @@ from .errors import QzoneAuthError, QzoneNeedsRebind, QzoneParseError, QzoneRequ
 from .models import FeedEntry, SessionState
 from .parser import (
     cookie_header,
+    cookie_gtk,
     compute_unikey,
     extract_feed_entry,
     extract_feed_page,
+    normalize_cookie_fields,
     normalize_uin,
     parse_index_html,
     parse_profile_html,
     unwrap_payload,
 )
 from .render import cookie_summary
-from .utils import extract_callback_json, gtk, now_iso
+from .utils import extract_callback_json, now_iso
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +50,7 @@ class QzoneClient:
         max_retries: int = 3,
     ) -> None:
         self.session = session
+        self.session.cookies = normalize_cookie_fields(self.session.cookies)
         self.timeout = timeout
         self.max_retries = max(1, int(max_retries))
         self.user_agent = user_agent or (
@@ -80,7 +83,7 @@ class QzoneClient:
 
     @property
     def gtk(self) -> int:
-        return gtk(self.session.cookies.get("p_skey") or self.session.cookies.get("skey"))
+        return cookie_gtk(self.session.cookies)
 
     def cookie_summary(self) -> str:
         return cookie_summary(self.session.cookies)
@@ -92,6 +95,7 @@ class QzoneClient:
         for key, value in response.cookies.items():
             if value is not None:
                 self.session.cookies[key] = value
+        self.session.cookies = normalize_cookie_fields(self.session.cookies)
         if self.session.cookies:
             self.session.updated_at = now_iso()
 
@@ -142,7 +146,7 @@ class QzoneClient:
         if login_required and not self.session.cookies:
             raise QzoneNeedsRebind()
         if login_required and self.gtk == 0:
-            raise QzoneNeedsRebind("Cookie 中缺少 p_skey 或 skey，无法计算 g_tk")
+            raise QzoneNeedsRebind("Cookie 中缺少 p_skey/skey，且没有可用的 g_tk/bkn，无法访问 QQ 空间")
 
         params = self._merge_params(params, hostuin=hostuin, attach_token=attach_token)
         last_exc: Exception | None = None
