@@ -41,6 +41,18 @@
     "default": true,
     "hint": "是否在第一次使用时自动启动本地 daemon。"
   },
+  "auto_bind_cookie": {
+    "description": "Auto bind cookie",
+    "type": "bool",
+    "default": true,
+    "hint": "是否在检测到登录态失效时自动从 OneBot 适配器获取 Cookie。"
+  },
+  "cookie_domain": {
+    "description": "OneBot cookie domain",
+    "type": "text",
+    "default": "user.qzone.qq.com",
+    "hint": "向 OneBot 请求 Cookie 时使用的域名，默认 user.qzone.qq.com。"
+  },
   "admin_uins": {
     "description": "Admin QQ numbers",
     "type": "text",
@@ -60,4 +72,3 @@
     "hint": "LLM 工具写操作是否默认先输出草稿预览。"
   }
 }
-

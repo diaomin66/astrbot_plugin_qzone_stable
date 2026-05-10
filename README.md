@@ -39,3 +39,6 @@
 - `qzone_comment_post`
 - `qzone_like_post`
 
+## 自动 Cookie 获取
+
+当 AstrBot 使用 `aiocqhttp`(OneBot v11) 平台时，插件会优先尝试从平台适配器自动获取 Cookie，并写入 daemon 持久化状态。若平台不支持 `get_cookies` / `get_credentials`，仍可使用 `/qzone bind <cookie>` 手动绑定。
