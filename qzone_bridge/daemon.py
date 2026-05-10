@@ -13,10 +13,10 @@ from datetime import datetime, timezone
 
 from aiohttp import web
 
-from .client import FeedPageResult, QzoneClient
-from .errors import QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError
-from .models import BridgeState, FeedEntry, SessionState
-from .parser import extract_feed_entry, extract_feed_page, normalize_uin, parse_cookie_text, unwrap_payload
+from .client import QzoneClient
+from .errors import QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
+from .models import FeedEntry, SessionState
+from .parser import normalize_uin, parse_cookie_text, unwrap_payload
 from .protocol import SECRET_HEADER, fail, ok
 from .storage import StateStore, ensure_state_secret
 from .utils import now_iso, from_iso
@@ -57,6 +57,10 @@ class QzoneDaemonService:
     def touch(self) -> None:
         self.state.runtime.last_seen_at = now_iso()
 
+    def _ensure_session_ready(self) -> None:
+        if self.state.session.needs_rebind or not self.state.session.cookies or not self.state.session.uin:
+            raise QzoneNeedsRebind()
+
     def _set_success(self) -> None:
         self.health_state = "ready" if self.state.session.cookies else "needs_rebind"
         self.state.session.last_ok_at = now_iso()
@@ -69,6 +73,13 @@ class QzoneDaemonService:
         if isinstance(exc, (QzoneNeedsRebind, QzoneAuthError)):
             self.health_state = "needs_rebind"
             self.state.session.needs_rebind = True
+            self.state.session.qzonetokens.clear()
+            self.client.feed_cache.clear()
+        elif isinstance(exc, QzoneRequestError) and exc.status_code is not None and 400 <= exc.status_code < 500:
+            if self.state.session.cookies and not self.state.session.needs_rebind:
+                self.health_state = "ready"
+            else:
+                self.health_state = "needs_rebind"
         else:
             self.health_state = "degraded"
         self.state.session.last_error = {
@@ -106,7 +117,7 @@ class QzoneDaemonService:
 
     async def bootstrap(self) -> None:
         self.save()
-        if self.state.session.cookies and self.state.session.uin:
+        if self.state.session.cookies and self.state.session.uin and not self.state.session.needs_rebind:
             try:
                 await self.warmup()
             except Exception as exc:
@@ -122,11 +133,16 @@ class QzoneDaemonService:
             self._keepalive_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._keepalive_task
+        self.health_state = "offline"
+        self.state.runtime.daemon_pid = 0
+        self.state.runtime.started_at = ""
+        self.touch()
+        self.save()
+        self.client.feed_cache.clear()
         await self.client.close()
 
     async def warmup(self) -> None:
-        if not self.state.session.cookies or not self.state.session.uin:
-            raise QzoneNeedsRebind()
+        self._ensure_session_ready()
         if not self.state.session.qzonetokens.get(str(self.state.session.uin)):
             await self.client.index()
         else:
@@ -134,6 +150,7 @@ class QzoneDaemonService:
         self._set_success()
 
     async def ensure_token(self, hostuin: int | None = None) -> None:
+        self._ensure_session_ready()
         hostuin = int(hostuin or self.state.session.uin or 0)
         if not hostuin:
             raise QzoneNeedsRebind()
@@ -164,6 +181,7 @@ class QzoneDaemonService:
             needs_rebind=False,
         )
         self.client.update_session(self.state.session)
+        self.client.feed_cache.clear()
         self.save()
         try:
             await self.warmup()
@@ -185,11 +203,13 @@ class QzoneDaemonService:
             needs_rebind=True,
         )
         self.client.update_session(self.state.session)
+        self.client.feed_cache.clear()
         self.save()
         self.health_state = "needs_rebind"
         return self.snapshot()
 
     async def list_feeds(self, *, hostuin: int = 0, limit: int = 5, cursor: str = "", scope: str = "") -> dict[str, Any]:
+        self._ensure_session_ready()
         if limit <= 0:
             limit = 5
         hostuin = int(hostuin or self.state.session.uin or 0)
@@ -337,9 +357,10 @@ class QzoneDaemonService:
         }
 
     async def health(self) -> dict[str, Any]:
-        if not self.state.session.cookies or not self.state.session.uin:
-            self.health_state = "needs_rebind"
-            self.save()
+        if self.state.session.needs_rebind or not self.state.session.cookies or not self.state.session.uin:
+            if self.health_state != "needs_rebind":
+                self.health_state = "needs_rebind"
+                self.save()
             return self.snapshot()
         try:
             await self.client.mfeeds_get_count()
@@ -354,16 +375,20 @@ class QzoneDaemonService:
             await asyncio.sleep(self.keepalive_interval)
             if self._closing:
                 break
+            if self.state.session.needs_rebind:
+                if self.health_state != "needs_rebind":
+                    self.health_state = "needs_rebind"
+                    self.save()
+                continue
             if not self.state.session.cookies or not self.state.session.uin:
-                self.health_state = "needs_rebind"
-                self.save()
+                if self.health_state != "needs_rebind":
+                    self.health_state = "needs_rebind"
+                    self.save()
                 continue
             try:
-                await self.client.mfeeds_get_count()
+                await self.health()
             except Exception as exc:
-                self._set_error(exc)
-            else:
-                self._set_success()
+                log.debug("qzone keepalive failed: %s", exc)
 
 
 async def _json_body(request: web.Request) -> dict[str, Any]:
@@ -376,9 +401,10 @@ async def _json_body(request: web.Request) -> dict[str, Any]:
     return payload
 
 
-def create_app(service: QzoneDaemonService) -> web.Application:
+def create_app(service: QzoneDaemonService, stop_event: asyncio.Event) -> web.Application:
     app = web.Application(client_max_size=8 * 1024 * 1024)
     app["service"] = service
+    app["stop_event"] = stop_event
 
     @web.middleware
     async def auth_middleware(request: web.Request, handler):
@@ -388,6 +414,12 @@ def create_app(service: QzoneDaemonService) -> web.Application:
         return await handler(request)
 
     app.middlewares.append(auth_middleware)
+
+    async def shutdown(request: web.Request) -> web.Response:
+        loop = asyncio.get_running_loop()
+        if not stop_event.is_set():
+            loop.call_later(0.1, stop_event.set)
+        return ok({"stopping": True})
 
     async def health(request: web.Request) -> web.Response:
         service.touch()
@@ -489,6 +521,7 @@ def create_app(service: QzoneDaemonService) -> web.Application:
     app.router.add_post("/post", post)
     app.router.add_post("/comment", comment)
     app.router.add_post("/like", like)
+    app.router.add_post("/shutdown", shutdown)
     return app
 
 
@@ -514,21 +547,20 @@ async def run_daemon(
     )
     await service.bootstrap()
 
-    app = create_app(service)
+    stop_event = asyncio.Event()
+    app = create_app(service, stop_event)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, host="127.0.0.1", port=port)
     await site.start()
     log.info("Qzone daemon started on 127.0.0.1:%s", port)
     try:
-        while True:
-            await asyncio.sleep(3600)
+        await stop_event.wait()
     except asyncio.CancelledError:
         pass
     finally:
         await service.close()
         await runner.cleanup()
-
 
 def main() -> None:
     import argparse
