@@ -7,7 +7,7 @@ import json
 import re
 from typing import Any
 
-from .parser import normalize_uin, parse_cookie_text
+from .parser import cookie_gtk, cookie_header, normalize_uin, parse_cookie_text
 
 COOKIE_ACTIONS = ("get_cookies", "get_credentials")
 LOGIN_INFO_ACTIONS = ("get_login_info",)
@@ -46,7 +46,9 @@ COOKIE_NAME_ALLOWLIST = {
     "lskey",
     "ldw",
     "g_tk",
+    "gtk",
     "bkn",
+    "csrf_token",
     "pskey",
     "qqmusic_key",
 }
@@ -69,7 +71,7 @@ COOKIE_META_KEYS = {
 }
 
 _COOKIE_PAIR_RE = re.compile(
-    r"\b(?:uin|p_uin|skey|p_skey|pt4_token|pt_key|pt_login_sig|clientkey|superkey|qzonetoken|qm_keyst|qm_sid|o_cookie|uin_cookie|skey2|rv2|ptcz|lskey|ldw|g_tk|bkn|pskey|qqmusic_key)\s*=",
+    r"\b(?:uin|p_uin|skey|p_skey|pt4_token|pt_key|pt_login_sig|clientkey|superkey|qzonetoken|qm_keyst|qm_sid|o_cookie|uin_cookie|skey2|rv2|ptcz|lskey|ldw|g_tk|gtk|bkn|csrf_token|pskey|qqmusic_key)\s*=",
     re.I,
 )
 
@@ -194,6 +196,21 @@ def _inject_login_uin(cookie_text: str, uin: int) -> str:
     return f"{prefix}; {cookie_text}"
 
 
+def _merge_cookie_texts(parts: list[str]) -> str:
+    merged: dict[str, str] = {}
+    for part in parts:
+        if not part:
+            continue
+        try:
+            cookies = parse_cookie_text(part)
+        except Exception:
+            continue
+        for key, value in cookies.items():
+            if key not in merged:
+                merged[key] = value
+    return cookie_header(merged) if merged else ""
+
+
 def extract_cookie_text(payload: Any, *, _depth: int = 0, _seen: set[int] | None = None) -> str:
     """Extract a Cookie header string from OneBot action payloads."""
 
@@ -222,9 +239,7 @@ def extract_cookie_text(payload: Any, *, _depth: int = 0, _seen: set[int] | None
             text = extract_cookie_text(item, _depth=_depth + 1, _seen=_seen)
             if text:
                 parts.append(text)
-        if parts:
-            return "; ".join(parts)
-        return ""
+        return _merge_cookie_texts(parts)
     if not isinstance(payload, dict):
         return ""
 
@@ -237,22 +252,23 @@ def extract_cookie_text(payload: Any, *, _depth: int = 0, _seen: set[int] | None
     if pair_text:
         return pair_text
 
+    parts: list[str] = []
     mapped_text = _cookie_mapping_to_text(payload)
     if mapped_text:
-        return mapped_text
+        parts.append(mapped_text)
 
     for key in COOKIE_VALUE_KEYS:
         if key in payload:
             text = extract_cookie_text(payload.get(key), _depth=_depth + 1, _seen=_seen)
             if text:
-                return text
+                parts.append(text)
 
     for value in payload.values():
         if isinstance(value, (dict, list, tuple, str, bytes)):
             text = extract_cookie_text(value, _depth=_depth + 1, _seen=_seen)
             if text:
-                return text
-    return ""
+                parts.append(text)
+    return _merge_cookie_texts(parts)
 
 
 def _unique(items: list[str]) -> list[str]:
@@ -342,6 +358,6 @@ async def fetch_cookie_text(bot: Any, *, domain: str) -> str:
                                 cookies = parse_cookie_text(cookie_text)
                             except Exception:
                                 cookies = {}
-                    if normalize_uin(cookies):
-                        return cookie_text
+                    if normalize_uin(cookies) and cookie_gtk(cookies):
+                        return cookie_header(cookies)
     return ""
