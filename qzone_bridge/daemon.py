@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from aiohttp import web
 
 from .client import FeedPageResult, QzoneClient
-from .errors import QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError
+from .errors import QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
 from .models import BridgeState, FeedEntry, SessionState
 from .parser import extract_feed_entry, extract_feed_page, normalize_uin, parse_cookie_text, unwrap_payload
 from .protocol import SECRET_HEADER, fail, ok
@@ -57,6 +57,10 @@ class QzoneDaemonService:
     def touch(self) -> None:
         self.state.runtime.last_seen_at = now_iso()
 
+    def _ensure_session_ready(self) -> None:
+        if self.state.session.needs_rebind or not self.state.session.cookies or not self.state.session.uin:
+            raise QzoneNeedsRebind()
+
     def _set_success(self) -> None:
         self.health_state = "ready" if self.state.session.cookies else "needs_rebind"
         self.state.session.last_ok_at = now_iso()
@@ -69,6 +73,13 @@ class QzoneDaemonService:
         if isinstance(exc, (QzoneNeedsRebind, QzoneAuthError)):
             self.health_state = "needs_rebind"
             self.state.session.needs_rebind = True
+            self.state.session.qzonetokens.clear()
+            self.client.feed_cache.clear()
+        elif isinstance(exc, QzoneRequestError) and exc.status_code is not None and 400 <= exc.status_code < 500:
+            if self.state.session.cookies and not self.state.session.needs_rebind:
+                self.health_state = "ready"
+            else:
+                self.health_state = "needs_rebind"
         else:
             self.health_state = "degraded"
         self.state.session.last_error = {
@@ -94,6 +105,7 @@ class QzoneDaemonService:
             "last_seen_at": runtime.last_seen_at,
             "uptime_seconds": uptime,
             "login_uin": session.uin,
+            "session_source": session.source,
             "cookie_summary": self.client.cookie_summary(),
             "cookie_count": self.client.cookie_count,
             "needs_rebind": session.needs_rebind or not bool(session.cookies),
@@ -106,7 +118,7 @@ class QzoneDaemonService:
 
     async def bootstrap(self) -> None:
         self.save()
-        if self.state.session.cookies and self.state.session.uin:
+        if self.state.session.cookies and self.state.session.uin and not self.state.session.needs_rebind:
             try:
                 await self.warmup()
             except Exception as exc:
@@ -122,18 +134,21 @@ class QzoneDaemonService:
             self._keepalive_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._keepalive_task
+        self.health_state = "offline"
+        self.state.runtime.daemon_pid = 0
+        self.state.runtime.started_at = ""
+        self.touch()
+        self.save()
+        self.client.feed_cache.clear()
         await self.client.close()
 
     async def warmup(self) -> None:
-        if not self.state.session.cookies or not self.state.session.uin:
-            raise QzoneNeedsRebind()
-        if not self.state.session.qzonetokens.get(str(self.state.session.uin)):
-            await self.client.index()
-        else:
-            await self.client.mfeeds_get_count()
+        self._ensure_session_ready()
+        await self.client.mfeeds_get_count()
         self._set_success()
 
     async def ensure_token(self, hostuin: int | None = None) -> None:
+        self._ensure_session_ready()
         hostuin = int(hostuin or self.state.session.uin or 0)
         if not hostuin:
             raise QzoneNeedsRebind()
@@ -164,6 +179,7 @@ class QzoneDaemonService:
             needs_rebind=False,
         )
         self.client.update_session(self.state.session)
+        self.client.feed_cache.clear()
         self.save()
         try:
             await self.warmup()
@@ -185,11 +201,13 @@ class QzoneDaemonService:
             needs_rebind=True,
         )
         self.client.update_session(self.state.session)
+        self.client.feed_cache.clear()
         self.save()
         self.health_state = "needs_rebind"
         return self.snapshot()
 
     async def list_feeds(self, *, hostuin: int = 0, limit: int = 5, cursor: str = "", scope: str = "") -> dict[str, Any]:
+        self._ensure_session_ready()
         if limit <= 0:
             limit = 5
         hostuin = int(hostuin or self.state.session.uin or 0)
@@ -203,7 +221,12 @@ class QzoneDaemonService:
         while len(items) < limit and page_round < 6:
             if scope == "self":
                 if page_round == 0 and not next_cursor:
-                    payload = unwrap_payload(await self.client.index())
+                    try:
+                        payload = unwrap_payload(await self.client.index())
+                    except QzoneRequestError as exc:
+                        if exc.status_code not in {301, 302, 303, 307, 308}:
+                            raise
+                        payload = await self.client.legacy_recent_feeds()
                 else:
                     payload = unwrap_payload(await self.client.get_active_feeds(next_cursor))
                 feedpage = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else payload
@@ -219,7 +242,11 @@ class QzoneDaemonService:
 
             if not isinstance(feedpage, dict):
                 break
-            raw_items = feedpage.get("vFeeds") or feedpage.get("vfeeds") or []
+            raw_items = feedpage.get("vFeeds") or feedpage.get("vfeeds") or feedpage.get("msglist") or feedpage.get("data") or []
+            if isinstance(raw_items, dict):
+                raw_items = raw_items.get("vFeeds") or raw_items.get("vfeeds") or raw_items.get("msglist") or raw_items.get("data") or []
+            if not isinstance(raw_items, list):
+                raw_items = []
             page_items = [
                 self.client.feed_entry_from_payload(item, default_hostuin=hostuin)
                 for item in raw_items
@@ -337,9 +364,10 @@ class QzoneDaemonService:
         }
 
     async def health(self) -> dict[str, Any]:
-        if not self.state.session.cookies or not self.state.session.uin:
-            self.health_state = "needs_rebind"
-            self.save()
+        if self.state.session.needs_rebind or not self.state.session.cookies or not self.state.session.uin:
+            if self.health_state != "needs_rebind":
+                self.health_state = "needs_rebind"
+                self.save()
             return self.snapshot()
         try:
             await self.client.mfeeds_get_count()
@@ -354,16 +382,20 @@ class QzoneDaemonService:
             await asyncio.sleep(self.keepalive_interval)
             if self._closing:
                 break
+            if self.state.session.needs_rebind:
+                if self.health_state != "needs_rebind":
+                    self.health_state = "needs_rebind"
+                    self.save()
+                continue
             if not self.state.session.cookies or not self.state.session.uin:
-                self.health_state = "needs_rebind"
-                self.save()
+                if self.health_state != "needs_rebind":
+                    self.health_state = "needs_rebind"
+                    self.save()
                 continue
             try:
-                await self.client.mfeeds_get_count()
+                await self.health()
             except Exception as exc:
-                self._set_error(exc)
-            else:
-                self._set_success()
+                log.debug("qzone keepalive failed: %s", exc)
 
 
 async def _json_body(request: web.Request) -> dict[str, Any]:
