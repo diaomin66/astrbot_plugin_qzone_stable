@@ -307,7 +307,7 @@ class QzoneDaemonService:
     async def publish_post(self, *, content: str, sync_weibo: bool = False) -> dict[str, Any]:
         if not content.strip():
             raise QzoneParseError("发布内容不能为空")
-        await self.ensure_token(self.state.session.uin)
+        self._ensure_session_ready()
         payload = unwrap_payload(await self.client.publish_mood(content, sync_weibo=sync_weibo))
         if not isinstance(payload, dict):
             raise QzoneParseError("发布说说返回结构异常")
@@ -329,7 +329,7 @@ class QzoneDaemonService:
     ) -> dict[str, Any]:
         if not content.strip():
             raise QzoneParseError("评论内容不能为空")
-        await self.ensure_token(hostuin)
+        self._ensure_session_ready()
         payload = unwrap_payload(await self.client.add_comment(hostuin, fid, content, appid=appid, private=private))
         if not isinstance(payload, dict):
             raise QzoneParseError("评论返回结构异常")
@@ -350,7 +350,7 @@ class QzoneDaemonService:
         curkey: str = "",
         unlike: bool = False,
     ) -> dict[str, Any]:
-        await self.ensure_token(hostuin)
+        self._ensure_session_ready()
         payload = unwrap_payload(
             await self.client.like_post(hostuin, fid, appid=appid, curkey=curkey, like=not unlike)
         )
