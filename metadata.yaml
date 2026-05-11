@@ -1,5 +1,5 @@
 name: astrbot_plugin_qzone_stable
-version: 0.1.1
+version: 0.1.2
 author: OpenAI
 description: Stable QQ空间 bridge with a local daemon and LLM tools.
 desc: Stable QQ空间 bridge with a local daemon and LLM tools.

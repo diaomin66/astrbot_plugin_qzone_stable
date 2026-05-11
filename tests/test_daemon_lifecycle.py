@@ -102,6 +102,63 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await service.close()
 
+    async def test_publish_post_does_not_probe_h5_index_for_token(self):
+        with TemporaryDirectory() as tmp:
+            service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
+            service.state.session = SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+            service.client.update_session(service.state.session)
+            try:
+                with patch.object(
+                    service.client,
+                    "index",
+                    new=AsyncMock(side_effect=QzoneRequestError("h5 redirect", status_code=302)),
+                ) as index, patch.object(
+                    service.client,
+                    "publish_mood",
+                    new=AsyncMock(return_value={"fid": "fid-1", "message": "ok"}),
+                ) as publish:
+                    payload = await service.publish_post(content="hello")
+                index.assert_not_awaited()
+                publish.assert_awaited_once()
+                self.assertEqual(payload["fid"], "fid-1")
+            finally:
+                await service.close()
+
+    async def test_comment_and_like_do_not_probe_h5_index_for_token(self):
+        with TemporaryDirectory() as tmp:
+            service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
+            service.state.session = SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+            service.client.update_session(service.state.session)
+            try:
+                with patch.object(
+                    service.client,
+                    "index",
+                    new=AsyncMock(side_effect=QzoneRequestError("h5 redirect", status_code=302)),
+                ) as index, patch.object(
+                    service.client,
+                    "add_comment",
+                    new=AsyncMock(return_value={"commentid": 7, "message": "ok"}),
+                ) as comment, patch.object(
+                    service.client,
+                    "like_post",
+                    new=AsyncMock(return_value={"message": "ok"}),
+                ) as like:
+                    comment_payload = await service.comment_post(hostuin=123456, fid="fid-1", content="hello")
+                    like_payload = await service.like_post(hostuin=123456, fid="fid-1")
+                index.assert_not_awaited()
+                comment.assert_awaited_once()
+                like.assert_awaited_once()
+                self.assertEqual(comment_payload["commentid"], 7)
+                self.assertEqual(like_payload["action"], "like")
+            finally:
+                await service.close()
+
 
 class ControllerLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_close_shuts_down_daemon_and_releases_port(self):
