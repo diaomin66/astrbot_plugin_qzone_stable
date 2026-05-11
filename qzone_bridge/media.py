@@ -319,12 +319,13 @@ def iter_event_components(event: Any) -> list[Any]:
 def strip_command_prefix(text: str, prefixes: Iterable[str]) -> str:
     stripped = text.lstrip()
     for prefix in prefixes:
-        prefix = prefix.strip()
+        prefix = prefix.strip().lstrip("/／").strip()
         if not prefix:
             continue
-        for candidate in (prefix, f"/{prefix}" if not prefix.startswith("/") else prefix[1:]):
-            if stripped.lower().startswith(candidate.lower()):
-                return stripped[len(candidate) :].lstrip()
+        pattern = r"^[/／]?\s*" + r"\s+".join(re.escape(part) for part in prefix.split()) + r"(?:\s+|$)"
+        match = re.match(pattern, stripped, re.I)
+        if match:
+            return stripped[match.end() :].lstrip()
     return text
 
 
@@ -367,6 +368,8 @@ def collect_post_payload(
     media.extend(normalize_media_list(extra_media))
     content = "".join(content_parts).strip() if include_event_text else ""
     fallback = str(fallback_content or "").strip()
+    if command_prefixes:
+        fallback = strip_command_prefix(fallback, command_prefixes).strip()
     use_fallback = bool(fallback and not (media and looks_like_component_string(fallback)))
     if not content and use_fallback:
         content = fallback
