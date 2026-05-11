@@ -16,7 +16,7 @@ from aiohttp import web
 from .client import QzoneClient
 from .errors import QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
 from .models import FeedEntry, SessionState
-from .parser import normalize_uin, parse_cookie_text, unwrap_payload
+from .parser import extract_feed_page, normalize_uin, parse_cookie_text, unwrap_payload
 from .protocol import SECRET_HEADER, fail, ok
 from .storage import StateStore, ensure_state_secret
 from .utils import now_iso, from_iso
@@ -144,10 +144,7 @@ class QzoneDaemonService:
 
     async def warmup(self) -> None:
         self._ensure_session_ready()
-        if not self.state.session.qzonetokens.get(str(self.state.session.uin)):
-            await self.client.index()
-        else:
-            await self.client.mfeeds_get_count()
+        await self.client.mfeeds_get_count()
         self._set_success()
 
     async def ensure_token(self, hostuin: int | None = None) -> None:
@@ -155,12 +152,6 @@ class QzoneDaemonService:
         hostuin = int(hostuin or self.state.session.uin or 0)
         if not hostuin:
             raise QzoneNeedsRebind()
-        if hostuin == self.state.session.uin:
-            if not self.state.session.qzonetokens.get(str(hostuin)):
-                await self.client.index()
-        else:
-            if not self.state.session.qzonetokens.get(str(hostuin)):
-                await self.client.profile(hostuin)
         self.save()
 
     async def bind_cookie(self, cookie_text: str, *, uin: int = 0, source: str = "manual") -> dict[str, Any]:
@@ -223,16 +214,22 @@ class QzoneDaemonService:
         page_round = 0
         while len(items) < limit and page_round < 6:
             if scope == "self":
-                if page_round == 0 and not next_cursor:
-                    payload = unwrap_payload(await self.client.index())
-                else:
-                    payload = unwrap_payload(await self.client.get_active_feeds(next_cursor))
+                try:
+                    if page_round == 0 and not next_cursor:
+                        payload = unwrap_payload(await self.client.index())
+                    else:
+                        payload = unwrap_payload(await self.client.get_active_feeds(next_cursor))
+                except QzoneRequestError:
+                    payload = await self.client.legacy_recent_feeds(page=page_round + 1)
                 feedpage = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else payload
             else:
-                if page_round == 0 and not next_cursor:
-                    payload = await self.client.profile(hostuin)
-                else:
-                    payload = unwrap_payload(await self.client.get_feeds(hostuin, next_cursor))
+                try:
+                    if page_round == 0 and not next_cursor:
+                        payload = await self.client.profile(hostuin)
+                    else:
+                        payload = unwrap_payload(await self.client.get_feeds(hostuin, next_cursor))
+                except QzoneRequestError:
+                    payload = await self.client.legacy_feeds(hostuin, page=page_round + 1, num=limit)
                 if isinstance(payload, dict) and isinstance(payload.get("feedpage"), dict):
                     feedpage = payload["feedpage"]
                 else:
@@ -240,12 +237,7 @@ class QzoneDaemonService:
 
             if not isinstance(feedpage, dict):
                 break
-            raw_items = feedpage.get("vFeeds") or feedpage.get("vfeeds") or []
-            page_items = [
-                self.client.feed_entry_from_payload(item, default_hostuin=hostuin)
-                for item in raw_items
-                if isinstance(item, dict)
-            ]
+            feedpage, page_items = extract_feed_page(feedpage, default_hostuin=hostuin)
             self.client.cache_feed_page(hostuin, page_items)
             items.extend(page_items)
             has_more = bool(feedpage.get("hasmore") or feedpage.get("hasMore") or False)
@@ -301,7 +293,6 @@ class QzoneDaemonService:
     async def publish_post(self, *, content: str, sync_weibo: bool = False) -> dict[str, Any]:
         if not content.strip():
             raise QzoneParseError("发布内容不能为空")
-        await self.ensure_token(self.state.session.uin)
         payload = unwrap_payload(await self.client.publish_mood(content, sync_weibo=sync_weibo))
         if not isinstance(payload, dict):
             raise QzoneParseError("发布说说返回结构异常")
@@ -323,7 +314,6 @@ class QzoneDaemonService:
     ) -> dict[str, Any]:
         if not content.strip():
             raise QzoneParseError("评论内容不能为空")
-        await self.ensure_token(hostuin)
         payload = unwrap_payload(await self.client.add_comment(hostuin, fid, content, appid=appid, private=private))
         if not isinstance(payload, dict):
             raise QzoneParseError("评论返回结构异常")

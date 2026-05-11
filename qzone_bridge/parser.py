@@ -52,6 +52,13 @@ def _text(value: Any) -> str:
     return str(value)
 
 
+def _int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return default
+
+
 def parse_cookie_text(cookie_text: str) -> dict[str, str]:
     cookie_text = cookie_text.strip()
     if not cookie_text:
@@ -216,22 +223,31 @@ def unwrap_payload(payload: Any) -> Any:
 
 
 def extract_hostuin(feed_item: dict[str, Any], default: int = 0) -> int:
-    candidate = _dig(feed_item, "userinfo", "uin")
-    if candidate is None:
-        candidate = _dig(feed_item, "user", "uin")
-    if candidate is None:
-        candidate = _dig(feed_item, "userinfo", "user", "uin")
-    if candidate is None:
-        candidate = default
-    try:
-        return int(candidate or 0)
-    except Exception:
-        return default
+    candidates = [
+        feed_item.get("uin"),
+        feed_item.get("hostuin"),
+        feed_item.get("hostUin"),
+        _dig(feed_item, "userinfo", "uin"),
+        _dig(feed_item, "user", "uin"),
+        _dig(feed_item, "userinfo", "user", "uin"),
+        default,
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            value = int(candidate or 0)
+        except Exception:
+            continue
+        if value:
+            return value
+    return default
 
 
 def extract_fid(feed_item: dict[str, Any]) -> str:
     candidates = [
         feed_item.get("fid"),
+        feed_item.get("tid"),
         feed_item.get("cellid"),
         _dig(feed_item, "id", "cellid"),
         _dig(feed_item, "common", "ugcrightkey"),
@@ -245,10 +261,11 @@ def extract_fid(feed_item: dict[str, Any]) -> str:
 
 def extract_summary_text(feed_item: dict[str, Any]) -> str:
     candidates = [
+        _text(feed_item.get("content")),
+        _text(feed_item.get("con")),
         _dig(feed_item, "summary", "summary"),
         _text(feed_item.get("summary")),
         _dig(feed_item, "original", "summary", "summary"),
-        _text(feed_item.get("content")),
         _text(feed_item.get("text")),
     ]
     for candidate in candidates:
@@ -278,26 +295,40 @@ def extract_feed_entry(feed_item: dict[str, Any], *, default_hostuin: int = 0) -
         original = {}
 
     hostuin = extract_hostuin(feed_item, default_hostuin)
-    appid = int(common.get("appid") or feed_item.get("appid") or 311)
+    appid = _int(common.get("appid") or feed_item.get("appid") or 311, 311)
     fid = extract_fid(feed_item)
-    created_at = int(common.get("time") or feed_item.get("abstime") or 0)
+    created_at = _int(common.get("time") or feed_item.get("abstime") or feed_item.get("created_time") or 0)
     summary = extract_summary_text(feed_item)
     if not summary:
         summary = extract_summary_text(original)
 
     curkey = str(
-        common.get("curkey")
-        or common.get("curlikekey")
-        or feed_item.get("curkey")
+        feed_item.get("curkey")
         or feed_item.get("curlikekey")
+        or common.get("curkey")
+        or common.get("curlikekey")
+        or compute_unikey(appid, hostuin, fid)
         or ""
     )
     unikey = compute_unikey(appid, hostuin, fid)
     topic = topic_id(appid, hostuin, fid, created_at)
-    nickname = str(userinfo.get("nickname") or userinfo.get("name") or "")
-    like_count = int(like.get("num") or like.get("likeNum") or like.get("count") or 0)
-    comment_count = int(comment.get("num") or comment.get("commentcount") or 0)
-    liked = bool(like.get("isliked") or like.get("ismylike") or False)
+    nickname = str(feed_item.get("name") or userinfo.get("nickname") or userinfo.get("name") or "")
+    like_count = _int(
+        like.get("num")
+        or like.get("likeNum")
+        or like.get("count")
+        or feed_item.get("likeNum")
+        or feed_item.get("likenum")
+        or feed_item.get("like_num")
+        or 0
+    )
+    raw_comments = feed_item.get("commentlist")
+    comment_count = _int(
+        comment.get("num") or comment.get("commentcount") or feed_item.get("cmtnum") or feed_item.get("commentnum") or 0
+    )
+    if not comment_count and isinstance(raw_comments, list):
+        comment_count = len(raw_comments)
+    liked = bool(like.get("isliked") or like.get("ismylike") or feed_item.get("isliked") or False)
     busi_param = operation.get("busi_param") or {}
     if not isinstance(busi_param, dict):
         busi_param = {}
@@ -324,7 +355,9 @@ def extract_feed_page(payload: dict[str, Any], *, default_hostuin: int = 0) -> t
     feedpage = payload.get("feedpage") if isinstance(payload.get("feedpage"), dict) else payload
     if not isinstance(feedpage, dict):
         return {}, []
-    raw_feeds = feedpage.get("vFeeds") or feedpage.get("vfeeds") or []
+    raw_feeds = feedpage.get("vFeeds") or feedpage.get("vfeeds") or feedpage.get("msglist") or feedpage.get("data") or []
+    if isinstance(raw_feeds, dict):
+        raw_feeds = raw_feeds.get("vFeeds") or raw_feeds.get("vfeeds") or raw_feeds.get("msglist") or raw_feeds.get("data") or []
     if not isinstance(raw_feeds, list):
         raw_feeds = []
     items = [extract_feed_entry(item, default_hostuin=default_hostuin) for item in raw_feeds if isinstance(item, dict)]

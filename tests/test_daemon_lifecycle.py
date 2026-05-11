@@ -3,6 +3,7 @@ import socket
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import AsyncMock, patch
 
 from qzone_bridge.controller import QzoneDaemonController, _port_is_free
 from qzone_bridge.daemon import QzoneDaemonService
@@ -18,6 +19,27 @@ def free_port() -> int:
 
 
 class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_warmup_uses_json_health_check_instead_of_h5_index(self):
+        with TemporaryDirectory() as tmp:
+            service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
+            service.state.session = SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+            service.client.update_session(service.state.session)
+            try:
+                with patch.object(service.client, "index", new=AsyncMock()) as index, patch.object(
+                    service.client,
+                    "mfeeds_get_count",
+                    new=AsyncMock(return_value={"code": 0}),
+                ) as count:
+                    await service.warmup()
+                    index.assert_not_awaited()
+                    count.assert_awaited_once()
+                self.assertFalse(service.state.session.needs_rebind)
+            finally:
+                await service.close()
+
     async def test_4xx_request_error_does_not_degrade_session_health(self):
         with TemporaryDirectory() as tmp:
             service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
@@ -54,6 +76,31 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(service.state.session.qzonetokens, {})
             self.assertEqual(service.client.feed_cache, {})
             await service.close()
+
+    async def test_list_feeds_falls_back_when_h5_home_redirects(self):
+        with TemporaryDirectory() as tmp:
+            service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
+            service.state.session = SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+            service.client.update_session(service.state.session)
+            try:
+                with patch.object(
+                    service.client,
+                    "index",
+                    new=AsyncMock(side_effect=QzoneRequestError("h5 redirect", status_code=302)),
+                ) as index, patch.object(
+                    service.client,
+                    "legacy_recent_feeds",
+                    new=AsyncMock(return_value={"msglist": [{"tid": "fid-1", "uin": 123456, "content": "hello"}]}),
+                ) as legacy:
+                    payload = await service.list_feeds(limit=1)
+                index.assert_awaited_once()
+                legacy.assert_awaited_once()
+                self.assertEqual(payload["items"][0]["fid"], "fid-1")
+            finally:
+                await service.close()
 
 
 class ControllerLifecycleTests(unittest.IsolatedAsyncioTestCase):

@@ -2,9 +2,11 @@ import unittest
 
 from qzone_bridge.parser import (
     extract_feed_entry,
+    extract_feed_page,
     parse_cookie_text,
     parse_index_html,
     parse_profile_html,
+    unwrap_payload,
 )
 from qzone_bridge.utils import gtk
 
@@ -66,6 +68,32 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(entry.curkey, "cur-key")
         self.assertEqual(entry.summary, "hello qzone")
         self.assertEqual(entry.unikey, "https://user.qzone.qq.com/123456/mood/fid-1")
+
+    def test_extract_legacy_feed_entry(self):
+        raw = {
+            "tid": "legacy-fid",
+            "uin": 123456,
+            "name": "Alice",
+            "content": "legacy hello",
+            "created_time": 1715330001,
+            "commentlist": [{"content": "x"}],
+        }
+        entry = extract_feed_entry(raw)
+        self.assertEqual(entry.hostuin, 123456)
+        self.assertEqual(entry.fid, "legacy-fid")
+        self.assertEqual(entry.summary, "legacy hello")
+        self.assertEqual(entry.curkey, "https://user.qzone.qq.com/123456/mood/legacy-fid")
+
+    def test_extract_feed_page_accepts_msglist(self):
+        feedpage, items = extract_feed_page({"msglist": [{"tid": "fid-1", "uin": 123456, "content": "hello"}]})
+        self.assertEqual(feedpage["msglist"][0]["tid"], "fid-1")
+        self.assertEqual(items[0].fid, "fid-1")
+
+    def test_unwrap_payload_keeps_legacy_data_behavior(self):
+        payload = {"data": {"code": -3000, "message": "登录态失效"}}
+        self.assertEqual(unwrap_payload(payload), payload["data"])
+        payload = {"code": -3000, "data": {"x": 1}, "message": "登录态失效"}
+        self.assertEqual(unwrap_payload(payload), {"x": 1})
 
 
 if __name__ == "__main__":
