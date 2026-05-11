@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import sys
 from pathlib import Path
 from typing import Any
@@ -12,8 +13,26 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
-if str(PLUGIN_ROOT) not in sys.path:
+
+
+def _prepare_local_qzone_bridge_imports() -> None:
+    """Force bundled qzone_bridge modules to reload from this plugin directory."""
+
+    def _same_path(value: str) -> bool:
+        try:
+            return Path(value).resolve() == PLUGIN_ROOT
+        except Exception:
+            return False
+
+    sys.path[:] = [path for path in sys.path if not _same_path(path)]
     sys.path.insert(0, str(PLUGIN_ROOT))
+    importlib.invalidate_caches()
+    for name in list(sys.modules):
+        if name == "qzone_bridge" or name.startswith("qzone_bridge."):
+            sys.modules.pop(name, None)
+
+
+_prepare_local_qzone_bridge_imports()
 
 from qzone_bridge.controller import QzoneDaemonController
 from qzone_bridge.errors import DaemonUnavailableError, QzoneBridgeError, QzoneCookieAcquireError, QzoneNeedsRebind
