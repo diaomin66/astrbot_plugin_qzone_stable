@@ -50,6 +50,19 @@ class DomainAwareCookieClient:
         return {"cookies": "uin=o123456; p_uin=o123456; pskey=domain-secret"}
 
 
+class MultiDomainCookieClient:
+    def __init__(self):
+        self.calls = []
+
+    async def get_cookies(self, domain=None):
+        self.calls.append(("get_cookies", domain))
+        if domain == "user.qzone.qq.com":
+            return {"cookies": "uin=o123456; p_uin=o123456; skey=user-skey"}
+        if domain == "h5.qzone.qq.com":
+            return {"cookies": "p_skey=h5-pskey"}
+        return {"cookies": ""}
+
+
 class OneBotCookieTests(unittest.IsolatedAsyncioTestCase):
     def test_extract_cookie_text_from_string(self):
         text = extract_cookie_text("uin=o123; p_uin=o123; skey=abc; p_skey=def")
@@ -122,6 +135,14 @@ class OneBotCookieTests(unittest.IsolatedAsyncioTestCase):
         cookies = parse_cookie_text(text)
         self.assertEqual(cookies["p_skey"], "domain-secret")
         self.assertGreater(len(client.calls), 1)
+
+    async def test_fetch_cookie_text_merges_qzone_domains(self):
+        client = MultiDomainCookieClient()
+        text = await fetch_cookie_text(client, domain="user.qzone.qq.com")
+        cookies = parse_cookie_text(text)
+        self.assertEqual(cookies["skey"], "user-skey")
+        self.assertEqual(cookies["p_skey"], "h5-pskey")
+        self.assertIn(("get_cookies", "h5.qzone.qq.com"), client.calls)
 
 
 if __name__ == "__main__":

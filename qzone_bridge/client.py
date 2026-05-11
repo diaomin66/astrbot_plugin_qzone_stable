@@ -17,7 +17,6 @@ from .parser import (
     cookie_gtk,
     compute_unikey,
     extract_feed_entry,
-    extract_feed_page,
     normalize_uin,
     normalize_cookie_fields,
     parse_index_html,
@@ -31,6 +30,7 @@ log = logging.getLogger(__name__)
 
 AUTH_ERROR_CODES = {-3000}
 AUTH_ERROR_KEYWORDS = ("登录", "失效", "请先登录", "skey", "g_tk", "cookie", "expired", "login")
+LOGIN_REDIRECT_HOSTS = ("ptlogin", "ui.ptlogin", "xui.ptlogin", "ssl.ptlogin", "login")
 
 
 @dataclass(slots=True)
@@ -106,6 +106,22 @@ class QzoneClient:
         normalized = message.lower()
         return any(keyword in message or keyword in normalized for keyword in AUTH_ERROR_KEYWORDS)
 
+    def _raise_payload_error(self, payload: Any, response: httpx.Response) -> None:
+        if not isinstance(payload, dict):
+            return
+        for key in ("ret", "code", "err", "error"):
+            if key in payload and payload.get(key) not in (0, "0", None):
+                raw_code = payload.get(key)
+                try:
+                    code = int(raw_code or 0)
+                except (TypeError, ValueError):
+                    code = 0
+                message = str(payload.get("msg") or payload.get("message") or payload.get("text") or "")
+                if self._payload_needs_rebind(code, message):
+                    raise QzoneNeedsRebind(message or "QQ空间登录态已失效", detail=payload)
+                code_text = raw_code if raw_code not in (None, "") else code
+                raise QzoneRequestError(message or f"QQ空间返回错误码 {code_text}", status_code=response.status_code, detail=payload)
+
     @staticmethod
     def _response_detail(response: httpx.Response) -> dict[str, Any]:
         detail: dict[str, Any] = {
@@ -116,6 +132,23 @@ class QzoneClient:
         if location:
             detail["location"] = location
         return detail
+
+    @staticmethod
+    def _is_login_redirect(location: str) -> bool:
+        if not location:
+            return False
+        lowered = location.lower()
+        return any(host in lowered for host in LOGIN_REDIRECT_HOSTS)
+
+    def _is_qzone_home_redirect(self, response: httpx.Response) -> bool:
+        location = response.headers.get("location") or response.headers.get("Location") or ""
+        if not location:
+            return False
+        lowered = location.lower()
+        if "user.qzone.qq.com" not in lowered:
+            return False
+        uin = str(self.login_uin)
+        return lowered.rstrip("/").endswith(f"/{uin}") or lowered.rstrip("/").endswith("user.qzone.qq.com")
 
     def _persist_cookie_response(self, response: httpx.Response) -> None:
         for key, value in response.cookies.items():
@@ -187,9 +220,24 @@ class QzoneClient:
                     headers=self._headers(referer=referer, origin=origin),
                 )
                 self._persist_cookie_response(response)
-                if response.status_code in (301, 302, 303, 307, 308, 401):
+                location = response.headers.get("location") or response.headers.get("Location") or ""
+                if response.status_code in (301, 302, 303, 307, 308) and self._is_qzone_home_redirect(response):
+                    raise QzoneRequestError(
+                        "QQ空间 H5 入口跳转到个人主页，已切换备用接口",
+                        status_code=response.status_code,
+                        detail=self._response_detail(response),
+                    )
+                if response.status_code == 401 or (
+                    response.status_code in (301, 302, 303, 307, 308) and self._is_login_redirect(location)
+                ):
                     raise QzoneNeedsRebind(
                         "QQ空间登录失效，请重新绑定 Cookie",
+                        detail=self._response_detail(response),
+                    )
+                if response.status_code in (301, 302, 303, 307, 308):
+                    raise QzoneRequestError(
+                        f"QQ空间返回跳转状态码 {response.status_code}",
+                        status_code=response.status_code,
                         detail=self._response_detail(response),
                     )
                 if response.status_code == 403:
@@ -274,20 +322,9 @@ class QzoneClient:
                         "QQ 空间接口返回了非 JSON 响应",
                         detail={"text": text[:500], "url": str(response.request.url)},
                     )
+        self._raise_payload_error(payload, response)
         payload = unwrap_payload(payload)
-        if isinstance(payload, dict):
-            for key in ("ret", "code", "err", "error"):
-                if key in payload and payload.get(key) not in (0, "0", None):
-                    raw_code = payload.get(key)
-                    try:
-                        code = int(raw_code or 0)
-                    except (TypeError, ValueError):
-                        code = 0
-                    message = str(payload.get("msg") or payload.get("message") or payload.get("text") or "")
-                    if self._payload_needs_rebind(code, message):
-                        raise QzoneNeedsRebind(message or "QQ空间登录态已失效", detail=payload)
-                    code_text = raw_code if raw_code not in (None, "") else code
-                    raise QzoneRequestError(message or f"QQ空间返回错误码 {code_text}", status_code=response.status_code, detail=payload)
+        self._raise_payload_error(payload, response)
         return payload if isinstance(payload, dict) else {"data": payload}
 
     def _extract_index_or_profile(self, response_text: str, *, profile: bool = False) -> dict[str, Any]:
@@ -362,6 +399,56 @@ class QzoneClient:
         )
         return payload
 
+    async def legacy_feeds(self, hostuin: int, *, page: int = 1, num: int = 10) -> dict[str, Any]:
+        payload = await self._request_json(
+            "GET",
+            "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6",
+            params={
+                "uin": hostuin,
+                "hostUin": hostuin,
+                "pos": max(0, (max(1, int(page)) - 1) * max(1, int(num))),
+                "num": max(1, int(num)),
+                "replynum": 100,
+                "callback": "_preloadCallback",
+                "code_version": 1,
+                "format": "json",
+                "need_comment": 1,
+                "need_private_comment": 1,
+            },
+            referer=f"https://user.qzone.qq.com/{hostuin}",
+            origin="https://user.qzone.qq.com",
+            hostuin=hostuin,
+            attach_token=False,
+        )
+        return payload
+
+    async def legacy_recent_feeds(self, page: int = 1) -> dict[str, Any]:
+        payload = await self._request_json(
+            "GET",
+            "https://user.qzone.qq.com/proxy/domain/ic2.qzone.qq.com/cgi-bin/feeds/feeds3_html_more",
+            params={
+                "uin": self.login_uin,
+                "scope": 0,
+                "view": 1,
+                "filter": "all",
+                "flag": 1,
+                "applist": "all",
+                "pagenum": max(1, int(page)),
+                "aisortEndTime": 0,
+                "aisortOffset": 0,
+                "aisortBeginTime": 0,
+                "begintime": 0,
+                "format": "json",
+                "useutf8": 1,
+                "outputhtmlfeed": 1,
+            },
+            referer=f"https://user.qzone.qq.com/{self.login_uin}" if self.login_uin else "https://qzone.qq.com/",
+            origin="https://user.qzone.qq.com",
+            hostuin=self.login_uin,
+            attach_token=False,
+        )
+        return payload
+
     async def shuoshuo(self, fid: str, uin: int, appid: int = 311, busi_param: str = "") -> dict[str, Any]:
         payload = await self._request_json(
             "GET",
@@ -398,20 +485,27 @@ class QzoneClient:
         richval = " ".join(photo.get("richval", "") for photo in photos if isinstance(photo, dict))
         payload = await self._request_json(
             "POST",
-            "https://mobile.qzone.qq.com/mood/publish_mood",
+            "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6",
             data={
-                "content": content,
+                "syn_tweet_verson": "1",
+                "paramstr": "1",
+                "who": "1",
+                "con": content,
+                "feedversion": "1",
+                "ver": "1",
+                "ugc_right": 1,
+                "to_sign": 0,
+                "hostuin": self.login_uin,
+                "code_version": "1",
                 "richval": richval,
                 "issyncweibo": int(bool(sync_weibo)),
-                "ugc_right": 1,
-                "opr_type": "publish_shuoshuo",
                 "format": "json",
-                "res_uin": self.login_uin,
+                "qzreferrer": f"https://user.qzone.qq.com/{self.login_uin}",
             },
             referer=f"https://user.qzone.qq.com/{self.login_uin}",
             origin="https://user.qzone.qq.com",
             hostuin=self.login_uin,
-            attach_token=True,
+            attach_token=False,
         )
         return payload
 
@@ -427,21 +521,28 @@ class QzoneClient:
     ) -> dict[str, Any]:
         payload = await self._request_json(
             "POST",
-            "https://h5.qzone.qq.com/webapp/json/qzoneOperation/addComment",
+            "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds",
             json_body=None,
             data={
-                "ownuin": hostuin,
-                "srcId": fid,
-                "isPrivateComment": int(bool(private)),
+                "topicId": f"{hostuin}_{fid}__1",
+                "uin": self.login_uin,
+                "hostUin": hostuin,
+                "feedsType": 100,
+                "inCharset": "utf-8",
+                "outCharset": "utf-8",
+                "plat": "qzone",
+                "source": "ic",
+                "platformid": 52,
+                "format": "fs",
+                "ref": "feeds",
                 "content": content,
-                "appid": appid,
-                "bypass_param": json.dumps({}),
+                "private": int(bool(private)),
                 "busi_param": json.dumps(busi_param or {}, ensure_ascii=False),
             },
             referer=f"https://user.qzone.qq.com/{hostuin}/mood/{fid}",
             origin="https://user.qzone.qq.com",
             hostuin=hostuin,
-            attach_token=True,
+            attach_token=False,
         )
         return payload
 
@@ -459,13 +560,7 @@ class QzoneClient:
             if cached and cached.curkey:
                 curkey = cached.curkey
         if not curkey:
-            detail = await self.shuoshuo(fid=fid, uin=hostuin, appid=appid)
-            detail_payload = unwrap_payload(detail)
-            _, items = extract_feed_page(detail_payload if isinstance(detail_payload, dict) else {}, default_hostuin=hostuin)
-            if items:
-                curkey = items[0].curkey
-        if not curkey:
-            raise QzoneParseError("无法解析 curkey，无法点赞", detail={"hostuin": hostuin, "fid": fid})
+            curkey = compute_unikey(appid, hostuin, fid)
 
         unikey = compute_unikey(appid, hostuin, fid)
         path = (
@@ -487,7 +582,7 @@ class QzoneClient:
             referer=f"https://user.qzone.qq.com/{hostuin}/mood/{fid}",
             origin="https://user.qzone.qq.com",
             hostuin=hostuin,
-            attach_token=True,
+            attach_token=False,
         )
         return payload
 

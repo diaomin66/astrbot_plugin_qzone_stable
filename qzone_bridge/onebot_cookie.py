@@ -7,11 +7,11 @@ import json
 import re
 from typing import Any
 
-from .parser import cookie_gtk, cookie_header, normalize_uin, parse_cookie_text
+from .parser import cookie_header, normalize_cookie_fields, normalize_uin, parse_cookie_text
 
 COOKIE_ACTIONS = ("get_cookies", "get_credentials")
 LOGIN_INFO_ACTIONS = ("get_login_info",)
-COOKIE_DOMAIN_FALLBACKS = ("user.qzone.qq.com", "qzone.qq.com")
+COOKIE_DOMAIN_FALLBACKS = ("user.qzone.qq.com", "qzone.qq.com", "h5.qzone.qq.com", "mobile.qzone.qq.com")
 COOKIE_VALUE_KEYS = (
     "cookies",
     "cookie",
@@ -211,6 +211,19 @@ def _merge_cookie_texts(parts: list[str]) -> str:
     return cookie_header(merged) if merged else ""
 
 
+def _merge_cookie_dicts(base: dict[str, str], incoming: dict[str, str]) -> dict[str, str]:
+    merged = dict(base)
+    for key, value in normalize_cookie_fields(incoming).items():
+        if value and key not in merged:
+            merged[key] = value
+    return merged
+
+
+def _has_auth_cookie(cookies: dict[str, str]) -> bool:
+    normalized = normalize_cookie_fields(cookies)
+    return any(normalized.get(key) for key in ("p_skey", "skey", "skey2"))
+
+
 def extract_cookie_text(payload: Any, *, _depth: int = 0, _seen: set[int] | None = None) -> str:
     """Extract a Cookie header string from OneBot action payloads."""
 
@@ -333,6 +346,7 @@ async def fetch_cookie_text(bot: Any, *, domain: str) -> str:
     """Try several OneBot actions and domains until a Cookie header is found."""
 
     login_uin: int | None = None
+    best_cookies: dict[str, str] = {}
     for action in COOKIE_ACTIONS:
         for candidate_domain in iter_cookie_domains(domain):
             for call_kwargs in ({"domain": candidate_domain}, {}):
@@ -356,6 +370,9 @@ async def fetch_cookie_text(bot: Any, *, domain: str) -> str:
                             cookies = parse_cookie_text(cookie_text)
                         except Exception:
                             cookies = {}
-                if normalize_uin(cookies) and cookie_gtk(cookies):
-                    return cookie_header(cookies)
+                candidate_cookies = _merge_cookie_dicts(best_cookies, cookies)
+                if normalize_uin(candidate_cookies) and _has_auth_cookie(candidate_cookies):
+                    best_cookies = candidate_cookies
+    if normalize_uin(best_cookies) and _has_auth_cookie(best_cookies):
+        return cookie_header(best_cookies)
     return ""
