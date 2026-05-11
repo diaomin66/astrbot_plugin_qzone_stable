@@ -2,25 +2,23 @@
 
 from __future__ import annotations
 
-import contextlib
 import asyncio
+import contextlib
+import logging
 import os
+import signal
 import socket
 import subprocess
 import sys
-import logging
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from . import __version__
-from .errors import DaemonUnavailableError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
-from .models import SessionState
-from .parser import normalize_uin, parse_cookie_text
+from .errors import DaemonUnavailableError, QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
+from .models import BridgeState
 from .protocol import SECRET_HEADER
 from .storage import StateStore, ensure_state_secret
-from .render import cookie_summary as render_cookie_summary
 from .utils import now_iso
 
 
@@ -37,6 +35,101 @@ def _port_is_free(port: int) -> bool:
     return True
 
 
+def _run_quiet(args: list[str], *, timeout: float = 5.0) -> subprocess.CompletedProcess:
+    kwargs: dict[str, Any] = {
+        "capture_output": True,
+        "text": True,
+        "timeout": timeout,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    return subprocess.run(args, **kwargs)
+
+
+def _port_owner_pids(port: int) -> set[int]:
+    pids: set[int] = set()
+    if port <= 0:
+        return pids
+    if os.name == "nt":
+        with contextlib.suppress(Exception):
+            result = _run_quiet(["netstat", "-ano", "-p", "tcp"], timeout=8.0)
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if len(parts) < 5 or parts[0].upper() != "TCP":
+                    continue
+                local_address = parts[1]
+                state = parts[3].upper()
+                pid_text = parts[4]
+                if state != "LISTENING":
+                    continue
+                if local_address.rsplit(":", 1)[-1] != str(port):
+                    continue
+                with contextlib.suppress(ValueError):
+                    pids.add(int(pid_text))
+        return pids
+
+    with contextlib.suppress(Exception):
+        result = _run_quiet(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            timeout=5.0,
+        )
+        for line in result.stdout.splitlines():
+            with contextlib.suppress(ValueError):
+                pids.add(int(line.strip()))
+    if pids:
+        return pids
+
+    with contextlib.suppress(Exception):
+        result = _run_quiet(["fuser", f"{port}/tcp"], timeout=5.0)
+        for token in (result.stdout + " " + result.stderr).split():
+            token = token.strip()
+            if token.isdigit():
+                pids.add(int(token))
+    return pids
+
+
+def _pid_command_line(pid: int) -> str:
+    if pid <= 0:
+        return ""
+    if os.name == "nt":
+        script = f"(Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\").CommandLine"
+        with contextlib.suppress(Exception):
+            result = _run_quiet(["powershell", "-NoProfile", "-Command", script], timeout=5.0)
+            return result.stdout.strip()
+        return ""
+
+    proc_cmdline = Path("/proc") / str(pid) / "cmdline"
+    with contextlib.suppress(Exception):
+        return proc_cmdline.read_text(encoding="utf-8", errors="ignore").replace("\x00", " ").strip()
+    with contextlib.suppress(Exception):
+        result = _run_quiet(["ps", "-p", str(pid), "-o", "command="], timeout=5.0)
+        return result.stdout.strip()
+    return ""
+
+
+def _is_plugin_daemon_pid(pid: int, plugin_root: Path) -> bool:
+    command_line = _pid_command_line(pid).lower()
+    if not command_line:
+        return False
+    root = str(plugin_root).lower()
+    return "daemon_main.py" in command_line and root in command_line
+
+
+def _terminate_pid_tree(pid: int, *, force: bool = False) -> None:
+    if pid <= 0 or pid == os.getpid():
+        return
+    if os.name == "nt":
+        args = ["taskkill", "/PID", str(pid), "/T"]
+        if force:
+            args.append("/F")
+        with contextlib.suppress(Exception):
+            _run_quiet(args, timeout=8.0)
+        return
+
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
+
+
 class QzoneDaemonController:
     def __init__(
         self,
@@ -48,7 +141,6 @@ class QzoneDaemonController:
         start_timeout: float = 20.0,
         keepalive_interval: int = 120,
         user_agent: str = "",
-        auto_start_daemon: bool = True,
     ) -> None:
         self.plugin_root = plugin_root
         self.data_dir = data_dir
@@ -58,30 +150,24 @@ class QzoneDaemonController:
         self.start_timeout = start_timeout
         self.keepalive_interval = keepalive_interval
         self.user_agent = user_agent
-        self.auto_start_daemon = auto_start_daemon
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(request_timeout), trust_env=False)
         self._lock = asyncio.Lock()
         self._process: subprocess.Popen | None = None
 
     def _runtime(self):
-        state = self.store.read()
-        changed = not bool(state.runtime.secret)
-        state = ensure_state_secret(state)
+        state = ensure_state_secret(self.store.read())
         if not state.runtime.daemon_port:
             state.runtime.daemon_port = self.default_port
-            changed = True
-        if changed:
-            self.store.write(state)
+        if not state.runtime.secret:
+            import secrets
+
+            state.runtime.secret = secrets.token_urlsafe(32)
+        self.store.write(state)
         return state.runtime
 
-    def _current_runtime(self):
-        return self.store.read().runtime
-
     def _base_url(self, port: int | None = None) -> str:
-        if port is not None:
-            return f"http://127.0.0.1:{port}"
         runtime = self._runtime()
-        return f"http://127.0.0.1:{runtime.daemon_port}"
+        return f"http://127.0.0.1:{port or runtime.daemon_port}"
 
     def _secret(self) -> str:
         return self._runtime().secret
@@ -89,45 +175,112 @@ class QzoneDaemonController:
     def _daemon_script(self) -> Path:
         return self.plugin_root / "daemon_main.py"
 
-    async def _probe_health(self, port: int, *, secret: str) -> bool:
+    def _spawn_daemon(self, port: int) -> subprocess.Popen:
+        runtime = self._runtime()
+        cmd = [
+            sys.executable,
+            str(self._daemon_script()),
+            "--data-dir",
+            str(self.data_dir),
+            "--port",
+            str(port),
+            "--secret",
+            runtime.secret,
+            "--keepalive-interval",
+            str(self.keepalive_interval),
+            "--request-timeout",
+            str(self.request_timeout),
+        ]
+        if self.user_agent:
+            cmd.extend(["--user-agent", self.user_agent])
+        kwargs: dict[str, Any] = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        else:
+            kwargs["start_new_session"] = True
+        env = os.environ.copy()
+        env["QZONE_BRIDGE_PLUGIN_ROOT"] = str(self.plugin_root)
+        kwargs["env"] = env
+        return subprocess.Popen(cmd, cwd=str(self.plugin_root), **kwargs)
+
+    async def _probe_health(self, port: int | None = None) -> bool:
+        runtime = self._runtime()
         try:
             response = await self._client.get(
                 f"{self._base_url(port)}/health",
-                headers={SECRET_HEADER: secret},
-                timeout=min(2.0, float(self.request_timeout)),
+                headers={SECRET_HEADER: runtime.secret},
             )
+        except httpx.HTTPError:
+            return False
+        if response.status_code != 200:
+            return False
+        try:
             payload = response.json()
         except Exception:
             return False
-        return response.status_code == 200 and bool(payload.get("ok"))
+        return bool(payload.get("ok"))
 
-    async def _request_remote(
+    async def ensure_running(self) -> None:
+        async with self._lock:
+            runtime = self._runtime()
+            port = runtime.daemon_port or self.default_port
+            if await self._probe_health(port):
+                return
+
+            if not _port_is_free(port):
+                candidate = port
+                for _ in range(32):
+                    candidate += 1
+                    if _port_is_free(candidate):
+                        port = candidate
+                        break
+                state = self.store.read()
+                state.runtime.daemon_port = port
+                self.store.write(state)
+
+            if not self._daemon_script().exists():
+                raise DaemonUnavailableError("找不到 daemon_main.py")
+
+            self._process = self._spawn_daemon(port)
+
+            deadline = asyncio.get_running_loop().time() + self.start_timeout
+            while asyncio.get_running_loop().time() < deadline:
+                if await self._probe_health(port):
+                    runtime.daemon_port = port
+                    runtime.daemon_pid = self._process.pid if self._process else 0
+                    runtime.started_at = now_iso()
+                    runtime.last_seen_at = now_iso()
+                    state = self.store.read()
+                    state.runtime = runtime
+                    self.store.write(state)
+                    return
+                if self._process and self._process.poll() is not None:
+                    break
+                await asyncio.sleep(0.5)
+
+            raise DaemonUnavailableError("QQ空间 daemon 启动失败")
+
+    async def _request(
         self,
         method: str,
         path: str,
         *,
-        port: int,
-        secret: str,
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
     ) -> Any:
-        try:
-            response = await self._client.request(
-                method,
-                f"{self._base_url(port)}{path}",
-                headers={SECRET_HEADER: secret},
-                params=params,
-                json=json_body,
-            )
-        except httpx.HTTPError as exc:
-            raise DaemonUnavailableError(
-                "daemon 请求失败",
-                detail={"method": method, "path": path, "port": port, "error": str(exc)},
-            ) from exc
+        await self.ensure_running()
+        runtime = self._runtime()
+        response = await self._client.request(
+            method,
+            f"{self._base_url()}{path}",
+            headers={SECRET_HEADER: runtime.secret},
+            params=params,
+            json=json_body,
+        )
         try:
             payload = response.json()
         except Exception as exc:
-            raise DaemonUnavailableError("daemon returned non-JSON response", detail={"text": response.text[:500]}) from exc
+            raise DaemonUnavailableError("daemon 返回了非 JSON 响应", detail={"text": response.text[:500]}) from exc
         if not payload.get("ok", False):
             error = payload.get("error") or {}
             code = str(error.get("code") or "DAEMON_ERROR")
@@ -142,44 +295,12 @@ class QzoneDaemonController:
             raise DaemonUnavailableError(message, detail=detail)
         return payload.get("data")
 
-    async def _request(
-        self,
-        method: str,
-        path: str,
-        *,
-        params: dict[str, Any] | None = None,
-        json_body: dict[str, Any] | None = None,
-    ) -> Any:
-        runtime = self._runtime()
-        if self.auto_start_daemon:
-            await self.ensure_running()
-            runtime = self._runtime()
-        elif not await self._probe_health(runtime.daemon_port, secret=runtime.secret):
-            raise DaemonUnavailableError("daemon 未运行")
-        return await self._request_remote(
-            method,
-            path,
-            port=runtime.daemon_port,
-            secret=runtime.secret,
-            params=params,
-            json_body=json_body,
-        )
-
     async def get_status(self) -> dict[str, Any]:
         state = self.store.read()
         runtime = state.runtime
         daemon_state = "offline"
-        if runtime.daemon_port and runtime.secret and await self._probe_health(runtime.daemon_port, secret=runtime.secret):
-            try:
-                payload = await self._request_remote("GET", "/status", port=runtime.daemon_port, secret=runtime.secret)
-                if isinstance(payload, dict):
-                    payload.setdefault("session_source", state.session.source)
-                    return payload
-            except Exception as exc:
-                log.debug("status probe failed: %s", exc)
-            daemon_state = "degraded"
-        elif state.session.needs_rebind or not bool(state.session.cookies):
-            daemon_state = "needs_rebind"
+        if runtime.daemon_port and await self._probe_health(runtime.daemon_port):
+            daemon_state = "ready"
         elif state.session.cookies:
             daemon_state = "degraded"
         return {
@@ -190,7 +311,6 @@ class QzoneDaemonController:
             "started_at": runtime.started_at,
             "last_seen_at": runtime.last_seen_at,
             "login_uin": state.session.uin,
-            "session_source": state.session.source,
             "cookie_summary": self.cookie_summary(state.session.cookies),
             "cookie_count": len(state.session.cookies),
             "needs_rebind": state.session.needs_rebind or not bool(state.session.cookies),
@@ -203,66 +323,17 @@ class QzoneDaemonController:
 
     @staticmethod
     def cookie_summary(cookies: dict[str, str]) -> str:
-        return render_cookie_summary(cookies)
+        if not cookies:
+            return "未绑定"
+        keys = ["uin", "p_uin", "skey", "p_skey", "pt4_token", "pt_key"]
+        found = [key for key in keys if key in cookies]
+        return f"{len(cookies)}个字段: " + ", ".join(found or ["未知字段"])
 
     async def bind_cookie(self, cookie_text: str, *, uin: int = 0, source: str = "manual") -> dict[str, Any]:
         return await self._request("POST", "/bind", json_body={"cookie_text": cookie_text, "uin": uin, "source": source})
 
-    async def bind_cookie_local(self, cookie_text: str, *, uin: int = 0, source: str = "manual") -> dict[str, Any]:
-        """Bind cookies directly into the persistent store when the daemon is unavailable."""
-
-        try:
-            return await self.bind_cookie(cookie_text, uin=uin, source=source)
-        except DaemonUnavailableError:
-            cookies = parse_cookie_text(cookie_text)
-            if not cookies:
-                raise QzoneParseError("Cookie 为空，无法绑定")
-            resolved_uin = normalize_uin(cookies, override=uin)
-            if not resolved_uin:
-                raise QzoneParseError("Cookie 中未找到 uin / p_uin，请补齐后重试")
-
-            state = self.store.read()
-            runtime = self._runtime()
-            state.runtime = runtime
-            state.session = SessionState(
-                uin=resolved_uin,
-                cookies=cookies,
-                qzonetokens={},
-                source=source,
-                updated_at=now_iso(),
-                last_ok_at="",
-                last_error=None,
-                revision=state.session.revision + 1,
-                needs_rebind=False,
-            )
-            self.store.write(state)
-            return await self.get_status()
-
     async def unbind(self) -> dict[str, Any]:
         return await self._request("POST", "/unbind", json_body={})
-
-    async def unbind_local(self) -> dict[str, Any]:
-        """Clear cookies even when the daemon is unavailable."""
-
-        try:
-            return await self.unbind()
-        except DaemonUnavailableError:
-            state = self.store.read()
-            runtime = self._runtime()
-            state.runtime = runtime
-            state.session = SessionState(
-                uin=0,
-                cookies={},
-                qzonetokens={},
-                source="manual",
-                updated_at=now_iso(),
-                last_ok_at="",
-                last_error=None,
-                revision=state.session.revision + 1,
-                needs_rebind=True,
-            )
-            self.store.write(state)
-            return await self.get_status()
 
     async def list_feeds(self, *, hostuin: int = 0, limit: int = 5, cursor: str = "", scope: str = "") -> dict[str, Any]:
         return await self._request(
@@ -323,150 +394,121 @@ class QzoneDaemonController:
             },
         )
 
-    def _choose_port(self, preferred: int) -> int:
-        if _port_is_free(preferred):
-            return preferred
-        for port in range(preferred + 1, preferred + 21):
+    async def _daemon_accepts_secret(self, port: int, secret: str) -> bool:
+        if not port or not secret:
+            return False
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(2.0), trust_env=False) as client:
+                response = await client.get(
+                    f"http://127.0.0.1:{port}/health",
+                    headers={SECRET_HEADER: secret},
+                )
+        except httpx.HTTPError:
+            return False
+        if response.status_code != 200:
+            return False
+        with contextlib.suppress(Exception):
+            payload = response.json()
+            return bool(payload.get("ok"))
+        return False
+
+    async def _request_daemon_shutdown(self, port: int, secret: str) -> bool:
+        if not port or not secret:
+            return False
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(2.0), trust_env=False) as client:
+                response = await client.post(
+                    f"http://127.0.0.1:{port}/shutdown",
+                    headers={SECRET_HEADER: secret},
+                )
+        except httpx.HTTPError:
+            return False
+        return response.status_code == 200
+
+    async def _wait_for_port_release(self, port: int, timeout: float = 3.0) -> bool:
+        if not port:
+            return True
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
             if _port_is_free(port):
-                return port
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("127.0.0.1", 0))
-            return int(sock.getsockname()[1])
-
-    def _popen_kwargs(self) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {
-            "cwd": str(self.plugin_root),
-            "stdin": subprocess.DEVNULL,
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
-        }
-        if os.name == "nt":
-            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        return kwargs
-
-    async def _wait_for_health(self, port: int, secret: str, *, timeout: float) -> bool:
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + max(1.0, timeout)
-        while loop.time() < deadline:
-            if self._process is not None and self._process.poll() is not None:
-                return False
-            if await self._probe_health(port, secret=secret):
                 return True
             await asyncio.sleep(0.2)
-        return await self._probe_health(port, secret=secret)
+        return _port_is_free(port)
 
-    async def _wait_for_shutdown(self, port: int, secret: str, *, timeout: float = 5.0) -> bool:
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + max(0.5, timeout)
-        while loop.time() < deadline:
-            if not await self._probe_health(port, secret=secret) and _port_is_free(port):
-                return True
-            await asyncio.sleep(0.2)
-        return not await self._probe_health(port, secret=secret) and _port_is_free(port)
-
-    async def ensure_running(self) -> dict[str, Any]:
-        async with self._lock:
-            runtime = self._runtime()
-            if runtime.daemon_port and runtime.secret and await self._probe_health(runtime.daemon_port, secret=runtime.secret):
-                payload = await self._request_remote(
-                    "GET",
-                    "/status",
-                    port=runtime.daemon_port,
-                    secret=runtime.secret,
-                )
-                return payload if isinstance(payload, dict) else {}
-
-            await self._stop_recorded_daemon(runtime)
-            state = ensure_state_secret(self.store.read())
-            preferred_port = state.runtime.daemon_port or self.default_port
-            port = self._choose_port(int(preferred_port))
-            secret = state.runtime.secret
-            state.runtime.daemon_port = port
-            state.runtime.daemon_pid = 0
-            state.runtime.started_at = ""
-            state.runtime.last_seen_at = now_iso()
-            state.runtime.version = __version__
-            self.store.write(state)
-
-            script = self._daemon_script()
-            if not script.exists():
-                raise DaemonUnavailableError("daemon_main.py 不存在，无法启动 daemon", detail={"path": str(script)})
-
-            cmd = [
-                sys.executable,
-                "-u",
-                str(script),
-                "--data-dir",
-                str(self.data_dir),
-                "--port",
-                str(port),
-                "--secret",
-                secret,
-                "--keepalive-interval",
-                str(self.keepalive_interval),
-                "--request-timeout",
-                str(self.request_timeout),
-                "--user-agent",
-                self.user_agent,
-                "--version",
-                __version__,
-            ]
-            try:
-                self._process = subprocess.Popen(cmd, **self._popen_kwargs())
-            except OSError as exc:
-                raise DaemonUnavailableError("daemon 启动失败", detail={"error": str(exc), "cmd": cmd}) from exc
-
-            state = self.store.read()
-            state.runtime.daemon_pid = int(self._process.pid or 0)
-            state.runtime.daemon_port = port
-            state.runtime.started_at = now_iso()
-            state.runtime.last_seen_at = now_iso()
-            state.runtime.version = __version__
-            self.store.write(state)
-
-            if not await self._wait_for_health(port, secret, timeout=self.start_timeout):
-                exit_code = self._process.poll() if self._process else None
-                await self._terminate_process_handle()
-                raise DaemonUnavailableError(
-                    "daemon 启动超时",
-                    detail={"port": port, "pid": state.runtime.daemon_pid, "exit_code": exit_code},
-                )
-
-            payload = await self._request_remote("GET", "/status", port=port, secret=secret)
-            return payload if isinstance(payload, dict) else {}
-
-    async def _terminate_process_handle(self) -> None:
+    async def _terminate_tracked_process(self) -> None:
         process = self._process
-        if process is None or process.poll() is not None:
-            self._process = None
+        self._process = None
+        if not process or process.poll() is not None:
             return
         process.terminate()
         try:
-            await asyncio.to_thread(process.wait, timeout=3)
+            await asyncio.to_thread(process.wait, 3.0)
         except subprocess.TimeoutExpired:
             process.kill()
-            with contextlib.suppress(Exception):
-                await asyncio.to_thread(process.wait, timeout=3)
-        finally:
-            self._process = None
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                await asyncio.to_thread(process.wait, 2.0)
 
-    async def _stop_recorded_daemon(self, runtime) -> None:
-        port = int(runtime.daemon_port or 0)
-        secret = str(runtime.secret or "")
-        if port and secret and await self._probe_health(port, secret=secret):
-            with contextlib.suppress(QzoneBridgeError):
-                await self._request_remote("POST", "/shutdown", port=port, secret=secret, json_body={})
-            await self._wait_for_shutdown(port, secret, timeout=5.0)
-        await self._terminate_process_handle()
+    async def _kill_plugin_port_owners(
+        self,
+        port: int,
+        *,
+        expected_pids: set[int],
+        trusted_by_secret: bool,
+    ) -> set[int]:
+        killed: set[int] = set()
+        owners = await asyncio.to_thread(_port_owner_pids, port)
+        for pid in owners:
+            if pid <= 0 or pid == os.getpid():
+                continue
+            is_expected = pid in expected_pids
+            is_plugin_daemon = await asyncio.to_thread(_is_plugin_daemon_pid, pid, self.plugin_root)
+            if not (trusted_by_secret or is_expected or is_plugin_daemon):
+                continue
+            await asyncio.to_thread(_terminate_pid_tree, pid, force=False)
+            killed.add(pid)
+
+        if killed and not await self._wait_for_port_release(port, 2.0):
+            for pid in killed:
+                await asyncio.to_thread(_terminate_pid_tree, pid, force=True)
+        return killed
+
+    def _clear_runtime_process_state(self) -> None:
+        state = self.store.read()
+        state.runtime.daemon_pid = 0
+        state.runtime.started_at = ""
+        state.runtime.last_seen_at = ""
+        self.store.write(state)
+
+    async def stop_daemon(self) -> None:
+        state = self.store.read()
+        runtime = state.runtime
+        port = int(runtime.daemon_port or self.default_port or 0)
+        secret = runtime.secret
+        expected_pids = {int(runtime.daemon_pid or 0)}
+        if self._process and self._process.pid:
+            expected_pids.add(int(self._process.pid))
+        expected_pids.discard(0)
+
+        trusted_by_secret = await self._daemon_accepts_secret(port, secret)
+        if trusted_by_secret:
+            await self._request_daemon_shutdown(port, secret)
+            await self._wait_for_port_release(port, 3.0)
+
+        await self._terminate_tracked_process()
+        if (expected_pids or trusted_by_secret) and not await self._wait_for_port_release(port, 0.5):
+            await self._kill_plugin_port_owners(
+                port,
+                expected_pids=expected_pids,
+                trusted_by_secret=trusted_by_secret,
+            )
+            await self._wait_for_port_release(port, 2.0)
+
+        self._clear_runtime_process_state()
 
     async def close(self) -> None:
-        async with self._lock:
-            runtime = self._current_runtime()
-            await self._stop_recorded_daemon(runtime)
-            state = self.store.read()
-            state.runtime.daemon_pid = 0
-            state.runtime.started_at = ""
-            state.runtime.last_seen_at = now_iso()
-            self.store.write(state)
-            self._process = None
-            await self._client.aclose()
+        try:
+            await self.stop_daemon()
+        except Exception:
+            log.warning("failed to stop qzone daemon during plugin close", exc_info=True)
+        await self._client.aclose()
