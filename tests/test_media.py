@@ -48,6 +48,46 @@ class MediaPayloadTests(unittest.TestCase):
         self.assertEqual(payload.content, "6:25")
         self.assertEqual(payload.media, [])
 
+    def test_collects_text_from_raw_string_component(self):
+        payload = collect_post_payload(
+            self.event(["/qzone post raw text"]),
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "raw text")
+        self.assertEqual(payload.media, [])
+
+    def test_strips_prefix_split_across_text_components(self):
+        payload = collect_post_payload(
+            self.event([Plain("/qzone "), Plain("post split text")]),
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "split text")
+        self.assertEqual(payload.media, [])
+
+    def test_strips_fullwidth_slash_command_prefix(self):
+        payload = collect_post_payload(
+            self.event([Plain("\uff0fqzone post fullwidth")]),
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "fullwidth")
+        self.assertEqual(payload.media, [])
+
+    def test_event_prefix_is_stripped_only_once(self):
+        payload = collect_post_payload(
+            self.event([Plain("/qzone post qzone post literal")]),
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "qzone post literal")
+        self.assertEqual(payload.media, [])
+
     def test_strips_command_prefix_from_fallback_content(self):
         payload = collect_post_payload(
             self.event([]),
