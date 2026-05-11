@@ -38,6 +38,38 @@ class MediaPayloadTests(unittest.TestCase):
         self.assertEqual(payload.media[0].kind, "image")
         self.assertEqual(payload.media[0].source, "photo.jpg")
 
+    def test_collects_text_after_qzone_post_without_slash(self):
+        payload = collect_post_payload(
+            self.event([Plain("qzone post 6:25")]),
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "6:25")
+        self.assertEqual(payload.media, [])
+
+    def test_strips_command_prefix_from_fallback_content(self):
+        payload = collect_post_payload(
+            self.event([]),
+            fallback_content="qzone post 6:25",
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "6:25")
+        self.assertEqual(payload.media, [])
+
+    def test_strips_slash_command_prefix_from_fallback_content(self):
+        payload = collect_post_payload(
+            self.event([]),
+            fallback_content="/qzone   post   6:25",
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "6:25")
+        self.assertEqual(payload.media, [])
+
     def test_onebot_image_prefers_download_url(self):
         payload = collect_post_payload(
             self.event(
