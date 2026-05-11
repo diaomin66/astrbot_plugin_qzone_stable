@@ -36,6 +36,7 @@ _prepare_local_qzone_bridge_imports()
 
 from qzone_bridge.controller import QzoneDaemonController
 from qzone_bridge.errors import DaemonUnavailableError, QzoneBridgeError, QzoneCookieAcquireError, QzoneNeedsRebind
+from qzone_bridge.media import collect_post_payload
 from qzone_bridge.models import FeedEntry
 from qzone_bridge.onebot_cookie import fetch_cookie_text
 from qzone_bridge.parser import normalize_uin, parse_cookie_text
@@ -264,7 +265,7 @@ class QzoneStablePlugin(Star):
                 "/qzone unbind",
                 "/qzone feed [hostuin] [limit] [cursor]",
                 "/qzone detail <hostuin> <fid> [appid]",
-                "/qzone post <content>",
+                "/qzone post <content> [图片/图片文件]",
                 "/qzone comment <hostuin> <fid> <content>",
                 "/qzone like <hostuin> <fid> [appid] [unlike]",
                 "",
@@ -358,14 +359,23 @@ class QzoneStablePlugin(Star):
         yield event.plain_result(self._render_detail(payload))
 
     @qzone.command("post")
-    async def qzone_post(self, event: AstrMessageEvent, content: str):
+    async def qzone_post(self, event: AstrMessageEvent, content: str = ""):
         if not self._is_admin(event):
             yield event.plain_result("仅管理员可发说说。")
             return
+        post = collect_post_payload(
+            event,
+            fallback_content=content,
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
-            payload = await self.controller.publish_post(content=content)
+            payload = await self.controller.publish_post(
+                content=post.content,
+                media=[item.to_dict() for item in post.media],
+            )
         except QzoneBridgeError as exc:
             yield event.plain_result(self._error_text(exc))
             return
@@ -460,7 +470,14 @@ class QzoneStablePlugin(Star):
         yield event.plain_result(self._render_detail(payload))
 
     @filter.llm_tool(name="qzone_publish_post")
-    async def tool_publish_post(self, event: AstrMessageEvent, content: str, confirm: bool = False, sync_weibo: bool = False):
+    async def tool_publish_post(
+        self,
+        event: AstrMessageEvent,
+        content: str,
+        confirm: bool = False,
+        sync_weibo: bool = False,
+        media: list[str] | None = None,
+    ):
         """发布一条 QQ 空间说说。
 
         Args:
@@ -471,13 +488,25 @@ class QzoneStablePlugin(Star):
         if not self._is_admin(event):
             yield event.plain_result("仅管理员可发布说说。")
             return
+        post = collect_post_payload(
+            event,
+            fallback_content=content,
+            include_event_text=False,
+            extra_media=media,
+        )
         if self.settings.preview_writes and not confirm:
-            yield event.plain_result(f"待发布草稿: {truncate(content, 120)}。确认后将执行。")
+            draft = truncate(post.content or "（仅附件）", 120)
+            suffix = f"；附件 {len(post.media)} 个" if post.media else ""
+            yield event.plain_result(f"待发布草稿: {draft}{suffix}。确认后将执行。")
             return
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
-            payload = await self.controller.publish_post(content=content, sync_weibo=sync_weibo)
+            payload = await self.controller.publish_post(
+                content=post.content,
+                sync_weibo=sync_weibo,
+                media=[item.to_dict() for item in post.media],
+            )
         except QzoneBridgeError as exc:
             yield event.plain_result(self._error_text(exc))
             return

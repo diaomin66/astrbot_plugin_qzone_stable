@@ -1,0 +1,89 @@
+import types
+import unittest
+
+from qzone_bridge.media import collect_post_payload
+
+
+class Plain:
+    def __init__(self, text):
+        self.text = text
+
+
+class Image:
+    def __init__(self, file="", url=""):
+        self.file = file
+        self.url = url
+
+
+class File:
+    def __init__(self, file, name=""):
+        self.file = file
+        self.name = name
+
+
+class MediaPayloadTests(unittest.TestCase):
+    def event(self, components):
+        return types.SimpleNamespace(message_obj=types.SimpleNamespace(message=components))
+
+    def test_collects_command_text_and_image_components(self):
+        payload = collect_post_payload(
+            self.event([Plain("/qzone post hello "), Image(file="photo.jpg"), Plain("tail")]),
+            fallback_content="Image(file='photo.jpg')",
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "hello tail")
+        self.assertEqual(len(payload.media), 1)
+        self.assertEqual(payload.media[0].kind, "image")
+        self.assertEqual(payload.media[0].source, "photo.jpg")
+
+    def test_onebot_image_prefers_download_url(self):
+        payload = collect_post_payload(
+            self.event(
+                [
+                    {"type": "text", "data": {"text": "/qzone post"}},
+                    {"type": "image", "data": {"file": "abc.image", "url": "https://example.com/a.png"}},
+                ]
+            ),
+            fallback_content="[CQ:image,file=abc.image]",
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "")
+        self.assertEqual(payload.media[0].source, "https://example.com/a.png")
+
+    def test_non_image_file_becomes_readable_reference(self):
+        payload = collect_post_payload(
+            self.event([Plain("/qzone post report "), File(file="notes.txt", name="notes.txt")]),
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.media, [])
+        self.assertEqual(payload.content, "report\n[文件: notes.txt]")
+
+    def test_llm_mode_keeps_explicit_content_and_file_reference(self):
+        payload = collect_post_payload(
+            self.event([Plain("please post this"), File(file="report.pdf", name="report.pdf")]),
+            fallback_content="weekly report",
+            include_event_text=False,
+        )
+
+        self.assertEqual(payload.content, "weekly report\n[文件: report.pdf]")
+        self.assertEqual(payload.media, [])
+
+    def test_stringified_image_fallback_is_ignored_when_image_component_exists(self):
+        payload = collect_post_payload(
+            self.event([Image(file="photo.jpg")]),
+            fallback_content="Image(file='photo.jpg')",
+            include_event_text=False,
+        )
+
+        self.assertEqual(payload.content, "")
+        self.assertEqual(len(payload.media), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

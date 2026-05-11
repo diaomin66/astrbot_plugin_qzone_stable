@@ -409,8 +409,18 @@ class QzoneDaemonController:
             params={"hostuin": hostuin, "fid": fid, "appid": appid, "busi_param": busi_param},
         )
 
-    async def publish_post(self, *, content: str, sync_weibo: bool = False) -> dict[str, Any]:
-        return await self._request("POST", "/post", json_body={"content": content, "sync_weibo": sync_weibo})
+    async def publish_post(
+        self,
+        *,
+        content: str,
+        sync_weibo: bool = False,
+        media: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            "/post",
+            json_body={"content": content, "sync_weibo": sync_weibo, "media": media or []},
+        )
 
     async def comment_post(
         self,

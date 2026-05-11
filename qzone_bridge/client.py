@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 import httpx
 
 from .errors import QzoneNeedsRebind, QzoneParseError, QzoneRequestError
+from .media import QZONE_MAX_IMAGES, is_supported_image, normalize_media_item, source_name
 from .models import FeedEntry, SessionState
 from .parser import (
     cookie_header,
@@ -31,6 +35,7 @@ log = logging.getLogger(__name__)
 AUTH_ERROR_CODES = {-3000}
 AUTH_ERROR_KEYWORDS = ("登录", "失效", "请先登录", "skey", "g_tk", "cookie", "expired", "login")
 LOGIN_REDIRECT_HOSTS = ("ptlogin", "ui.ptlogin", "xui.ptlogin", "ssl.ptlogin", "login")
+QZONE_IMAGE_UPLOAD_URL = "https://up.qzone.qq.com/cgi-bin/upload/cgi_upload_image"
 
 
 @dataclass(slots=True)
@@ -480,28 +485,202 @@ class QzoneClient:
         )
         return payload
 
+    @staticmethod
+    def _photo_type(filename: str, mime_type: str = "") -> int:
+        lowered = f"{filename} {mime_type}".lower()
+        if ".gif" in lowered or "image/gif" in lowered:
+            return 2
+        if ".png" in lowered or "image/png" in lowered:
+            return 3
+        if ".bmp" in lowered or "image/bmp" in lowered:
+            return 4
+        return 1
+
+    @staticmethod
+    def _extract_pic_bo(value: str) -> str:
+        if not value or "bo=" not in value:
+            return ""
+        result = value.split("bo=", 1)[1]
+        for token in ("!!", "&", "#"):
+            result = result.split(token, 1)[0]
+        return unquote(result)
+
+    async def _load_image_source(self, media: dict[str, Any]) -> tuple[bytes, str, str]:
+        item = normalize_media_item(media, default_kind="image")
+        if item is None or not item.source:
+            raise QzoneParseError("图片来源为空，无法上传")
+
+        source = item.source.strip()
+        filename = item.name or source_name(source) or "image.jpg"
+        mime_type = item.mime_type
+        if source.startswith("base64://"):
+            try:
+                return base64.b64decode(source[len("base64://") :], validate=False), filename, mime_type
+            except Exception as exc:
+                raise QzoneParseError("无法解析 base64 图片数据") from exc
+        if source.startswith("data:"):
+            try:
+                header, encoded = source.split(",", 1)
+            except ValueError as exc:
+                raise QzoneParseError("无法解析 data URI 图片数据") from exc
+            header_mime = header[5:].split(";", 1)[0]
+            if ";base64" not in header:
+                raise QzoneParseError("data URI 图片必须使用 base64 编码")
+            try:
+                data = base64.b64decode(encoded, validate=False)
+            except Exception as exc:
+                raise QzoneParseError("无法解析 data URI 图片数据") from exc
+            return data, filename, mime_type or header_mime
+
+        parsed = urlparse(source)
+        if parsed.scheme.lower() in {"http", "https"}:
+            try:
+                response = await self._client.get(
+                    source,
+                    headers=self._headers(referer=f"https://user.qzone.qq.com/{self.login_uin}"),
+                    follow_redirects=True,
+                )
+            except httpx.HTTPError as exc:
+                raise QzoneRequestError("下载图片失败", detail={"url": source}) from exc
+            self._persist_cookie_response(response)
+            if response.status_code >= 400:
+                raise QzoneRequestError(
+                    f"下载图片返回 HTTP {response.status_code}",
+                    status_code=response.status_code,
+                    detail={"url": source, "text": response.text[:500]},
+                )
+            content_type = response.headers.get("content-type", "").split(";", 1)[0]
+            return response.content, filename, mime_type or content_type
+
+        path = Path(source)
+        if not path.exists() or not path.is_file():
+            raise QzoneParseError("图片文件不存在", detail={"path": source})
+        return path.read_bytes(), filename or path.name, mime_type
+
+    @staticmethod
+    def _photo_payload_from_upload(payload: dict[str, Any], *, filename: str = "", mime_type: str = "") -> dict[str, Any]:
+        data = unwrap_payload(payload)
+        if not isinstance(data, dict):
+            raise QzoneParseError("图片上传返回结构异常", detail=payload)
+        albumid = str(data.get("albumid") or data.get("albumId") or "")
+        lloc = str(data.get("lloc") or data.get("LLoc") or "")
+        sloc = str(data.get("sloc") or data.get("SLoc") or "")
+        photo_type = str(data.get("type") or QzoneClient._photo_type(filename, mime_type))
+        height = str(data.get("height") or data.get("h") or 0)
+        width = str(data.get("width") or data.get("w") or 0)
+        if not albumid or not lloc or not sloc:
+            raise QzoneParseError("图片上传返回缺少 richval 字段", detail=data)
+        url = str(data.get("url") or data.get("origin_url") or data.get("originUrl") or data.get("pre") or "")
+        pic_bo = str(data.get("pic_bo") or data.get("picBo") or QzoneClient._extract_pic_bo(url) or "")
+        richval = f",{albumid},{lloc},{sloc},{photo_type},{height},{width},,{height},{width}"
+        return {
+            "albumid": albumid,
+            "lloc": lloc,
+            "sloc": sloc,
+            "type": photo_type,
+            "height": height,
+            "width": width,
+            "url": url,
+            "pic_bo": pic_bo,
+            "richval": richval,
+        }
+
+    async def upload_photo(self, media: dict[str, Any]) -> dict[str, Any]:
+        item = normalize_media_item(media, default_kind="image")
+        if item is None or not is_supported_image(item):
+            raise QzoneParseError("QQ空间说说仅支持上传图片附件", detail=media)
+        data, filename, mime_type = await self._load_image_source(item.to_dict())
+        if not data:
+            raise QzoneParseError("图片内容为空，无法上传", detail={"name": filename})
+
+        encoded = base64.b64encode(data).decode("ascii")
+        skey = self.session.cookies.get("skey") or self.session.cookies.get("p_skey") or ""
+        p_skey = self.session.cookies.get("p_skey") or self.session.cookies.get("skey") or ""
+        upload_payload = await self._request_json(
+            "POST",
+            QZONE_IMAGE_UPLOAD_URL,
+            params={"g_tk": self.gtk},
+            data={
+                "filename": filename,
+                "uin": self.login_uin,
+                "skey": skey,
+                "zzpaneluin": self.login_uin,
+                "p_uin": self.login_uin,
+                "p_skey": p_skey,
+                "qzonetoken": self.session.qzonetokens.get(str(self.login_uin), ""),
+                "uploadtype": "1",
+                "albumtype": "7",
+                "exttype": "0",
+                "refer": "shuoshuo",
+                "output_type": "json",
+                "charset": "utf-8",
+                "output_charset": "utf-8",
+                "upload_hd": "1",
+                "hd_width": "2048",
+                "hd_height": "10000",
+                "hd_quality": "96",
+                "backUrls": (
+                    "http://upbak.photo.qzone.qq.com/cgi-bin/upload/cgi_upload_image,"
+                    "http://119.147.64.75/cgi-bin/upload/cgi_upload_image"
+                ),
+                "url": f"{QZONE_IMAGE_UPLOAD_URL}?g_tk={self.gtk}",
+                "base64": "1",
+                "picfile": encoded,
+                "qzreferrer": f"https://user.qzone.qq.com/{self.login_uin}",
+            },
+            referer=f"https://user.qzone.qq.com/{self.login_uin}",
+            origin="https://user.qzone.qq.com",
+            hostuin=self.login_uin,
+            attach_token=False,
+        )
+        return self._photo_payload_from_upload(upload_payload, filename=filename, mime_type=mime_type)
+
+    async def _prepare_publish_photos(self, photos: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        if photos and len(photos) > QZONE_MAX_IMAGES:
+            raise QzoneParseError(f"QQ空间说说最多支持 {QZONE_MAX_IMAGES} 张图片")
+        prepared: list[dict[str, Any]] = []
+        for photo in photos or []:
+            if isinstance(photo, dict) and photo.get("richval"):
+                prepared.append(photo)
+                continue
+            prepared.append(await self.upload_photo(photo))
+        if len(prepared) > QZONE_MAX_IMAGES:
+            raise QzoneParseError(f"QQ空间说说最多支持 {QZONE_MAX_IMAGES} 张图片")
+        return prepared
+
     async def publish_mood(self, content: str, *, sync_weibo: bool = False, photos: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-        photos = photos or []
-        richval = " ".join(photo.get("richval", "") for photo in photos if isinstance(photo, dict))
+        photos = await self._prepare_publish_photos(photos)
+        richval = "\t".join(photo.get("richval", "") for photo in photos if isinstance(photo, dict))
+        pic_bo = ",".join(photo.get("pic_bo", "") for photo in photos if isinstance(photo, dict) and photo.get("pic_bo"))
+        data = {
+            "syn_tweet_verson": "1",
+            "paramstr": "1",
+            "who": "1",
+            "con": content,
+            "feedversion": "1",
+            "ver": "1",
+            "ugc_right": 1,
+            "to_sign": 0,
+            "hostuin": self.login_uin,
+            "code_version": "1",
+            "richval": richval,
+            "issyncweibo": int(bool(sync_weibo)),
+            "format": "json",
+            "qzreferrer": f"https://user.qzone.qq.com/{self.login_uin}",
+        }
+        if photos:
+            data.update(
+                {
+                    "richtype": "1",
+                    "subrichtype": "1",
+                    "pic_bo": pic_bo,
+                    "pic_template": "",
+                }
+            )
         payload = await self._request_json(
             "POST",
             "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6",
-            data={
-                "syn_tweet_verson": "1",
-                "paramstr": "1",
-                "who": "1",
-                "con": content,
-                "feedversion": "1",
-                "ver": "1",
-                "ugc_right": 1,
-                "to_sign": 0,
-                "hostuin": self.login_uin,
-                "code_version": "1",
-                "richval": richval,
-                "issyncweibo": int(bool(sync_weibo)),
-                "format": "json",
-                "qzreferrer": f"https://user.qzone.qq.com/{self.login_uin}",
-            },
+            data=data,
             referer=f"https://user.qzone.qq.com/{self.login_uin}",
             origin="https://user.qzone.qq.com",
             hostuin=self.login_uin,
