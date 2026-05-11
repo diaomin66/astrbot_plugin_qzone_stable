@@ -127,6 +127,32 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await service.close()
 
+    async def test_publish_post_allows_media_only_posts(self):
+        with TemporaryDirectory() as tmp:
+            service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
+            service.state.session = SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+            service.client.update_session(service.state.session)
+            try:
+                with patch.object(
+                    service.client,
+                    "publish_mood",
+                    new=AsyncMock(return_value={"fid": "fid-media", "message": "ok"}),
+                ) as publish:
+                    payload = await service.publish_post(
+                        content="",
+                        media=[{"kind": "image", "source": "base64://aGVsbG8=", "name": "photo.jpg"}],
+                    )
+                publish.assert_awaited_once()
+                _, kwargs = publish.await_args
+                self.assertEqual(kwargs["photos"][0]["source"], "base64://aGVsbG8=")
+                self.assertEqual(payload["fid"], "fid-media")
+                self.assertEqual(payload["photo_count"], 1)
+            finally:
+                await service.close()
+
     async def test_comment_and_like_do_not_probe_h5_index_for_token(self):
         with TemporaryDirectory() as tmp:
             service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())

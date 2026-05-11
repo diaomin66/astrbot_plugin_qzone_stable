@@ -15,6 +15,7 @@ from aiohttp import web
 
 from .client import FeedPageResult, QzoneClient
 from .errors import QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
+from .media import QZONE_MAX_IMAGES, media_reference_text, normalize_media_list, split_publishable_images
 from .models import BridgeState, FeedEntry, SessionState
 from .parser import extract_feed_entry, extract_feed_page, normalize_uin, parse_cookie_text, unwrap_payload
 from .protocol import SECRET_HEADER, fail, ok
@@ -304,17 +305,38 @@ class QzoneDaemonService:
                     )
         return {"entry": asdict(entry), "comments": comments, "raw": payload}
 
-    async def publish_post(self, *, content: str, sync_weibo: bool = False) -> dict[str, Any]:
-        if not content.strip():
+    async def publish_post(
+        self,
+        *,
+        content: str,
+        sync_weibo: bool = False,
+        media: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        normalized_media = normalize_media_list(media)
+        photos, fallback_media = split_publishable_images(normalized_media)
+        if len(photos) > QZONE_MAX_IMAGES:
+            raise QzoneParseError(f"QQ空间说说最多支持 {QZONE_MAX_IMAGES} 张图片")
+        if fallback_media:
+            refs = "\n".join(media_reference_text(item) for item in fallback_media)
+            content = "\n".join(part for part in (content.strip(), refs) if part)
+        if not content.strip() and not photos:
             raise QzoneParseError("发布内容不能为空")
         self._ensure_session_ready()
-        payload = unwrap_payload(await self.client.publish_mood(content, sync_weibo=sync_weibo))
+        payload = unwrap_payload(
+            await self.client.publish_mood(
+                content,
+                sync_weibo=sync_weibo,
+                photos=[item.to_dict() for item in photos],
+            )
+        )
         if not isinstance(payload, dict):
             raise QzoneParseError("发布说说返回结构异常")
         self._set_success()
         return {
             "fid": payload.get("fid") or payload.get("tid") or "",
             "message": payload.get("msg") or payload.get("message") or "",
+            "media_count": len(normalized_media),
+            "photo_count": len(photos),
             "raw": payload,
         }
 
@@ -409,7 +431,7 @@ async def _json_body(request: web.Request) -> dict[str, Any]:
 
 
 def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None = None) -> web.Application:
-    app = web.Application(client_max_size=8 * 1024 * 1024)
+    app = web.Application(client_max_size=32 * 1024 * 1024)
     app["service"] = service
     if shutdown_event is not None:
         app["shutdown_event"] = shutdown_event
@@ -477,8 +499,9 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
         body = await _json_body(request)
         content = str(body.get("content") or "")
         sync_weibo = bool(body.get("sync_weibo") or False)
+        media = body.get("media") or body.get("attachments") or body.get("photos") or []
         try:
-            payload = await service.publish_post(content=content, sync_weibo=sync_weibo)
+            payload = await service.publish_post(content=content, sync_weibo=sync_weibo, media=media)
         except QzoneBridgeError as exc:
             service._set_error(exc)
             return fail(exc.code, exc.message, detail=exc.detail)

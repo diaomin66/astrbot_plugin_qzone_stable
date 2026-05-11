@@ -12,7 +12,7 @@ from textwrap import dedent
 from typing import Any, Iterable, TypeVar
 
 MATCH_PAIR = {"{": "}", "[": "]"}
-CALLBACK_RE = re.compile(r"callback\(\s*([\{\[].*[\}\]])\s*\)", re.S | re.I)
+CALLBACK_RE = re.compile(r"(?:[A-Za-z_$][\w$]*\.)*[A-Za-z_$][\w$]*\(\s*([\{\[].*[\}\]])\s*\)", re.S)
 SCRIPT_RE = re.compile(
     r"<script[^>]+type=[\"']application/javascript[\"'][^>]*>(.*?)</script>",
     re.S | re.I,

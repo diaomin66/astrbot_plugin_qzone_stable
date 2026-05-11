@@ -8,6 +8,7 @@
 - AstrBot 负责命令、LLM tools 和展示
 - Cookie 持久化，断线后可自动恢复
 - 支持从 OneBot v11 平台自动获取 Cookie
+- 发布说说支持文字、图片、图片文件以及文件+文字组合
 
 ## 使用
 
@@ -19,7 +20,7 @@
    - `/qzone autobind`
    - `/qzone feed`
    - `/qzone detail <hostuin> <fid>`
-   - `/qzone post <content>`
+   - `/qzone post <content>`（可同消息携带图片/图片文件，普通文件会写入可读引用）
    - `/qzone comment <hostuin> <fid> <content>`
    - `/qzone like <hostuin> <fid>`
 
