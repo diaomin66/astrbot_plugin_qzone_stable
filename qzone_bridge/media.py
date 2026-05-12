@@ -16,7 +16,8 @@ QZONE_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 TEXT_KINDS = {"plain", "text"}
 MEDIA_KINDS = {"image", "file", "video", "record", "audio", "voice"}
 COMPONENT_STRING_RE = re.compile(r"\b(?:Image|Video|File|Record|Plain)\s*\(|\[CQ:(?:image|video|file|record)\b", re.I)
-COMMAND_SEPARATOR_CHARS = ":：,，;；"
+COMMAND_SEPARATOR_CHARS = ":\uFF1A,\uFF0C;\uFF1B"
+COMMAND_PREFIX_CHARS = "/\uFF0F!\uFF01#\uFF03.\uFF0E\u3002~\uFF5E?\uFF1F"
 LEADING_SPACE_CHARS = " \t\r\n\f\v\u3000\ufeff\u200b\u200c\u200d"
 
 
@@ -298,7 +299,7 @@ def _component_media(component: Any, kind: str) -> PostMedia | None:
 
 def _event_message_text(event: Any) -> str:
     message_obj = getattr(event, "message_obj", None)
-    for owner in (message_obj, event):
+    for owner in (event, message_obj):
         value = getattr(owner, "message_str", None)
         if isinstance(value, str) and value:
             return value
@@ -352,7 +353,8 @@ def _strip_leading_command_noise(text: str) -> tuple[str, bool]:
             value = value[match.end() :].lstrip(LEADING_SPACE_CHARS)
             stripped_noise = True
             continue
-        match = re.match(r"@\S+\s+", value)
+        mention_boundary = re.escape(LEADING_SPACE_CHARS + COMMAND_SEPARATOR_CHARS + COMMAND_PREFIX_CHARS)
+        match = re.match(r"@\S+?(?:[" + mention_boundary + r"]+|$)", value)
         if match:
             value = value[match.end() :].lstrip(LEADING_SPACE_CHARS)
             stripped_noise = True
@@ -374,7 +376,8 @@ def strip_command_prefix(text: str, prefixes: Iterable[str]) -> str:
         prefix = prefix.strip().lstrip("/\uff0f").strip()
         if not prefix:
             continue
-        pattern = r"^[/\uFF0F]?\s*" + r"\s+".join(re.escape(part) for part in prefix.split())
+        command_marker = r"(?:[" + re.escape(COMMAND_PREFIX_CHARS) + r"]+\s*)?"
+        pattern = r"^" + command_marker + r"\s*" + r"\s+".join(re.escape(part) for part in prefix.split())
         match = re.match(pattern, stripped, re.I)
         if match:
             return _strip_command_separator(stripped[match.end() :])
@@ -424,6 +427,8 @@ def collect_post_payload(
     first_text = True
     event_prefix_stripped = False
     components = iter_event_components(event)
+    event_text = _event_message_text(event)
+    event_text_consumed = False
 
     for component in components:
         kind = _component_kind(component)
@@ -447,8 +452,16 @@ def collect_post_payload(
                 reference_parts.append(media_reference_text(item))
 
     media.extend(normalize_media_list(extra_media))
-    if include_event_text and not content_parts and components:
-        event_text = _event_message_text(event)
+    if include_event_text and command_prefixes and event_text:
+        event_content = strip_command_prefix(event_text, command_prefixes).strip()
+        if event_content != event_text.strip():
+            event_text_consumed = True
+            if media and looks_like_component_string(event_content):
+                content_parts = []
+            else:
+                content_parts = [event_content] if event_content else []
+            event_prefix_stripped = True
+    if include_event_text and not content_parts and components and not event_text_consumed:
         if event_text and not (media and looks_like_component_string(event_text)):
             content_parts.append(event_text)
     content = "".join(content_parts).strip() if include_event_text else ""

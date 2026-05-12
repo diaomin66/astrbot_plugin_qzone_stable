@@ -83,6 +83,51 @@ class ControllerBindTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await controller.close()
 
+    async def test_publish_post_strips_command_prefix_before_daemon_request(self):
+        with TemporaryDirectory() as tmp:
+            controller = QzoneDaemonController(
+                plugin_root=Path(tmp),
+                data_dir=Path(tmp) / "data",
+                default_port=19009,
+                request_timeout=1.0,
+                start_timeout=1.0,
+                keepalive_interval=30,
+                user_agent="test-agent",
+            )
+            try:
+                with patch.object(controller, "_request", new=AsyncMock(return_value={"fid": "fid-1"})) as request:
+                    payload = await controller.publish_post(content="!qzone post hello")
+                request.assert_awaited_once()
+                self.assertEqual(request.await_args.kwargs["json_body"]["content"], "hello")
+                self.assertTrue(request.await_args.kwargs["json_body"]["content_sanitized"])
+                self.assertEqual(payload["fid"], "fid-1")
+            finally:
+                await controller.close()
+
+    async def test_publish_post_preserves_content_marked_sanitized(self):
+        with TemporaryDirectory() as tmp:
+            controller = QzoneDaemonController(
+                plugin_root=Path(tmp),
+                data_dir=Path(tmp) / "data",
+                default_port=19009,
+                request_timeout=1.0,
+                start_timeout=1.0,
+                keepalive_interval=30,
+                user_agent="test-agent",
+            )
+            try:
+                with patch.object(controller, "_request", new=AsyncMock(return_value={"fid": "fid-1"})) as request:
+                    payload = await controller.publish_post(
+                        content="qzone post literal",
+                        content_sanitized=True,
+                    )
+                request.assert_awaited_once()
+                self.assertEqual(request.await_args.kwargs["json_body"]["content"], "qzone post literal")
+                self.assertTrue(request.await_args.kwargs["json_body"]["content_sanitized"])
+                self.assertEqual(payload["fid"], "fid-1")
+            finally:
+                await controller.close()
+
 
 if __name__ == "__main__":
     unittest.main()

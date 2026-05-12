@@ -15,7 +15,7 @@ from aiohttp import web
 
 from .client import FeedPageResult, QzoneClient
 from .errors import QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
-from .media import QZONE_MAX_IMAGES, media_reference_text, normalize_media_list, split_publishable_images
+from .media import QZONE_MAX_IMAGES, media_reference_text, normalize_media_list, split_publishable_images, strip_command_prefix
 from .models import BridgeState, FeedEntry, SessionState
 from .parser import extract_feed_entry, extract_feed_page, normalize_uin, parse_cookie_text, unwrap_payload
 from .protocol import SECRET_HEADER, fail, ok
@@ -311,7 +311,11 @@ class QzoneDaemonService:
         content: str,
         sync_weibo: bool = False,
         media: list[dict[str, Any]] | None = None,
+        content_sanitized: bool = False,
     ) -> dict[str, Any]:
+        content = str(content or "")
+        if not content_sanitized:
+            content = strip_command_prefix(content, ("qzone post",)).strip()
         normalized_media = normalize_media_list(media)
         photos, fallback_media = split_publishable_images(normalized_media)
         if len(photos) > QZONE_MAX_IMAGES:
@@ -500,8 +504,14 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
         content = str(body.get("content") or "")
         sync_weibo = bool(body.get("sync_weibo") or False)
         media = body.get("media") or body.get("attachments") or body.get("photos") or []
+        content_sanitized = bool(body.get("content_sanitized") or False)
         try:
-            payload = await service.publish_post(content=content, sync_weibo=sync_weibo, media=media)
+            payload = await service.publish_post(
+                content=content,
+                sync_weibo=sync_weibo,
+                media=media,
+                content_sanitized=content_sanitized,
+            )
         except QzoneBridgeError as exc:
             service._set_error(exc)
             return fail(exc.code, exc.message, detail=exc.detail)

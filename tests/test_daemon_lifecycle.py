@@ -1,14 +1,20 @@
 import asyncio
 import socket
+import warnings
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, patch
 
+import httpx
+from aiohttp import web
+from aiohttp.web_app import NotAppKeyWarning
+
 from qzone_bridge.controller import QzoneDaemonController, _port_is_free
-from qzone_bridge.daemon import QzoneDaemonService
+from qzone_bridge.daemon import QzoneDaemonService, create_app
 from qzone_bridge.errors import QzoneNeedsRebind, QzoneRequestError
 from qzone_bridge.models import FeedEntry, SessionState
+from qzone_bridge.protocol import SECRET_HEADER
 from qzone_bridge.storage import StateStore
 
 
@@ -125,6 +131,92 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
                 publish.assert_awaited_once()
                 self.assertEqual(payload["fid"], "fid-1")
             finally:
+                await service.close()
+
+    async def test_publish_post_strips_command_prefix_before_client_publish(self):
+        with TemporaryDirectory() as tmp:
+            service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
+            service.state.session = SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+            service.client.update_session(service.state.session)
+            try:
+                with patch.object(
+                    service.client,
+                    "publish_mood",
+                    new=AsyncMock(return_value={"fid": "fid-1", "message": "ok"}),
+                ) as publish:
+                    payload = await service.publish_post(content="!qzone post hello")
+                publish.assert_awaited_once()
+                self.assertEqual(publish.await_args.args[0], "hello")
+                self.assertEqual(payload["fid"], "fid-1")
+            finally:
+                await service.close()
+
+    async def test_publish_post_preserves_content_marked_sanitized(self):
+        with TemporaryDirectory() as tmp:
+            service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
+            service.state.session = SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+            service.client.update_session(service.state.session)
+            try:
+                with patch.object(
+                    service.client,
+                    "publish_mood",
+                    new=AsyncMock(return_value={"fid": "fid-1", "message": "ok"}),
+                ) as publish:
+                    payload = await service.publish_post(
+                        content="qzone post literal",
+                        content_sanitized=True,
+                    )
+                publish.assert_awaited_once()
+                self.assertEqual(publish.await_args.args[0], "qzone post literal")
+                self.assertEqual(payload["fid"], "fid-1")
+            finally:
+                await service.close()
+
+    async def test_post_route_strips_raw_prefix_but_preserves_sanitized_content(self):
+        with TemporaryDirectory() as tmp:
+            port = free_port()
+            service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=port)
+            service.state.session = SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+            service.client.update_session(service.state.session)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", NotAppKeyWarning)
+                app = create_app(service)
+            runner = web.AppRunner(app, access_log=None)
+            await runner.setup()
+            site = web.TCPSite(runner, host="127.0.0.1", port=port)
+            try:
+                await site.start()
+                with patch.object(
+                    service.client,
+                    "publish_mood",
+                    new=AsyncMock(return_value={"fid": "fid-1", "message": "ok"}),
+                ) as publish:
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0), trust_env=False) as client:
+                        raw_response = await client.post(
+                            f"http://127.0.0.1:{port}/post",
+                            headers={SECRET_HEADER: "secret"},
+                            json={"content": "!qzone post hello"},
+                        )
+                        sanitized_response = await client.post(
+                            f"http://127.0.0.1:{port}/post",
+                            headers={SECRET_HEADER: "secret"},
+                            json={"content": "qzone post literal", "content_sanitized": True},
+                        )
+                self.assertEqual(raw_response.status_code, 200)
+                self.assertEqual(sanitized_response.status_code, 200)
+                self.assertEqual(publish.await_args_list[0].args[0], "hello")
+                self.assertEqual(publish.await_args_list[1].args[0], "qzone post literal")
+            finally:
+                await runner.cleanup()
                 await service.close()
 
     async def test_publish_post_allows_media_only_posts(self):

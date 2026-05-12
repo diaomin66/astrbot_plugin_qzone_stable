@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 
 from .errors import DaemonUnavailableError, QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
+from .media import strip_command_prefix
 from .models import SessionState
 from .parser import normalize_uin, parse_cookie_text
 from .protocol import SECRET_HEADER
@@ -415,11 +416,20 @@ class QzoneDaemonController:
         content: str,
         sync_weibo: bool = False,
         media: list[dict[str, Any]] | None = None,
+        content_sanitized: bool = False,
     ) -> dict[str, Any]:
+        content = str(content or "")
+        if not content_sanitized:
+            content = strip_command_prefix(content, ("qzone post",)).strip()
         return await self._request(
             "POST",
             "/post",
-            json_body={"content": content, "sync_weibo": sync_weibo, "media": media or []},
+            json_body={
+                "content": content,
+                "sync_weibo": sync_weibo,
+                "media": media or [],
+                "content_sanitized": True,
+            },
         )
 
     async def comment_post(
