@@ -1,10 +1,11 @@
 name: astrbot_plugin_qzone_stable
 version: 0.1.2
-author: OpenAI
-description: Stable QQ空间 bridge with a local daemon and LLM tools.
-desc: Stable QQ空间 bridge with a local daemon and LLM tools.
-short_desc: 稳定的 QQ 空间接入与 LLM 工具插件
-display_name: QQ空间 Stable Bridge
+author: 雪碧bir
+description: QQ空间Ultra bridge with a local daemon and LLM tools.
+desc: QQ空间Ultra bridge with a local daemon and LLM tools.
+short_desc: QQ空间Ultra 接入与 LLM 工具插件
+display_name: QQ空间Ultra（QzoneUltra）
+repo: https://github.com/diaomin66/astrbot_plugin_qzone_stable
 entry: main.py
 support_platforms: []
 astrbot_version: ">=4.0.0"
