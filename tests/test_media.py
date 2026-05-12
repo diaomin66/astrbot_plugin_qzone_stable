@@ -68,6 +68,38 @@ class MediaPayloadTests(unittest.TestCase):
         self.assertEqual(payload.content, "split text")
         self.assertEqual(payload.media, [])
 
+    def test_strips_prefix_split_across_token_components(self):
+        payload = collect_post_payload(
+            self.event([Plain("/qzone "), Plain("post"), Plain("token text")]),
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "token text")
+        self.assertEqual(payload.media, [])
+
+    def test_strips_prefix_split_without_boundary_spaces(self):
+        payload = collect_post_payload(
+            self.event([Plain("/qzone"), Plain("post"), Plain("compact text")]),
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "compact text")
+        self.assertEqual(payload.media, [])
+
+    def test_uses_event_message_str_when_components_are_missing(self):
+        event = types.SimpleNamespace(message_obj=types.SimpleNamespace(message=[]), message_str="/qzone post full text")
+        payload = collect_post_payload(
+            event,
+            fallback_content="full",
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "full text")
+        self.assertEqual(payload.media, [])
+
     def test_strips_fullwidth_slash_command_prefix(self):
         payload = collect_post_payload(
             self.event([Plain("\uff0fqzone post fullwidth")]),

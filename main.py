@@ -87,6 +87,15 @@ class QzoneStablePlugin(Star):
             pass
         return self._sender_id(event) in set(self.settings.admin_uins)
 
+    def _command_result(self, event: AstrMessageEvent, text: str):
+        stopper = getattr(event, "stop_event", None)
+        if callable(stopper):
+            try:
+                stopper()
+            except Exception:
+                pass
+        return event.plain_result(text)
+
     def _error_text(self, exc: QzoneBridgeError) -> str:
         if not exc.detail:
             return exc.message
@@ -278,57 +287,57 @@ class QzoneStablePlugin(Star):
                 "qzone_like_post",
             ]
         )
-        yield event.plain_result(text)
+        yield self._command_result(event, text)
 
     @qzone.command("status")
     async def qzone_status(self, event: AstrMessageEvent):
         if not self._is_admin(event):
-            yield event.plain_result("仅管理员可查看状态。")
+            yield self._command_result(event, "仅管理员可查看状态。")
             return
         try:
             payload = await self.controller.get_status()
         except QzoneBridgeError as exc:
-            yield event.plain_result(self._error_text(exc))
+            yield self._command_result(event, self._error_text(exc))
             return
-        yield event.plain_result(format_status(payload))
+        yield self._command_result(event, format_status(payload))
 
     @qzone.command("bind")
     async def qzone_bind(self, event: AstrMessageEvent, cookie: str):
         if not self._is_admin(event):
-            yield event.plain_result("仅管理员可绑定 Cookie。")
+            yield self._command_result(event, "仅管理员可绑定 Cookie。")
             return
         try:
             payload = await self.controller.bind_cookie_local(cookie)
         except QzoneBridgeError as exc:
             logger.warning("qzone bind failed: %s", exc)
-            yield event.plain_result(self._error_text(exc))
+            yield self._command_result(event, self._error_text(exc))
             return
-        yield event.plain_result(format_status(payload))
+        yield self._command_result(event, format_status(payload))
 
     @qzone.command("autobind")
     async def qzone_autobind(self, event: AstrMessageEvent):
         if not self._is_admin(event):
-            yield event.plain_result("仅管理员可自动绑定 Cookie。")
+            yield self._command_result(event, "仅管理员可自动绑定 Cookie。")
             return
         try:
             payload = await self._auto_bind_cookie(event, force=True, source="aiocqhttp")
         except QzoneBridgeError as exc:
             logger.warning("qzone autobind failed: %s", exc)
-            yield event.plain_result(self._error_text(exc))
+            yield self._command_result(event, self._error_text(exc))
             return
-        yield event.plain_result(format_status(payload))
+        yield self._command_result(event, format_status(payload))
 
     @qzone.command("unbind")
     async def qzone_unbind(self, event: AstrMessageEvent):
         if not self._is_admin(event):
-            yield event.plain_result("仅管理员可解绑。")
+            yield self._command_result(event, "仅管理员可解绑。")
             return
         try:
             payload = await self.controller.unbind_local()
         except QzoneBridgeError as exc:
-            yield event.plain_result(self._error_text(exc))
+            yield self._command_result(event, self._error_text(exc))
             return
-        yield event.plain_result(format_status(payload))
+        yield self._command_result(event, format_status(payload))
 
     @qzone.command("feed")
     async def qzone_feed(self, event: AstrMessageEvent, hostuin: int = 0, limit: int = 0, cursor: str = ""):
@@ -341,11 +350,11 @@ class QzoneStablePlugin(Star):
                 cursor=cursor,
             )
         except QzoneBridgeError as exc:
-            yield event.plain_result(self._error_text(exc))
+            yield self._command_result(event, self._error_text(exc))
             return
         entries = self._to_feed_entries(payload)
         text = format_feed_list(entries, cursor=str(payload.get("cursor") or ""), has_more=bool(payload.get("has_more")))
-        yield event.plain_result(text)
+        yield self._command_result(event, text)
 
     @qzone.command("detail")
     async def qzone_detail(self, event: AstrMessageEvent, hostuin: int, fid: str, appid: int = 311):
@@ -354,14 +363,14 @@ class QzoneStablePlugin(Star):
             await self._ensure_daemon()
             payload = await self.controller.detail_feed(hostuin=hostuin, fid=fid, appid=appid)
         except QzoneBridgeError as exc:
-            yield event.plain_result(self._error_text(exc))
+            yield self._command_result(event, self._error_text(exc))
             return
-        yield event.plain_result(self._render_detail(payload))
+        yield self._command_result(event, self._render_detail(payload))
 
     @qzone.command("post")
     async def qzone_post(self, event: AstrMessageEvent, content: str = ""):
         if not self._is_admin(event):
-            yield event.plain_result("仅管理员可发说说。")
+            yield self._command_result(event, "仅管理员可发说说。")
             return
         post = collect_post_payload(
             event,
@@ -377,37 +386,37 @@ class QzoneStablePlugin(Star):
                 media=[item.to_dict() for item in post.media],
             )
         except QzoneBridgeError as exc:
-            yield event.plain_result(self._error_text(exc))
+            yield self._command_result(event, self._error_text(exc))
             return
-        yield event.plain_result(format_action_result("发布成功", payload))
+        yield self._command_result(event, format_action_result("发布成功", payload))
 
     @qzone.command("comment")
     async def qzone_comment(self, event: AstrMessageEvent, hostuin: int, fid: str, content: str):
         if not self._is_admin(event):
-            yield event.plain_result("仅管理员可评论。")
+            yield self._command_result(event, "仅管理员可评论。")
             return
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
             payload = await self.controller.comment_post(hostuin=hostuin, fid=fid, content=content)
         except QzoneBridgeError as exc:
-            yield event.plain_result(self._error_text(exc))
+            yield self._command_result(event, self._error_text(exc))
             return
-        yield event.plain_result(format_action_result("评论成功", payload))
+        yield self._command_result(event, format_action_result("评论成功", payload))
 
     @qzone.command("like")
     async def qzone_like(self, event: AstrMessageEvent, hostuin: int, fid: str, appid: int = 311, unlike: bool = False):
         if not self._is_admin(event):
-            yield event.plain_result("仅管理员可点赞。")
+            yield self._command_result(event, "仅管理员可点赞。")
             return
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
             payload = await self.controller.like_post(hostuin=hostuin, fid=fid, appid=appid, unlike=unlike)
         except QzoneBridgeError as exc:
-            yield event.plain_result(self._error_text(exc))
+            yield self._command_result(event, self._error_text(exc))
             return
-        yield event.plain_result(format_action_result("点赞成功", payload))
+        yield self._command_result(event, format_action_result("点赞成功", payload))
 
     @filter.llm_tool(name="qzone_get_status")
     async def tool_get_status(self, event: AstrMessageEvent):
@@ -492,6 +501,7 @@ class QzoneStablePlugin(Star):
             event,
             fallback_content=content,
             include_event_text=False,
+            command_prefixes=("qzone post",),
             extra_media=media,
         )
         if self.settings.preview_writes and not confirm:

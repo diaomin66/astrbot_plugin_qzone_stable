@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import mimetypes
 import re
 from dataclasses import asdict, dataclass
@@ -305,16 +306,26 @@ def iter_event_components(event: Any) -> list[Any]:
     for candidate in candidates:
         if candidate is None:
             continue
-        if isinstance(candidate, (list, tuple)):
+        if isinstance(candidate, (list, tuple)) and candidate:
             return list(candidate)
         inner = getattr(candidate, "chain", None) or getattr(candidate, "messages", None)
-        if isinstance(inner, (list, tuple)):
+        if isinstance(inner, (list, tuple)) and inner:
             return list(inner)
     raw = getattr(message_obj, "raw_message", None) or getattr(event, "raw_message", None)
-    if isinstance(raw, list):
+    if isinstance(raw, list) and raw:
         return list(raw)
-    if isinstance(raw, dict) and isinstance(raw.get("message"), list):
+    if isinstance(raw, dict) and isinstance(raw.get("message"), list) and raw.get("message"):
         return list(raw["message"])
+    for owner in (message_obj, event):
+        value = getattr(owner, "message_str", None)
+        if isinstance(value, str) and value:
+            return [value]
+        getter = getattr(owner, "get_message_str", None)
+        if callable(getter):
+            with contextlib.suppress(Exception):
+                value = getter()
+            if isinstance(value, str) and value:
+                return [value]
     return []
 
 
@@ -333,6 +344,29 @@ def strip_command_prefix(text: str, prefixes: Iterable[str]) -> str:
 
 def looks_like_component_string(text: str) -> bool:
     return bool(text and COMPONENT_STRING_RE.search(text))
+
+
+def join_text_parts_for_command_scan(parts: Iterable[str]) -> str:
+    text = ""
+    for part in parts:
+        if not part:
+            continue
+        if text and not text[-1].isspace() and not part[0].isspace():
+            text += " "
+        text += part
+    return text
+
+
+def strip_command_prefix_from_parts(text: str, parts: Iterable[str], prefixes: Iterable[str]) -> str:
+    stripped = strip_command_prefix(text, prefixes).strip()
+    if stripped != text:
+        return stripped
+    spaced = join_text_parts_for_command_scan(parts).strip()
+    if spaced and spaced != text:
+        stripped_spaced = strip_command_prefix(spaced, prefixes).strip()
+        if stripped_spaced != spaced:
+            return stripped_spaced
+    return stripped
 
 
 def collect_post_payload(
@@ -373,7 +407,7 @@ def collect_post_payload(
     media.extend(normalize_media_list(extra_media))
     content = "".join(content_parts).strip() if include_event_text else ""
     if content and command_prefixes and not event_prefix_stripped:
-        content = strip_command_prefix(content, command_prefixes).strip()
+        content = strip_command_prefix_from_parts(content, content_parts, command_prefixes)
     fallback = str(fallback_content or "").strip()
     if command_prefixes:
         fallback = strip_command_prefix(fallback, command_prefixes).strip()
