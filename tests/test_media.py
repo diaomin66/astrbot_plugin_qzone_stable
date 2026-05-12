@@ -21,6 +21,17 @@ class File:
         self.name = name
 
 
+class ObjText:
+    type = "text"
+
+    def __init__(self, text):
+        self.data = {"text": text}
+
+
+class At:
+    type = "at"
+
+
 class MediaPayloadTests(unittest.TestCase):
     def event(self, components):
         return types.SimpleNamespace(message_obj=types.SimpleNamespace(message=components))
@@ -88,6 +99,36 @@ class MediaPayloadTests(unittest.TestCase):
         self.assertEqual(payload.content, "compact text")
         self.assertEqual(payload.media, [])
 
+    def test_strips_prefix_without_space_after_post(self):
+        payload = collect_post_payload(
+            self.event([Plain("/qzone post1")]),
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "1")
+        self.assertEqual(payload.media, [])
+
+    def test_strips_prefix_without_space_before_chinese_content(self):
+        payload = collect_post_payload(
+            self.event([Plain("/qzone post\u4f60\u597d")]),
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "\u4f60\u597d")
+        self.assertEqual(payload.media, [])
+
+    def test_strips_prefix_with_separator_after_post(self):
+        payload = collect_post_payload(
+            self.event([Plain("/qzone post: hello")]),
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "hello")
+        self.assertEqual(payload.media, [])
+
     def test_uses_event_message_str_when_components_are_missing(self):
         event = types.SimpleNamespace(message_obj=types.SimpleNamespace(message=[]), message_str="/qzone post full text")
         payload = collect_post_payload(
@@ -98,6 +139,55 @@ class MediaPayloadTests(unittest.TestCase):
         )
 
         self.assertEqual(payload.content, "full text")
+        self.assertEqual(payload.media, [])
+
+    def test_strips_prefix_after_leading_cq_at_in_message_str(self):
+        event = types.SimpleNamespace(
+            message_obj=types.SimpleNamespace(message=[]),
+            message_str="[CQ:at,qq=123] /qzone post hello",
+        )
+        payload = collect_post_payload(
+            event,
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "hello")
+        self.assertEqual(payload.media, [])
+
+    def test_strips_prefix_after_leading_mention_in_message_str(self):
+        event = types.SimpleNamespace(message_obj=types.SimpleNamespace(message=[]), message_str="@bot /qzone post hello")
+        payload = collect_post_payload(
+            event,
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "hello")
+        self.assertEqual(payload.media, [])
+
+    def test_collects_object_data_text_components(self):
+        payload = collect_post_payload(
+            self.event([ObjText("/qzone post hello")]),
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "hello")
+        self.assertEqual(payload.media, [])
+
+    def test_uses_message_str_when_only_non_text_components_exist(self):
+        event = types.SimpleNamespace(
+            message_obj=types.SimpleNamespace(message=[At()]),
+            message_str="/qzone post hello",
+        )
+        payload = collect_post_payload(
+            event,
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "hello")
         self.assertEqual(payload.media, [])
 
     def test_strips_fullwidth_slash_command_prefix(self):

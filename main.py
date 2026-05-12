@@ -88,13 +88,16 @@ class QzoneStablePlugin(Star):
         return self._sender_id(event) in set(self.settings.admin_uins)
 
     def _command_result(self, event: AstrMessageEvent, text: str):
+        self._stop_event(event)
+        return event.plain_result(text)
+
+    def _stop_event(self, event: AstrMessageEvent) -> None:
         stopper = getattr(event, "stop_event", None)
         if callable(stopper):
             try:
                 stopper()
             except Exception:
                 pass
-        return event.plain_result(text)
 
     def _error_text(self, exc: QzoneBridgeError) -> str:
         if not exc.detail:
@@ -369,6 +372,7 @@ class QzoneStablePlugin(Star):
 
     @qzone.command("post")
     async def qzone_post(self, event: AstrMessageEvent, content: str = ""):
+        self._stop_event(event)
         if not self._is_admin(event):
             yield self._command_result(event, "仅管理员可发说说。")
             return

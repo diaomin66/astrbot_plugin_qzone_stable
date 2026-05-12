@@ -16,6 +16,8 @@ QZONE_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 TEXT_KINDS = {"plain", "text"}
 MEDIA_KINDS = {"image", "file", "video", "record", "audio", "voice"}
 COMPONENT_STRING_RE = re.compile(r"\b(?:Image|Video|File|Record|Plain)\s*\(|\[CQ:(?:image|video|file|record)\b", re.I)
+COMMAND_SEPARATOR_CHARS = ":：,，;；"
+LEADING_SPACE_CHARS = " \t\r\n\f\v\u3000\ufeff\u200b\u200c\u200d"
 
 
 @dataclass(slots=True)
@@ -230,6 +232,9 @@ def _component_mapping(component: Any) -> dict[str, Any]:
             merged.update(data)
         return merged
     data: dict[str, Any] = {}
+    component_data = getattr(component, "data", None)
+    if isinstance(component_data, dict):
+        data.update(component_data)
     for attr in (
         "text",
         "content",
@@ -291,6 +296,21 @@ def _component_media(component: Any, kind: str) -> PostMedia | None:
     return media
 
 
+def _event_message_text(event: Any) -> str:
+    message_obj = getattr(event, "message_obj", None)
+    for owner in (message_obj, event):
+        value = getattr(owner, "message_str", None)
+        if isinstance(value, str) and value:
+            return value
+        getter = getattr(owner, "get_message_str", None)
+        if callable(getter):
+            with contextlib.suppress(Exception):
+                value = getter()
+            if isinstance(value, str) and value:
+                return value
+    return ""
+
+
 def iter_event_components(event: Any) -> list[Any]:
     message_obj = getattr(event, "message_obj", None)
     candidates = [
@@ -316,29 +336,50 @@ def iter_event_components(event: Any) -> list[Any]:
         return list(raw)
     if isinstance(raw, dict) and isinstance(raw.get("message"), list) and raw.get("message"):
         return list(raw["message"])
-    for owner in (message_obj, event):
-        value = getattr(owner, "message_str", None)
-        if isinstance(value, str) and value:
-            return [value]
-        getter = getattr(owner, "get_message_str", None)
-        if callable(getter):
-            with contextlib.suppress(Exception):
-                value = getter()
-            if isinstance(value, str) and value:
-                return [value]
+    event_text = _event_message_text(event)
+    if event_text:
+        return [event_text]
     return []
 
 
+def _strip_leading_command_noise(text: str) -> tuple[str, bool]:
+    stripped_noise = False
+    value = text.lstrip(LEADING_SPACE_CHARS)
+    stripped_noise = stripped_noise or value != text
+    while value:
+        match = re.match(r"\[CQ:at,[^\]]+\]\s*", value, re.I)
+        if match:
+            value = value[match.end() :].lstrip(LEADING_SPACE_CHARS)
+            stripped_noise = True
+            continue
+        match = re.match(r"@\S+\s+", value)
+        if match:
+            value = value[match.end() :].lstrip(LEADING_SPACE_CHARS)
+            stripped_noise = True
+            continue
+        break
+    return value, stripped_noise
+
+
+def _strip_command_separator(text: str) -> str:
+    value = text.lstrip()
+    if value[:1] in COMMAND_SEPARATOR_CHARS:
+        value = value[1:].lstrip()
+    return value
+
+
 def strip_command_prefix(text: str, prefixes: Iterable[str]) -> str:
-    stripped = text.lstrip()
+    stripped, stripped_noise = _strip_leading_command_noise(text)
     for prefix in prefixes:
         prefix = prefix.strip().lstrip("/\uff0f").strip()
         if not prefix:
             continue
-        pattern = r"^[/\uFF0F]?\s*" + r"\s+".join(re.escape(part) for part in prefix.split()) + r"(?:\s+|$)"
+        pattern = r"^[/\uFF0F]?\s*" + r"\s+".join(re.escape(part) for part in prefix.split())
         match = re.match(pattern, stripped, re.I)
         if match:
-            return stripped[match.end() :].lstrip()
+            return _strip_command_separator(stripped[match.end() :])
+    if stripped_noise:
+        return text
     return text
 
 
@@ -382,8 +423,9 @@ def collect_post_payload(
     media: list[PostMedia] = []
     first_text = True
     event_prefix_stripped = False
+    components = iter_event_components(event)
 
-    for component in iter_event_components(event):
+    for component in components:
         kind = _component_kind(component)
         if kind in TEXT_KINDS:
             text = _component_text(component)
@@ -405,6 +447,10 @@ def collect_post_payload(
                 reference_parts.append(media_reference_text(item))
 
     media.extend(normalize_media_list(extra_media))
+    if include_event_text and not content_parts and components:
+        event_text = _event_message_text(event)
+        if event_text and not (media and looks_like_component_string(event_text)):
+            content_parts.append(event_text)
     content = "".join(content_parts).strip() if include_event_text else ""
     if content and command_prefixes and not event_prefix_stripped:
         content = strip_command_prefix_from_parts(content, content_parts, command_prefixes)
