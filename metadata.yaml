@@ -5,7 +5,7 @@ description: QQ空间Ultra bridge with a local daemon and LLM tools.
 desc: QQ空间Ultra bridge with a local daemon and LLM tools.
 short_desc: QQ空间Ultra 接入与 LLM 工具插件
 display_name: QQ空间Ultra
-repo: https://github.com/diaomin66/astrbot_plugin_qzone_stable
+repo: https://github.com/diaomin66/astrbot_plugin_qzone_ultra
 entry: main.py
 support_platforms: []
 astrbot_version: ">=4.0.0"
