@@ -1,6 +1,12 @@
-# AstrBot QQ空间 Stable Bridge
+# QQ空间Ultra（QzoneUltra）
 
-更稳定的 QQ 空间插件方案。
+QQ空间Ultra 是面向 AstrBot 的 QQ 空间插件方案。
+
+## 插件信息
+
+- 插件名：QQ空间Ultra（QzoneUltra）
+- 作者：雪碧bir
+- GitHub：https://github.com/diaomin66/astrbot_plugin_qzone_stable
 
 ## 特点
 
