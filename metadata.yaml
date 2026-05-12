@@ -1,10 +1,10 @@
-name: astrbot_plugin_qzone_stable
+name: astrbot_plugin_qzone_ultra
 version: 0.1.2
 author: 雪碧bir
 description: QQ空间Ultra bridge with a local daemon and LLM tools.
 desc: QQ空间Ultra bridge with a local daemon and LLM tools.
 short_desc: QQ空间Ultra 接入与 LLM 工具插件
-display_name: QQ空间Ultra（QzoneUltra）
+display_name: QQ空间Ultra
 repo: https://github.com/diaomin66/astrbot_plugin_qzone_stable
 entry: main.py
 support_platforms: []
