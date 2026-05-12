@@ -388,6 +388,7 @@ class QzoneStablePlugin(Star):
             payload = await self.controller.publish_post(
                 content=post.content,
                 media=[item.to_dict() for item in post.media],
+                content_sanitized=True,
             )
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
@@ -520,6 +521,7 @@ class QzoneStablePlugin(Star):
                 content=post.content,
                 sync_weibo=sync_weibo,
                 media=[item.to_dict() for item in post.media],
+                content_sanitized=True,
             )
         except QzoneBridgeError as exc:
             yield event.plain_result(self._error_text(exc))

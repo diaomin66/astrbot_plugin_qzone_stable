@@ -33,8 +33,8 @@ class At:
 
 
 class MediaPayloadTests(unittest.TestCase):
-    def event(self, components):
-        return types.SimpleNamespace(message_obj=types.SimpleNamespace(message=components))
+    def event(self, components, **attrs):
+        return types.SimpleNamespace(message_obj=types.SimpleNamespace(message=components), **attrs)
 
     def test_collects_command_text_and_image_components(self):
         payload = collect_post_payload(
@@ -139,6 +139,56 @@ class MediaPayloadTests(unittest.TestCase):
         )
 
         self.assertEqual(payload.content, "full text")
+        self.assertEqual(payload.media, [])
+
+    def test_prefers_pipeline_message_str_over_raw_symbol_wake_prefix(self):
+        payload = collect_post_payload(
+            self.event([Plain("!qzone post hello")], message_str="qzone post hello"),
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "hello")
+        self.assertEqual(payload.media, [])
+
+    def test_prefers_pipeline_message_str_over_raw_word_wake_prefix(self):
+        payload = collect_post_payload(
+            self.event([Plain("bot qzone post hello")], message_str="qzone post hello"),
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "hello")
+        self.assertEqual(payload.media, [])
+
+    def test_strips_common_symbol_wake_prefix_without_pipeline_text(self):
+        payload = collect_post_payload(
+            self.event([Plain("!qzone post hello")]),
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "hello")
+        self.assertEqual(payload.media, [])
+
+    def test_strips_prefix_after_mention_with_chinese_comma(self):
+        payload = collect_post_payload(
+            self.event([Plain("@bot\uff0c/qzone post hello")]),
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "hello")
+        self.assertEqual(payload.media, [])
+
+    def test_strips_prefix_after_mention_without_separator(self):
+        payload = collect_post_payload(
+            self.event([Plain("@bot/qzone post hello")]),
+            include_event_text=True,
+            command_prefixes=("qzone post",),
+        )
+
+        self.assertEqual(payload.content, "hello")
         self.assertEqual(payload.media, [])
 
     def test_strips_prefix_after_leading_cq_at_in_message_str(self):

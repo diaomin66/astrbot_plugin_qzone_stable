@@ -13,8 +13,9 @@ class Plain:
 
 
 class Event:
-    def __init__(self, components):
+    def __init__(self, components, message_str=""):
         self.message_obj = types.SimpleNamespace(message=components)
+        self.message_str = message_str
         self.stopped = False
 
     def is_admin(self):
@@ -140,6 +141,30 @@ class MainPublishTests(unittest.TestCase):
         self.assertTrue(event.stopped)
         plugin.controller.publish_post.assert_awaited_once()
         self.assertEqual(plugin.controller.publish_post.await_args.kwargs["content"], "hello")
+        self.assertTrue(plugin.controller.publish_post.await_args.kwargs["content_sanitized"])
+
+    def test_qzone_post_prefers_pipeline_text_over_raw_custom_wake_prefix(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        event = Event([Plain("bot qzone post hello")], message_str="qzone post hello")
+
+        asyncio.run(collect_async_generator(plugin.qzone_post(event, content="hello")))
+
+        self.assertTrue(event.stopped)
+        plugin.controller.publish_post.assert_awaited_once()
+        self.assertEqual(plugin.controller.publish_post.await_args.kwargs["content"], "hello")
+        self.assertTrue(plugin.controller.publish_post.await_args.kwargs["content_sanitized"])
+
+    def test_qzone_post_keeps_literal_command_text_after_real_command(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        event = Event([Plain("/qzone post qzone post literal")])
+
+        asyncio.run(collect_async_generator(plugin.qzone_post(event, content="/qzone post qzone post literal")))
+
+        plugin.controller.publish_post.assert_awaited_once()
+        self.assertEqual(plugin.controller.publish_post.await_args.kwargs["content"], "qzone post literal")
+        self.assertTrue(plugin.controller.publish_post.await_args.kwargs["content_sanitized"])
 
     def test_llm_publish_tool_strips_command_prefix_from_tool_content(self):
         module = self.load_main_module()
@@ -154,6 +179,7 @@ class MainPublishTests(unittest.TestCase):
 
         plugin.controller.publish_post.assert_awaited_once()
         self.assertEqual(plugin.controller.publish_post.await_args.kwargs["content"], "hello")
+        self.assertTrue(plugin.controller.publish_post.await_args.kwargs["content_sanitized"])
 
     def test_llm_publish_tool_strips_no_space_typo_from_tool_content(self):
         module = self.load_main_module()
@@ -168,6 +194,7 @@ class MainPublishTests(unittest.TestCase):
 
         plugin.controller.publish_post.assert_awaited_once()
         self.assertEqual(plugin.controller.publish_post.await_args.kwargs["content"], "1")
+        self.assertTrue(plugin.controller.publish_post.await_args.kwargs["content_sanitized"])
 
 
 if __name__ == "__main__":
