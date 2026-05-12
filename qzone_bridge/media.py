@@ -200,6 +200,8 @@ def media_reference_text(media: PostMedia) -> str:
 
 
 def _component_kind(component: Any) -> str:
+    if isinstance(component, str):
+        return "plain"
     if isinstance(component, dict):
         raw = component.get("type") or component.get("kind") or component.get("message_type") or ""
     else:
@@ -319,10 +321,10 @@ def iter_event_components(event: Any) -> list[Any]:
 def strip_command_prefix(text: str, prefixes: Iterable[str]) -> str:
     stripped = text.lstrip()
     for prefix in prefixes:
-        prefix = prefix.strip().lstrip("/／").strip()
+        prefix = prefix.strip().lstrip("/\uff0f").strip()
         if not prefix:
             continue
-        pattern = r"^[/／]?\s*" + r"\s+".join(re.escape(part) for part in prefix.split()) + r"(?:\s+|$)"
+        pattern = r"^[/\uFF0F]?\s*" + r"\s+".join(re.escape(part) for part in prefix.split()) + r"(?:\s+|$)"
         match = re.match(pattern, stripped, re.I)
         if match:
             return stripped[match.end() :].lstrip()
@@ -345,13 +347,16 @@ def collect_post_payload(
     reference_parts: list[str] = []
     media: list[PostMedia] = []
     first_text = True
+    event_prefix_stripped = False
 
     for component in iter_event_components(event):
         kind = _component_kind(component)
         if kind in TEXT_KINDS:
             text = _component_text(component)
             if first_text and command_prefixes:
+                original_text = text
                 text = strip_command_prefix(text, command_prefixes)
+                event_prefix_stripped = text != original_text
             first_text = False
             if include_event_text and text:
                 content_parts.append(text)
@@ -367,6 +372,8 @@ def collect_post_payload(
 
     media.extend(normalize_media_list(extra_media))
     content = "".join(content_parts).strip() if include_event_text else ""
+    if content and command_prefixes and not event_prefix_stripped:
+        content = strip_command_prefix(content, command_prefixes).strip()
     fallback = str(fallback_content or "").strip()
     if command_prefixes:
         fallback = strip_command_prefix(fallback, command_prefixes).strip()
