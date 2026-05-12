@@ -155,6 +155,20 @@ class MainPublishTests(unittest.TestCase):
         plugin.controller.publish_post.assert_awaited_once()
         self.assertEqual(plugin.controller.publish_post.await_args.kwargs["content"], "hello")
 
+    def test_llm_publish_tool_strips_no_space_typo_from_tool_content(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        event = Event([])
+
+        asyncio.run(
+            collect_async_generator(
+                plugin.tool_publish_post(event, content="/qzone post1", confirm=True)
+            )
+        )
+
+        plugin.controller.publish_post.assert_awaited_once()
+        self.assertEqual(plugin.controller.publish_post.await_args.kwargs["content"], "1")
+
 
 if __name__ == "__main__":
     unittest.main()
