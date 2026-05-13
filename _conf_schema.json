@@ -70,5 +70,17 @@
     "type": "bool",
     "default": true,
     "hint": "LLM 工具写操作是否默认先输出草稿预览。"
+  },
+  "render_publish_result": {
+    "description": "Render publish result image",
+    "type": "bool",
+    "default": true,
+    "hint": "发布说说成功后是否返回 QQ 空间样式的实时渲染图。"
+  },
+  "render_result_width": {
+    "description": "Publish result image width",
+    "type": "int",
+    "default": 900,
+    "hint": "发布结果渲染图宽度，默认 900。"
   }
 }

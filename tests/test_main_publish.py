@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -17,6 +18,7 @@ class Event:
         self.message_obj = types.SimpleNamespace(message=components)
         self.message_str = message_str
         self.stopped = False
+        self.images = []
 
     def is_admin(self):
         return True
@@ -26,6 +28,16 @@ class Event:
 
     def plain_result(self, text):
         return text
+
+    def image_result(self, path):
+        self.images.append(path)
+        return {"image": path}
+
+
+class File:
+    def __init__(self, file, name=""):
+        self.file = file
+        self.name = name
 
 
 def install_astrbot_stubs():
@@ -124,6 +136,9 @@ class MainPublishTests(unittest.TestCase):
 
     def make_plugin(self, module):
         plugin = module.QzoneStablePlugin(types.SimpleNamespace(), config={"admin_uins": []})
+        data_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(data_dir.cleanup)
+        plugin.data_dir = Path(data_dir.name)
         plugin._ensure_cookie_ready = AsyncMock()
         plugin._ensure_daemon = AsyncMock()
         plugin.controller = types.SimpleNamespace(
@@ -195,6 +210,29 @@ class MainPublishTests(unittest.TestCase):
         plugin.controller.publish_post.assert_awaited_once()
         self.assertEqual(plugin.controller.publish_post.await_args.kwargs["content"], "1")
         self.assertTrue(plugin.controller.publish_post.await_args.kwargs["content_sanitized"])
+
+    def test_qzone_post_returns_rendered_image_result(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        event = Event([Plain("/qzone post hello")])
+
+        results = asyncio.run(collect_async_generator(plugin.qzone_post(event, content="/qzone post hello")))
+
+        self.assertEqual(len(results), 1)
+        self.assertIn("image", results[0])
+        self.assertTrue(Path(results[0]["image"]).exists())
+
+    def test_qzone_post_keeps_files_out_of_publish_media_but_renders_success(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        event = Event([Plain("/qzone post report "), File(file="report.pdf", name="report.pdf")])
+
+        results = asyncio.run(collect_async_generator(plugin.qzone_post(event, content="/qzone post report")))
+
+        plugin.controller.publish_post.assert_awaited_once()
+        self.assertEqual(plugin.controller.publish_post.await_args.kwargs["media"], [])
+        self.assertEqual(plugin.controller.publish_post.await_args.kwargs["content"], "report\n[文件: report.pdf]")
+        self.assertTrue(Path(results[0]["image"]).exists())
 
 
 if __name__ == "__main__":

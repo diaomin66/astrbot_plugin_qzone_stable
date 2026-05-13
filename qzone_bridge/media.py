@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import mimetypes
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import unquote, urlparse
@@ -38,6 +38,7 @@ class PostMedia:
 class PostPayload:
     content: str
     media: list[PostMedia]
+    attachments: list[PostMedia] = field(default_factory=list)
 
     def to_request_body(self) -> dict[str, Any]:
         return {
@@ -424,6 +425,7 @@ def collect_post_payload(
     content_parts: list[str] = []
     reference_parts: list[str] = []
     media: list[PostMedia] = []
+    attachments: list[PostMedia] = []
     first_text = True
     event_prefix_stripped = False
     components = iter_event_components(event)
@@ -449,9 +451,15 @@ def collect_post_payload(
             if item.kind == "image":
                 media.append(item)
             else:
+                attachments.append(item)
                 reference_parts.append(media_reference_text(item))
 
-    media.extend(normalize_media_list(extra_media))
+    for item in normalize_media_list(extra_media):
+        if item.kind == "image":
+            media.append(item)
+        else:
+            attachments.append(item)
+            reference_parts.append(media_reference_text(item))
     if include_event_text and command_prefixes and event_text:
         event_content = strip_command_prefix(event_text, command_prefixes).strip()
         if event_content != event_text.strip():
@@ -478,4 +486,4 @@ def collect_post_payload(
     if reference_parts:
         refs = "\n".join(reference_parts)
         content = "\n".join(part for part in (content, refs) if part)
-    return PostPayload(content=content, media=media)
+    return PostPayload(content=content, media=media, attachments=attachments)
