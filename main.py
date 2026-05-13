@@ -42,7 +42,14 @@ from qzone_bridge.models import FeedEntry
 from qzone_bridge.onebot_cookie import fetch_cookie_text
 from qzone_bridge.parser import normalize_uin, parse_cookie_text
 from qzone_bridge.publish_renderer import RenderProfile, profile_from_event, render_publish_result_image
-from qzone_bridge.render import format_action_result, format_feed_detail, format_feed_list, format_status
+from qzone_bridge.render import (
+    format_action_result,
+    format_feed_detail,
+    format_feed_list,
+    format_like_result,
+    format_llm_feed_list,
+    format_status,
+)
 from qzone_bridge.settings import PluginSettings
 from qzone_bridge.utils import truncate
 
@@ -590,7 +597,7 @@ class QzoneStablePlugin(Star):
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
             return
-        yield self._command_result(event, format_action_result("点赞成功", payload))
+        yield self._command_result(event, format_like_result(payload))
 
     @filter.llm_tool(name="qzone_get_status")
     async def tool_get_status(self, event: AstrMessageEvent):
@@ -632,7 +639,7 @@ class QzoneStablePlugin(Star):
             yield event.plain_result(self._error_text(exc))
             return
         entries = self._to_feed_entries(payload)
-        yield event.plain_result(format_feed_list(entries, cursor=str(payload.get("cursor") or ""), has_more=bool(payload.get("has_more"))))
+        yield event.plain_result(format_llm_feed_list(entries))
 
     @filter.llm_tool(name="qzone_detail_feed")
     async def tool_detail_feed(self, event: AstrMessageEvent, hostuin: int, fid: str, appid: int = 311):
@@ -748,8 +755,8 @@ class QzoneStablePlugin(Star):
     async def tool_like_post(
         self,
         event: AstrMessageEvent,
-        hostuin: int,
-        fid: str,
+        hostuin: int = 0,
+        fid: str = "",
         confirm: bool = False,
         appid: int = 311,
         unlike: bool = False,
@@ -757,8 +764,8 @@ class QzoneStablePlugin(Star):
         """点赞或取消点赞一条说说。
 
         Args:
-            hostuin (number): 目标 QQ 号。
-            fid (string): 说说 fid。
+            hostuin (number): 目标 QQ 号。为 0 且 fid 为数字时，表示最近列表中的编号。
+            fid (string): 说说 fid，或最近列表中的编号。
             confirm (boolean): 是否确认执行。
             appid (number): 应用 id。
             unlike (boolean): 是否取消点赞。
@@ -768,7 +775,8 @@ class QzoneStablePlugin(Star):
             return
         if self.settings.preview_writes and not confirm:
             action = "取消点赞" if unlike else "点赞"
-            yield event.plain_result(f"待执行草稿: {action} hostuin={hostuin}, fid={fid}。确认后将执行。")
+            target = f"第 {fid} 条" if not hostuin and str(fid).isdigit() else "指定说说"
+            yield event.plain_result(f"待执行: {action}{target}。确认后将执行。")
             return
         try:
             await self._ensure_cookie_ready(event)
@@ -777,7 +785,7 @@ class QzoneStablePlugin(Star):
         except QzoneBridgeError as exc:
             yield event.plain_result(self._error_text(exc))
             return
-        yield event.plain_result(format_action_result("点赞成功", payload))
+        yield event.plain_result(format_like_result(payload))
 
     async def terminate(self):
         try:

@@ -17,7 +17,15 @@ from .client import FeedPageResult, QzoneClient
 from .errors import QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
 from .media import QZONE_MAX_IMAGES, media_reference_text, normalize_media_list, split_publishable_images, strip_command_prefix
 from .models import BridgeState, FeedEntry, SessionState
-from .parser import extract_feed_page, feed_page_cursor, feed_page_has_more, normalize_uin, parse_cookie_text, unwrap_payload
+from .parser import (
+    compute_unikey,
+    extract_feed_page,
+    feed_page_cursor,
+    feed_page_has_more,
+    normalize_uin,
+    parse_cookie_text,
+    unwrap_payload,
+)
 from .protocol import SECRET_HEADER, fail, ok
 from .storage import StateStore, ensure_state_secret
 from .utils import now_iso, from_iso
@@ -51,6 +59,7 @@ class QzoneDaemonService:
         self._keepalive_task: asyncio.Task | None = None
         self._warmup_task: asyncio.Task | None = None
         self._save_task: asyncio.Task | None = None
+        self.recent_feed_entries: list[FeedEntry] = []
         self._closing = False
 
     def save(self) -> None:
@@ -97,6 +106,7 @@ class QzoneDaemonService:
             self.state.session.needs_rebind = True
             self.state.session.qzonetokens.clear()
             self.client.feed_cache.clear()
+            self.recent_feed_entries.clear()
         elif isinstance(exc, QzoneRequestError) and exc.status_code is not None and 400 <= exc.status_code < 500:
             if self.state.session.cookies and not self.state.session.needs_rebind:
                 self.health_state = "ready"
@@ -215,6 +225,7 @@ class QzoneDaemonService:
         )
         self.client.update_session(self.state.session)
         self.client.feed_cache.clear()
+        self.recent_feed_entries.clear()
         self.save()
         try:
             await self.warmup()
@@ -237,6 +248,7 @@ class QzoneDaemonService:
         )
         self.client.update_session(self.state.session)
         self.client.feed_cache.clear()
+        self.recent_feed_entries.clear()
         self.save()
         self.health_state = "needs_rebind"
         return self.snapshot()
@@ -283,10 +295,12 @@ class QzoneDaemonService:
                 break
             page_round += 1
 
+        visible_items = items[:limit]
+        self.recent_feed_entries = visible_items
         return {
             "scope": scope,
             "hostuin": hostuin,
-            "items": [asdict(item) for item in items[:limit]],
+            "items": [asdict(item) for item in visible_items],
             "has_more": has_more,
             "cursor": next_cursor,
             "count": min(len(items), limit),
@@ -384,6 +398,50 @@ class QzoneDaemonService:
             "raw": payload,
         }
 
+    def _resolve_recent_feed_reference(self, hostuin: int, fid: str, appid: int, curkey: str = "") -> tuple[int, str, int, str]:
+        fid_text = str(fid or "").strip()
+        if not hostuin and fid_text.isdigit():
+            index = int(fid_text) - 1
+            if 0 <= index < len(self.recent_feed_entries):
+                entry = self.recent_feed_entries[index]
+                return entry.hostuin, entry.fid, entry.appid or appid, curkey or entry.curkey
+        return int(hostuin or self.state.session.uin or 0), fid_text, int(appid or 311), curkey
+
+    @staticmethod
+    def _http_like_key(appid: int, hostuin: int, fid: str) -> str:
+        return compute_unikey(appid, hostuin, fid).replace("https://", "http://", 1)
+
+    async def _refresh_like_entry(self, hostuin: int, fid: str, appid: int) -> FeedEntry | None:
+        try:
+            payload = unwrap_payload(await self.client.detail(hostuin, fid, appid=appid))
+        except Exception as exc:
+            log.debug("qzone like verification refresh failed: %s", exc)
+        else:
+            if isinstance(payload, dict):
+                entry = self.client.feed_entry_from_payload(payload, default_hostuin=hostuin)
+                self.client.cache_feed_page(hostuin, [entry])
+                return entry
+
+        for fetch in (
+            self.client.legacy_recent_feeds if hostuin == self.state.session.uin else None,
+            lambda: self.client.legacy_feeds(hostuin, page=1, num=20),
+        ):
+            if fetch is None:
+                continue
+            try:
+                payload = unwrap_payload(await fetch())
+            except Exception as exc:
+                log.debug("qzone like verification feed fallback failed: %s", exc)
+                continue
+            feedpage, entries = extract_feed_page(payload, default_hostuin=hostuin)
+            if not feedpage:
+                continue
+            self.client.cache_feed_page(hostuin, entries)
+            for entry in entries:
+                if entry.fid == fid:
+                    return entry
+        return None
+
     async def like_post(
         self,
         *,
@@ -394,14 +452,65 @@ class QzoneDaemonService:
         unlike: bool = False,
     ) -> dict[str, Any]:
         self._ensure_session_ready()
+        hostuin, fid, appid, curkey = self._resolve_recent_feed_reference(hostuin, fid, appid, curkey)
+        if not hostuin or not fid:
+            raise QzoneParseError("点赞目标不完整，请先选择一条说说")
+
+        target_liked = not unlike
+        before_entry = await self._refresh_like_entry(hostuin, fid, appid)
+        if before_entry is not None and before_entry.liked == target_liked:
+            self._set_success(defer_save=True)
+            return {
+                "action": "unlike" if unlike else "like",
+                "liked": before_entry.liked,
+                "verified": True,
+                "already": True,
+                "summary": before_entry.summary,
+                "raw": {},
+            }
+
         payload = unwrap_payload(
             await self.client.like_post(hostuin, fid, appid=appid, curkey=curkey, like=not unlike)
         )
         if not isinstance(payload, dict):
             raise QzoneParseError("点赞返回结构异常")
+        verified_entry = await self._refresh_like_entry(hostuin, fid, appid)
+        if verified_entry is not None and verified_entry.liked != target_liked:
+            fallback_key = self._http_like_key(appid, hostuin, fid)
+            if fallback_key not in {curkey, compute_unikey(appid, hostuin, fid)}:
+                payload = unwrap_payload(
+                    await self.client.like_post(
+                        hostuin,
+                        fid,
+                        appid=appid,
+                        curkey=fallback_key,
+                        unikey=fallback_key,
+                        like=not unlike,
+                    )
+                )
+                if not isinstance(payload, dict):
+                    raise QzoneParseError("点赞返回结构异常")
+                verified_entry = await self._refresh_like_entry(hostuin, fid, appid)
+
+        if verified_entry is not None and verified_entry.liked != target_liked:
+            action_text = "取消点赞" if unlike else "点赞"
+            raise QzoneRequestError(
+                f"{action_text}请求已发送，但 QQ 空间未确认状态变更",
+                detail={
+                    "hostuin": hostuin,
+                    "fid": fid,
+                    "expected_liked": target_liked,
+                    "actual_liked": verified_entry.liked,
+                    "raw": payload,
+                },
+            )
         self._set_success(defer_save=True)
         return {
             "action": "unlike" if unlike else "like",
+            "liked": verified_entry.liked if verified_entry is not None else target_liked,
+            "verified": verified_entry is not None,
+            "already": False,
+            "summary": verified_entry.summary if verified_entry is not None else "",
             "message": payload.get("msg") or payload.get("message") or "",
             "raw": payload,
         }

@@ -284,6 +284,157 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await service.close()
 
+    async def test_like_post_verifies_liked_state_after_request(self):
+        with TemporaryDirectory() as tmp:
+            service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
+            service.state.session = SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+            service.client.update_session(service.state.session)
+            before = {
+                "tid": "fid-1",
+                "uin": 123456,
+                "content": "hello",
+                "like": {"isliked": "0"},
+            }
+            after = {
+                "tid": "fid-1",
+                "uin": 123456,
+                "content": "hello",
+                "like": {"isliked": "1"},
+            }
+            try:
+                with patch.object(service.client, "detail", new=AsyncMock(side_effect=[before, after])) as detail, patch.object(
+                    service.client,
+                    "like_post",
+                    new=AsyncMock(return_value={"message": "ok"}),
+                ) as like:
+                    payload = await service.like_post(hostuin=123456, fid="fid-1")
+                self.assertEqual(detail.await_count, 2)
+                like.assert_awaited_once()
+                self.assertTrue(payload["verified"])
+                self.assertTrue(payload["liked"])
+                self.assertFalse(payload["already"])
+            finally:
+                await service.close()
+
+    async def test_like_post_retries_http_key_when_first_request_does_not_change_state(self):
+        with TemporaryDirectory() as tmp:
+            service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
+            service.state.session = SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+            service.client.update_session(service.state.session)
+            false_state = {
+                "tid": "fid-1",
+                "uin": 123456,
+                "content": "hello",
+                "like": {"isliked": "0"},
+            }
+            true_state = {
+                "tid": "fid-1",
+                "uin": 123456,
+                "content": "hello",
+                "like": {"isliked": "1"},
+            }
+            try:
+                with patch.object(
+                    service.client,
+                    "detail",
+                    new=AsyncMock(side_effect=[false_state, false_state, true_state]),
+                ), patch.object(
+                    service.client,
+                    "like_post",
+                    new=AsyncMock(return_value={"message": "ok"}),
+                ) as like:
+                    payload = await service.like_post(hostuin=123456, fid="fid-1")
+                self.assertEqual(like.await_count, 2)
+                _, second_kwargs = like.await_args_list[1]
+                self.assertEqual(second_kwargs["curkey"], "http://user.qzone.qq.com/123456/mood/fid-1")
+                self.assertEqual(second_kwargs["unikey"], "http://user.qzone.qq.com/123456/mood/fid-1")
+                self.assertTrue(payload["verified"])
+                self.assertTrue(payload["liked"])
+            finally:
+                await service.close()
+
+    async def test_like_post_verification_falls_back_to_legacy_feed_page(self):
+        with TemporaryDirectory() as tmp:
+            service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
+            service.state.session = SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+            service.client.update_session(service.state.session)
+            before = {"msglist": [{"tid": "fid-1", "uin": 3112333596, "content": "hello", "isliked": "0"}]}
+            after = {"msglist": [{"tid": "fid-1", "uin": 3112333596, "content": "hello", "isliked": "1"}]}
+            try:
+                with patch.object(
+                    service.client,
+                    "detail",
+                    new=AsyncMock(side_effect=QzoneRequestError("detail unavailable")),
+                ), patch.object(
+                    service.client,
+                    "legacy_feeds",
+                    new=AsyncMock(side_effect=[before, after]),
+                ) as legacy, patch.object(
+                    service.client,
+                    "like_post",
+                    new=AsyncMock(return_value={"message": "ok"}),
+                ):
+                    payload = await service.like_post(hostuin=3112333596, fid="fid-1")
+                self.assertEqual(legacy.await_count, 2)
+                self.assertTrue(payload["verified"])
+                self.assertTrue(payload["liked"])
+            finally:
+                await service.close()
+
+    async def test_like_post_accepts_recent_feed_index_reference(self):
+        with TemporaryDirectory() as tmp:
+            service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
+            service.state.session = SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+            service.client.update_session(service.state.session)
+            service.recent_feed_entries = [
+                FeedEntry(
+                    hostuin=3112333596,
+                    fid="1c7182b96589046ad3380900",
+                    appid=311,
+                    summary="瘦了…………",
+                    liked=False,
+                    curkey="cached-curkey",
+                )
+            ]
+            before = {
+                "tid": "1c7182b96589046ad3380900",
+                "uin": 3112333596,
+                "content": "瘦了…………",
+                "like": {"isliked": "0"},
+            }
+            after = {
+                "tid": "1c7182b96589046ad3380900",
+                "uin": 3112333596,
+                "content": "瘦了…………",
+                "like": {"isliked": "1"},
+            }
+            try:
+                with patch.object(service.client, "detail", new=AsyncMock(side_effect=[before, after])), patch.object(
+                    service.client,
+                    "like_post",
+                    new=AsyncMock(return_value={"message": "ok"}),
+                ) as like:
+                    payload = await service.like_post(hostuin=0, fid="1")
+                args, kwargs = like.await_args
+                self.assertEqual(args[:2], (3112333596, "1c7182b96589046ad3380900"))
+                self.assertEqual(kwargs["curkey"], "cached-curkey")
+                self.assertTrue(payload["verified"])
+                self.assertEqual(payload["summary"], "瘦了…………")
+            finally:
+                await service.close()
+
 
 class ControllerLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_close_shuts_down_daemon_and_releases_port(self):
