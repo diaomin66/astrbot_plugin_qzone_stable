@@ -5,6 +5,7 @@ from urllib.parse import parse_qs
 import httpx
 
 from qzone_bridge.client import QzoneClient
+from qzone_bridge.errors import QzoneRequestError
 from qzone_bridge.models import SessionState
 
 
@@ -131,6 +132,80 @@ class ClientMediaTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreater(max_active, 1)
         self.assertEqual([item["richval"] for item in payload], ["rich-a.jpg", "rich-b.jpg", "rich-c.jpg"])
+
+    async def test_prepare_publish_photos_retries_only_failed_parallel_uploads(self):
+        client = QzoneClient(
+            SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+        )
+        attempts = {}
+
+        async def upload_photo(photo):
+            name = photo["name"]
+            attempts[name] = attempts.get(name, 0) + 1
+            if name == "b.jpg" and attempts[name] == 1:
+                raise QzoneRequestError("temporary upload failure")
+            return {"richval": f"rich-{name}", "pic_bo": name}
+
+        client.upload_photo = upload_photo
+        try:
+            payload = await client._prepare_publish_photos(
+                [
+                    {"kind": "image", "source": "base64://MQ==", "name": "a.jpg"},
+                    {"kind": "image", "source": "base64://Mg==", "name": "b.jpg"},
+                    {"kind": "image", "source": "base64://Mw==", "name": "c.jpg"},
+                ]
+            )
+        finally:
+            await client.close()
+
+        self.assertEqual(attempts, {"a.jpg": 1, "b.jpg": 2, "c.jpg": 1})
+        self.assertEqual([item["richval"] for item in payload], ["rich-a.jpg", "rich-b.jpg", "rich-c.jpg"])
+
+    async def test_upload_photo_reuses_downloaded_remote_image_bytes(self):
+        download_calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal download_calls
+            if request.url.path == "/photo.jpg":
+                download_calls += 1
+                return httpx.Response(
+                    200,
+                    content=b"image-bytes",
+                    headers={"content-type": "image/jpeg"},
+                    request=request,
+                )
+            return httpx.Response(
+                200,
+                text=(
+                    '_Callback({"ret":0,"data":{"albumid":"album","lloc":"lloc",'
+                    '"sloc":"sloc","type":1,"height":1,"width":1}})'
+                ),
+                request=request,
+            )
+
+        client = QzoneClient(
+            SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+        )
+        await client._client.aclose()
+        client._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            trust_env=False,
+            headers={"User-Agent": client.user_agent},
+        )
+        try:
+            media = {"kind": "image", "source": "https://example.com/photo.jpg", "name": "photo.jpg"}
+            await client.upload_photo(media)
+            await client.upload_photo(media)
+        finally:
+            await client.close()
+
+        self.assertEqual(download_calls, 1)
 
 
 if __name__ == "__main__":

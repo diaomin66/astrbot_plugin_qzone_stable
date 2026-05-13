@@ -82,5 +82,11 @@
     "type": "int",
     "default": 900,
     "hint": "发布结果渲染图宽度，默认 900。"
+  },
+  "render_remote_timeout": {
+    "description": "Publish result remote image timeout",
+    "type": "float",
+    "default": 0.35,
+    "hint": "发布结果图渲染远程头像或图片预览的单个资源超时，越小越快。"
   }
 }

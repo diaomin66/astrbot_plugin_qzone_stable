@@ -71,6 +71,7 @@ class PluginSettings:
     preview_writes: bool = True
     render_publish_result: bool = True
     render_result_width: int = 900
+    render_remote_timeout: float = 0.35
 
     @classmethod
     def from_mapping(cls, config: Any) -> "PluginSettings":
@@ -96,4 +97,5 @@ class PluginSettings:
             preview_writes=_as_bool(_pick(mapping, "preview_writes", True), True),
             render_publish_result=_as_bool(_pick(mapping, "render_publish_result", True), True),
             render_result_width=int(_pick(mapping, "render_result_width", 900) or 900),
+            render_remote_timeout=float(_pick(mapping, "render_remote_timeout", 0.35) or 0.35),
         )
