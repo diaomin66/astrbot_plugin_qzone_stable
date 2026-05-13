@@ -3,6 +3,8 @@ import unittest
 from qzone_bridge.parser import (
     extract_feed_entry,
     extract_feed_page,
+    feed_page_cursor,
+    feed_page_has_more,
     parse_cookie_text,
     parse_index_html,
     parse_profile_html,
@@ -88,6 +90,35 @@ class ParserTests(unittest.TestCase):
         feedpage, items = extract_feed_page({"msglist": [{"tid": "fid-1", "uin": 123456, "content": "hello"}]})
         self.assertEqual(feedpage["msglist"][0]["tid"], "fid-1")
         self.assertEqual(items[0].fid, "fid-1")
+
+    def test_extract_feed_page_accepts_legacy_main_container(self):
+        feedpage, items = extract_feed_page(
+            {
+                "main": {
+                    "hasMoreFeeds": True,
+                    "attach": "",
+                    "externparam": "basetime=1778625269&pagenum=2",
+                    "data": [
+                        {
+                            "key": "fid-legacy",
+                            "nickname": "Alice",
+                            "html": (
+                                "<div data-uin='123456' data-fid='fid-legacy' "
+                                "data-appid='311' data-curkey='cur-key' "
+                                "data-unikey='uni-key'>hello<br>legacy</div>"
+                            ),
+                        }
+                    ],
+                }
+            }
+        )
+        self.assertTrue(feed_page_has_more(feedpage))
+        self.assertEqual(feed_page_cursor(feedpage), "basetime=1778625269&pagenum=2")
+        self.assertEqual(items[0].fid, "fid-legacy")
+        self.assertEqual(items[0].hostuin, 123456)
+        self.assertEqual(items[0].curkey, "cur-key")
+        self.assertEqual(items[0].unikey, "uni-key")
+        self.assertIn("hello", items[0].summary)
 
     def test_unwrap_payload_keeps_legacy_data_behavior(self):
         payload = {"data": {"code": -3000, "message": "登录态失效"}}

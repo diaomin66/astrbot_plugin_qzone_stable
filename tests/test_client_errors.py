@@ -1,10 +1,11 @@
 import unittest
+from urllib.parse import parse_qs
 
 import httpx
 
 from qzone_bridge.client import QzoneClient
-from qzone_bridge.errors import QzoneNeedsRebind, QzoneRequestError
-from qzone_bridge.models import SessionState
+from qzone_bridge.errors import QzoneNeedsRebind, QzoneParseError, QzoneRequestError
+from qzone_bridge.models import FeedEntry, SessionState
 
 
 class ClientErrorMappingTests(unittest.IsolatedAsyncioTestCase):
@@ -90,6 +91,63 @@ class ClientErrorMappingTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(QzoneRequestError) as caught:
             await self.client._request_json("GET", "https://mobile.qzone.qq.com/feeds/mfeeds_get_count")
         self.assertNotIsInstance(caught.exception, QzoneNeedsRebind)
+
+    async def test_jsonish_qzone_payload_falls_back_to_js_literal_parser(self):
+        text = """
+        {
+            "code":0,
+            "subcode":0,
+            "message":"",
+            "default":0,
+            "data": {
+                main:{
+                    attach:'',
+                    hasMoreFeeds:true,
+                    pagenum:'2',
+                    externparam:'basetime=1778625269&pagenum=2',
+                    data:[{uin:123456, tid:'fid-1', content:'hello'}]
+                }
+            }
+        }
+        """
+        await self._use_response(lambda request: httpx.Response(200, text=text, request=request))
+
+        payload = await self.client._request_json(
+            "GET",
+            "https://user.qzone.qq.com/proxy/domain/ic2.qzone.qq.com/cgi-bin/feeds/feeds3_html_more",
+        )
+
+        self.assertTrue(payload["main"]["hasMoreFeeds"])
+        self.assertEqual(payload["main"]["data"][0]["tid"], "fid-1")
+
+    async def test_plain_non_json_text_still_fails_as_parse_error(self):
+        await self._use_response(lambda request: httpx.Response(200, text="ok", request=request))
+
+        with self.assertRaises(QzoneParseError):
+            await self.client._request_json("GET", "https://mobile.qzone.qq.com/feeds/mfeeds_get_count")
+
+    async def test_like_uses_cached_legacy_unikey_and_curkey(self):
+        seen_form = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen_form.update(parse_qs(request.content.decode()))
+            return httpx.Response(200, json={"code": 0, "message": "ok"}, request=request)
+
+        await self._use_response(handler)
+        self.client.feed_cache[(123456, "fid-1")] = FeedEntry(
+            hostuin=123456,
+            fid="fid-1",
+            appid=311,
+            summary="hello",
+            curkey="cached-curkey",
+            unikey="cached-unikey",
+        )
+
+        payload = await self.client.like_post(123456, "fid-1")
+
+        self.assertEqual(payload["message"], "ok")
+        self.assertEqual(seen_form["curkey"][0], "cached-curkey")
+        self.assertEqual(seen_form["unikey"][0], "cached-unikey")
 
 
 if __name__ == "__main__":
