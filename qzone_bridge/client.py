@@ -638,15 +638,43 @@ class QzoneClient:
     async def _prepare_publish_photos(self, photos: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
         if photos and len(photos) > QZONE_MAX_IMAGES:
             raise QzoneParseError(f"QQ空间说说最多支持 {QZONE_MAX_IMAGES} 张图片")
-        prepared: list[dict[str, Any]] = []
-        for photo in photos or []:
+        source_photos = list(photos or [])
+        prepared: list[dict[str, Any] | None] = [None] * len(source_photos)
+        pending: list[tuple[int, dict[str, Any]]] = []
+        for index, photo in enumerate(source_photos):
             if isinstance(photo, dict) and photo.get("richval"):
-                prepared.append(photo)
+                prepared[index] = photo
                 continue
-            prepared.append(await self.upload_photo(photo))
-        if len(prepared) > QZONE_MAX_IMAGES:
+            pending.append((index, photo))
+
+        async def upload_limited(index: int, photo: dict[str, Any], semaphore: asyncio.Semaphore) -> tuple[int, dict[str, Any]]:
+            async with semaphore:
+                return index, await self.upload_photo(photo)
+
+        if len(pending) == 1:
+            index, photo = pending[0]
+            prepared[index] = await self.upload_photo(photo)
+        elif pending:
+            semaphore = asyncio.Semaphore(min(3, len(pending)))
+            results = await asyncio.gather(
+                *(upload_limited(index, photo, semaphore) for index, photo in pending),
+                return_exceptions=True,
+            )
+            errors = [result for result in results if isinstance(result, Exception)]
+            if errors:
+                if not all(isinstance(error, QzoneRequestError) for error in errors):
+                    raise errors[0]
+                log.debug("parallel qzone image upload failed; retrying sequentially", exc_info=errors[0])
+                for index, photo in pending:
+                    prepared[index] = await self.upload_photo(photo)
+            else:
+                for index, payload in results:
+                    prepared[index] = payload
+
+        final = [photo for photo in prepared if photo is not None]
+        if len(final) > QZONE_MAX_IMAGES:
             raise QzoneParseError(f"QQ空间说说最多支持 {QZONE_MAX_IMAGES} 张图片")
-        return prepared
+        return final
 
     async def publish_mood(self, content: str, *, sync_weibo: bool = False, photos: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         photos = await self._prepare_publish_photos(photos)

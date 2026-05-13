@@ -140,6 +140,7 @@ class MainPublishTests(unittest.TestCase):
 
         self.assertTrue(event.stopped)
         plugin.controller.publish_post.assert_awaited_once()
+        plugin._ensure_daemon.assert_not_awaited()
         self.assertEqual(plugin.controller.publish_post.await_args.kwargs["content"], "hello")
         self.assertTrue(plugin.controller.publish_post.await_args.kwargs["content_sanitized"])
 
@@ -152,6 +153,7 @@ class MainPublishTests(unittest.TestCase):
 
         self.assertTrue(event.stopped)
         plugin.controller.publish_post.assert_awaited_once()
+        plugin._ensure_daemon.assert_not_awaited()
         self.assertEqual(plugin.controller.publish_post.await_args.kwargs["content"], "hello")
         self.assertTrue(plugin.controller.publish_post.await_args.kwargs["content_sanitized"])
 

@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from urllib.parse import parse_qs
 
@@ -97,6 +98,39 @@ class ClientMediaTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(upload_called)
         self.assertEqual(payload["tid"], "fid-2")
+
+    async def test_prepare_publish_photos_uploads_concurrently_and_preserves_order(self):
+        client = QzoneClient(
+            SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+        )
+        active = 0
+        max_active = 0
+
+        async def upload_photo(photo):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return {"richval": f"rich-{photo['name']}", "pic_bo": photo["name"]}
+
+        client.upload_photo = upload_photo
+        try:
+            payload = await client._prepare_publish_photos(
+                [
+                    {"kind": "image", "source": "base64://MQ==", "name": "a.jpg"},
+                    {"kind": "image", "source": "base64://Mg==", "name": "b.jpg"},
+                    {"kind": "image", "source": "base64://Mw==", "name": "c.jpg"},
+                ]
+            )
+        finally:
+            await client.close()
+
+        self.assertGreater(max_active, 1)
+        self.assertEqual([item["richval"] for item in payload], ["rich-a.jpg", "rich-b.jpg", "rich-c.jpg"])
 
 
 if __name__ == "__main__":
