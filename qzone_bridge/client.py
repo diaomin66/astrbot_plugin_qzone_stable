@@ -6,6 +6,8 @@ import asyncio
 import base64
 import json
 import logging
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -36,6 +38,11 @@ AUTH_ERROR_CODES = {-3000}
 AUTH_ERROR_KEYWORDS = ("登录", "失效", "请先登录", "skey", "g_tk", "cookie", "expired", "login")
 LOGIN_REDIRECT_HOSTS = ("ptlogin", "ui.ptlogin", "xui.ptlogin", "ssl.ptlogin", "login")
 QZONE_IMAGE_UPLOAD_URL = "https://up.qzone.qq.com/cgi-bin/upload/cgi_upload_image"
+MAX_UPLOAD_IMAGE_BYTES = 32 * 1024 * 1024
+IMAGE_SOURCE_CACHE_TTL_SECONDS = 10 * 60
+IMAGE_SOURCE_CACHE_MAX_ITEMS = 16
+IMAGE_SOURCE_CACHE_MAX_ITEM_BYTES = 8 * 1024 * 1024
+IMAGE_SOURCE_CACHE_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(slots=True)
@@ -73,6 +80,7 @@ class QzoneClient:
             headers={"User-Agent": self.user_agent},
         )
         self.feed_cache: dict[tuple[int, str], FeedEntry] = {}
+        self._image_source_cache: OrderedDict[str, tuple[float, bytes, str]] = OrderedDict()
 
     def _normalize_session(self) -> None:
         self.session.cookies = normalize_cookie_fields(dict(self.session.cookies or {}))
@@ -103,6 +111,34 @@ class QzoneClient:
     def update_session(self, session: SessionState) -> None:
         self.session = session
         self._normalize_session()
+
+    def _cached_image_source(self, source: str) -> tuple[bytes, str] | None:
+        cached = self._image_source_cache.get(source)
+        if cached is None:
+            return None
+        expires_at, data, mime_type = cached
+        if expires_at <= time.monotonic():
+            self._image_source_cache.pop(source, None)
+            return None
+        self._image_source_cache.move_to_end(source)
+        return data, mime_type
+
+    def _store_image_source_cache(self, source: str, data: bytes, mime_type: str) -> None:
+        if not source or not data or len(data) > IMAGE_SOURCE_CACHE_MAX_ITEM_BYTES:
+            return
+        now = time.monotonic()
+        for key, (expires_at, _, _) in list(self._image_source_cache.items()):
+            if expires_at <= now:
+                self._image_source_cache.pop(key, None)
+        self._image_source_cache[source] = (now + IMAGE_SOURCE_CACHE_TTL_SECONDS, data, mime_type)
+        self._image_source_cache.move_to_end(source)
+        total_bytes = sum(len(item[1]) for item in self._image_source_cache.values())
+        while (
+            len(self._image_source_cache) > IMAGE_SOURCE_CACHE_MAX_ITEMS
+            or total_bytes > IMAGE_SOURCE_CACHE_MAX_TOTAL_BYTES
+        ):
+            _, (_, evicted_data, _) = self._image_source_cache.popitem(last=False)
+            total_bytes -= len(evicted_data)
 
     @staticmethod
     def _payload_needs_rebind(code: int, message: str) -> bool:
@@ -513,6 +549,11 @@ class QzoneClient:
         source = item.source.strip()
         filename = item.name or source_name(source) or "image.jpg"
         mime_type = item.mime_type
+        parsed = urlparse(source)
+        cached = self._cached_image_source(source) if parsed.scheme.lower() in {"http", "https"} else None
+        if cached is not None:
+            cached_data, cached_mime = cached
+            return cached_data, filename, mime_type or cached_mime
         if source.startswith("base64://"):
             try:
                 return base64.b64decode(source[len("base64://") :], validate=False), filename, mime_type
@@ -532,30 +573,55 @@ class QzoneClient:
                 raise QzoneParseError("无法解析 data URI 图片数据") from exc
             return data, filename, mime_type or header_mime
 
-        parsed = urlparse(source)
         if parsed.scheme.lower() in {"http", "https"}:
             try:
-                response = await self._client.get(
+                async with self._client.stream(
+                    "GET",
                     source,
                     headers=self._headers(referer=f"https://user.qzone.qq.com/{self.login_uin}"),
                     follow_redirects=True,
-                )
+                ) as response:
+                    self._persist_cookie_response(response)
+                    if response.status_code >= 400:
+                        text = (await response.aread()).decode("utf-8", errors="ignore")
+                        raise QzoneRequestError(
+                            f"下载图片返回 HTTP {response.status_code}",
+                            status_code=response.status_code,
+                            detail={"url": source, "text": text[:500]},
+                        )
+                    length = response.headers.get("content-length")
+                    try:
+                        if length and int(length) > MAX_UPLOAD_IMAGE_BYTES:
+                            raise QzoneParseError("图片文件过大，无法快速上传", detail={"url": source})
+                    except ValueError:
+                        pass
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in response.aiter_bytes():
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > MAX_UPLOAD_IMAGE_BYTES:
+                            raise QzoneParseError("图片文件过大，无法快速上传", detail={"url": source})
+                        chunks.append(chunk)
             except httpx.HTTPError as exc:
                 raise QzoneRequestError("下载图片失败", detail={"url": source}) from exc
-            self._persist_cookie_response(response)
-            if response.status_code >= 400:
-                raise QzoneRequestError(
-                    f"下载图片返回 HTTP {response.status_code}",
-                    status_code=response.status_code,
-                    detail={"url": source, "text": response.text[:500]},
-                )
             content_type = response.headers.get("content-type", "").split(";", 1)[0]
-            return response.content, filename, mime_type or content_type
+            data = b"".join(chunks)
+            self._store_image_source_cache(source, data, content_type)
+            return data, filename, mime_type or content_type
 
         path = Path(source)
-        if not path.exists() or not path.is_file():
-            raise QzoneParseError("图片文件不存在", detail={"path": source})
-        return path.read_bytes(), filename or path.name, mime_type
+        def read_local_image() -> bytes:
+            if not path.exists() or not path.is_file():
+                raise QzoneParseError("图片文件不存在", detail={"path": source})
+            stat = path.stat()
+            if stat.st_size > MAX_UPLOAD_IMAGE_BYTES:
+                raise QzoneParseError("图片文件过大，无法快速上传", detail={"path": source})
+            return path.read_bytes()
+
+        data = await asyncio.to_thread(read_local_image)
+        return data, filename or path.name, mime_type
 
     @staticmethod
     def _photo_payload_from_upload(payload: dict[str, Any], *, filename: str = "", mime_type: str = "") -> dict[str, Any]:
@@ -593,7 +659,8 @@ class QzoneClient:
         if not data:
             raise QzoneParseError("图片内容为空，无法上传", detail={"name": filename})
 
-        encoded = base64.b64encode(data).decode("ascii")
+        encoded_bytes = await asyncio.to_thread(base64.b64encode, data)
+        encoded = encoded_bytes.decode("ascii")
         skey = self.session.cookies.get("skey") or self.session.cookies.get("p_skey") or ""
         p_skey = self.session.cookies.get("p_skey") or self.session.cookies.get("skey") or ""
         upload_payload = await self._request_json(
@@ -655,7 +722,7 @@ class QzoneClient:
             index, photo = pending[0]
             prepared[index] = await self.upload_photo(photo)
         elif pending:
-            semaphore = asyncio.Semaphore(min(3, len(pending)))
+            semaphore = asyncio.Semaphore(min(5, len(pending)))
             results = await asyncio.gather(
                 *(upload_limited(index, photo, semaphore) for index, photo in pending),
                 return_exceptions=True,
@@ -664,9 +731,13 @@ class QzoneClient:
             if errors:
                 if not all(isinstance(error, QzoneRequestError) for error in errors):
                     raise errors[0]
-                log.debug("parallel qzone image upload failed; retrying sequentially", exc_info=errors[0])
-                for index, photo in pending:
-                    prepared[index] = await self.upload_photo(photo)
+                log.debug("parallel qzone image upload failed; retrying failed items sequentially", exc_info=errors[0])
+                for (index, photo), result in zip(pending, results):
+                    if isinstance(result, Exception):
+                        prepared[index] = await self.upload_photo(photo)
+                    else:
+                        _, payload = result
+                        prepared[index] = payload
             else:
                 for index, payload in results:
                     prepared[index] = payload

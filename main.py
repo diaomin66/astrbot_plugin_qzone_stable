@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +41,7 @@ from qzone_bridge.media import PostPayload, collect_post_payload
 from qzone_bridge.models import FeedEntry
 from qzone_bridge.onebot_cookie import fetch_cookie_text
 from qzone_bridge.parser import normalize_uin, parse_cookie_text
-from qzone_bridge.publish_renderer import profile_from_event, render_publish_result_image
+from qzone_bridge.publish_renderer import RenderProfile, profile_from_event, render_publish_result_image
 from qzone_bridge.render import format_action_result, format_feed_detail, format_feed_list, format_status
 from qzone_bridge.settings import PluginSettings
 from qzone_bridge.utils import truncate
@@ -68,6 +69,7 @@ class QzoneStablePlugin(Star):
         )
         self._capture_onebot_client_from_context()
         self._daemon_warmup_task: asyncio.Task | None = None
+        self._publisher_profile_cache: tuple[int, float, Any] | None = None
 
     def _sender_id(self, event: AstrMessageEvent) -> int:
         try:
@@ -97,13 +99,25 @@ class QzoneStablePlugin(Star):
         profile = profile_from_event(event)
         status: dict[str, Any] = {}
         try:
-            status = await self.controller.get_status()
+            status = await self.controller.get_status(probe_daemon=False)
         except QzoneBridgeError:
             status = {}
 
         login_uin = int(status.get("login_uin") or 0)
         if not login_uin:
             return profile
+
+        now = time.monotonic()
+        cached = self._publisher_profile_cache
+        if cached is not None:
+            cached_uin, expires_at, cached_profile = cached
+            if cached_uin == login_uin and expires_at > now:
+                return RenderProfile(
+                    nickname=cached_profile.nickname,
+                    user_id=cached_profile.user_id,
+                    avatar_source=cached_profile.avatar_source,
+                    time_text=profile.time_text,
+                )
 
         nickname = str(
             status.get("login_nickname")
@@ -117,7 +131,10 @@ class QzoneStablePlugin(Star):
 
         bot = self._capture_onebot_client(event)
         if bot is not None:
-            fetched = await self._fetch_onebot_user_info(bot, login_uin)
+            try:
+                fetched = await asyncio.wait_for(self._fetch_onebot_user_info(bot, login_uin), timeout=0.35)
+            except Exception:
+                fetched = {}
             if fetched:
                 nickname = nickname or str(fetched.get("nickname") or fetched.get("name") or "").strip()
                 avatar_source = str(fetched.get("avatar") or fetched.get("avatar_url") or avatar_source).strip()
@@ -125,6 +142,16 @@ class QzoneStablePlugin(Star):
         profile.user_id = str(login_uin)
         profile.nickname = nickname or str(login_uin)
         profile.avatar_source = avatar_source
+        self._publisher_profile_cache = (
+            login_uin,
+            now + 10 * 60,
+            RenderProfile(
+                nickname=profile.nickname,
+                user_id=profile.user_id,
+                avatar_source=profile.avatar_source,
+                time_text="",
+            ),
+        )
         return profile
 
     async def _fetch_onebot_user_info(self, bot: Any, uin: int) -> dict[str, Any]:
@@ -153,12 +180,27 @@ class QzoneStablePlugin(Star):
                 return result
         return {}
 
-    async def _publish_result(self, event: AstrMessageEvent, post: PostPayload, payload: dict[str, Any]):
+    def _schedule_publisher_profile(self, event: AstrMessageEvent) -> asyncio.Task | None:
+        if not self.settings.render_publish_result:
+            return None
+        return asyncio.create_task(self._publisher_render_profile(event))
+
+    async def _publish_result(
+        self,
+        event: AstrMessageEvent,
+        post: PostPayload,
+        payload: dict[str, Any],
+        *,
+        profile_task: asyncio.Task | None = None,
+    ):
         text = format_action_result("发布成功", payload)
         if not self.settings.render_publish_result:
             self._stop_event(event)
             return event.plain_result(text)
-        profile = await self._publisher_render_profile(event)
+        try:
+            profile = await profile_task if profile_task is not None else await self._publisher_render_profile(event)
+        except Exception:
+            profile = profile_from_event(event)
         try:
             image_path = await asyncio.to_thread(
                 render_publish_result_image,
@@ -167,6 +209,7 @@ class QzoneStablePlugin(Star):
                 profile=profile,
                 result=payload,
                 width=self.settings.render_result_width,
+                remote_timeout=self.settings.render_remote_timeout,
             )
         except Exception as exc:
             logger.exception("qzone publish result render failed: %s", exc)
@@ -505,17 +548,21 @@ class QzoneStablePlugin(Star):
             include_event_text=True,
             command_prefixes=("qzone post",),
         )
+        profile_task: asyncio.Task | None = None
         try:
             await self._ensure_cookie_ready(event)
+            profile_task = self._schedule_publisher_profile(event)
             payload = await self.controller.publish_post(
                 content=post.content,
                 media=[item.to_dict() for item in post.media],
                 content_sanitized=True,
             )
         except QzoneBridgeError as exc:
+            if profile_task is not None:
+                profile_task.cancel()
             yield self._command_result(event, self._error_text(exc))
             return
-        yield await self._publish_result(event, post, payload)
+        yield await self._publish_result(event, post, payload, profile_task=profile_task)
 
     @qzone.command("comment")
     async def qzone_comment(self, event: AstrMessageEvent, hostuin: int, fid: str, content: str):
@@ -636,8 +683,10 @@ class QzoneStablePlugin(Star):
             suffix = f"；附件 {len(post.media)} 个" if post.media else ""
             yield event.plain_result(f"待发布草稿: {draft}{suffix}。确认后将执行。")
             return
+        profile_task: asyncio.Task | None = None
         try:
             await self._ensure_cookie_ready(event)
+            profile_task = self._schedule_publisher_profile(event)
             payload = await self.controller.publish_post(
                 content=post.content,
                 sync_weibo=sync_weibo,
@@ -645,9 +694,11 @@ class QzoneStablePlugin(Star):
                 content_sanitized=True,
             )
         except QzoneBridgeError as exc:
+            if profile_task is not None:
+                profile_task.cancel()
             yield event.plain_result(self._error_text(exc))
             return
-        yield await self._publish_result(event, post, payload)
+        yield await self._publish_result(event, post, payload, profile_task=profile_task)
 
     @filter.llm_tool(name="qzone_comment_post")
     async def tool_comment_post(

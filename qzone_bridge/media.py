@@ -276,6 +276,9 @@ def _choose_media_source(data: dict[str, Any]) -> str:
     ]
     normalized = [normalize_source(value) for value in candidates if value not in (None, "")]
     for value in normalized:
+        if _is_base64_source(value) or (not _is_url(value) and _looks_like_path(value)):
+            return value
+    for value in normalized:
         if _is_url(value) or _is_base64_source(value) or _looks_like_path(value):
             return value
     return normalized[0] if normalized else ""

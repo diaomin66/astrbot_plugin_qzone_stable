@@ -50,6 +50,7 @@ class QzoneDaemonService:
         self.health_state = "idle"
         self._keepalive_task: asyncio.Task | None = None
         self._warmup_task: asyncio.Task | None = None
+        self._save_task: asyncio.Task | None = None
         self._closing = False
 
     def save(self) -> None:
@@ -63,13 +64,32 @@ class QzoneDaemonService:
         if self.state.session.needs_rebind or not self.state.session.cookies or not self.state.session.uin:
             raise QzoneNeedsRebind()
 
-    def _set_success(self) -> None:
+    def _schedule_save(self) -> None:
+        if self._closing:
+            return
+        task = self._save_task
+        if task is not None and not task.done():
+            return
+
+        async def runner() -> None:
+            await asyncio.sleep(0.05)
+            try:
+                self.save()
+            except Exception:
+                log.warning("qzone daemon deferred state save failed", exc_info=True)
+
+        self._save_task = asyncio.create_task(runner())
+
+    def _set_success(self, *, defer_save: bool = False) -> None:
         self.health_state = "ready" if self.state.session.cookies else "needs_rebind"
         self.state.session.last_ok_at = now_iso()
         self.state.session.last_error = None
         self.state.session.needs_rebind = not bool(self.state.session.cookies)
         self.touch()
-        self.save()
+        if defer_save:
+            self._schedule_save()
+        else:
+            self.save()
 
     def _set_error(self, exc: Exception) -> None:
         if isinstance(exc, (QzoneNeedsRebind, QzoneAuthError)):
@@ -138,6 +158,9 @@ class QzoneDaemonService:
             self._keepalive_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._keepalive_task
+        if self._save_task:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._save_task
         self.health_state = "offline"
         self.state.runtime.daemon_pid = 0
         self.state.runtime.started_at = ""
@@ -149,7 +172,7 @@ class QzoneDaemonService:
     async def warmup(self) -> None:
         self._ensure_session_ready()
         await self.client.mfeeds_get_count()
-        self._set_success()
+        self._set_success(defer_save=True)
 
     async def _background_warmup(self) -> None:
         try:
@@ -346,7 +369,7 @@ class QzoneDaemonService:
         )
         if not isinstance(payload, dict):
             raise QzoneParseError("发布说说返回结构异常")
-        self._set_success()
+        self._set_success(defer_save=True)
         return {
             "fid": payload.get("fid") or payload.get("tid") or "",
             "message": payload.get("msg") or payload.get("message") or "",
@@ -370,7 +393,7 @@ class QzoneDaemonService:
         payload = unwrap_payload(await self.client.add_comment(hostuin, fid, content, appid=appid, private=private))
         if not isinstance(payload, dict):
             raise QzoneParseError("评论返回结构异常")
-        self._set_success()
+        self._set_success(defer_save=True)
         return {
             "commentid": payload.get("commentid") or payload.get("commentId") or 0,
             "commentLikekey": payload.get("commentLikekey") or "",
@@ -393,7 +416,7 @@ class QzoneDaemonService:
         )
         if not isinstance(payload, dict):
             raise QzoneParseError("点赞返回结构异常")
-        self._set_success()
+        self._set_success(defer_save=True)
         return {
             "action": "unlike" if unlike else "like",
             "message": payload.get("msg") or payload.get("message") or "",

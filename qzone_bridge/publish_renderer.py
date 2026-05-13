@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import io
 import math
 import os
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -46,6 +48,16 @@ FILE_COLORS = {
     ".md": (112, 121, 130),
 }
 FONT_CACHE: dict[tuple[int, bool], ImageFont.ImageFont] = {}
+FAST_RESAMPLE = Image.Resampling.BILINEAR
+PREVIEW_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="qzone-render")
+_THREAD_LOCAL = threading.local()
+_BYTES_CACHE: dict[str, tuple[float, bytes]] = {}
+_BYTES_CACHE_LOCK = threading.Lock()
+_BYTES_CACHE_TTL = 10 * 60
+_BYTES_CACHE_MAX_ITEMS = 64
+_BYTES_CACHE_MAX_ITEM_SIZE = 4 * 1024 * 1024
+_LAST_PRUNE_AT = 0.0
+_PRUNE_INTERVAL_SECONDS = 60.0
 
 
 @dataclass(slots=True)
@@ -160,7 +172,15 @@ def render_publish_result_image(
     line_height = _line_height(scratch, text_font, 1.34)
     text_height = len(text_lines) * line_height if text_lines else 0
 
-    previews = [_load_image_preview(item, remote_timeout=remote_timeout) for item in post.media[:9]]
+    preview_targets: list[PostMedia] = []
+    avatar_offset = 0
+    if profile.avatar_source:
+        preview_targets.append(PostMedia(kind="image", source=profile.avatar_source, name="avatar"))
+        avatar_offset = 1
+    preview_targets.extend(post.media[:9])
+    loaded_previews = _load_image_previews(preview_targets, remote_timeout=remote_timeout)
+    avatar_preview = loaded_previews[0] if avatar_offset else None
+    previews = loaded_previews[avatar_offset:]
     image_height = _image_block_height(previews, content_width) if previews else 0
     attachment_height = _attachment_block_height(post.attachments, content_width) if post.attachments else 0
 
@@ -177,7 +197,7 @@ def render_publish_result_image(
 
     image = Image.new("RGB", (width, height), WHITE)
     draw = ImageDraw.Draw(image)
-    _draw_header(draw, image, profile, margin, name_font, time_font)
+    _draw_header(draw, image, profile, margin, name_font, time_font, avatar_preview=avatar_preview)
 
     y = 126
     if text_lines:
@@ -198,7 +218,7 @@ def render_publish_result_image(
     _draw_comment_box(draw, margin, comment_y, content_width, 52, meta_font)
 
     path = output_dir / f"publish_result_{int(time.time())}_{uuid.uuid4().hex[:10]}.png"
-    image.save(path, "PNG", optimize=True)
+    image.save(path, "PNG", optimize=False, compress_level=1)
     return path
 
 
@@ -333,16 +353,38 @@ def _load_image_preview(media: PostMedia, *, remote_timeout: float) -> _ImagePre
                 preview = base
             else:
                 preview = preview.copy()
-            preview.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
+            preview.thumbnail((900, 900), FAST_RESAMPLE)
             return _ImagePreview(media=media, image=preview, failed=False)
     except (OSError, UnidentifiedImageError):
         return _ImagePreview(media=media, image=None, failed=True)
+
+
+def _load_image_previews(items: list[PostMedia], *, remote_timeout: float) -> list[_ImagePreview]:
+    if not items:
+        return []
+    if len(items) == 1:
+        return [_load_image_preview(items[0], remote_timeout=remote_timeout)]
+    futures = [
+        PREVIEW_EXECUTOR.submit(_load_image_preview, item, remote_timeout=remote_timeout)
+        for item in items
+    ]
+    previews: list[_ImagePreview] = []
+    for item, future in zip(items, futures):
+        try:
+            previews.append(future.result())
+        except Exception:
+            previews.append(_ImagePreview(media=item, image=None, failed=True))
+    return previews
 
 
 def _read_source_bytes(source: str, *, max_bytes: int, remote_timeout: float) -> bytes:
     source = str(source or "").strip()
     if not source:
         return b""
+    cache_key = _bytes_cache_key(source)
+    cached = _get_cached_bytes(cache_key)
+    if cached:
+        return cached[:max_bytes]
     if source.startswith("base64://"):
         try:
             return base64.b64decode(source[len("base64://") :], validate=False)[:max_bytes]
@@ -363,14 +405,30 @@ def _read_source_bytes(source: str, *, max_bytes: int, remote_timeout: float) ->
     parsed = urlparse(source)
     if parsed.scheme.lower() in {"http", "https"}:
         try:
-            with httpx.Client(timeout=httpx.Timeout(remote_timeout), follow_redirects=True, trust_env=False) as client:
-                response = client.get(source)
-            if response.status_code >= 400:
-                return b""
-            length = response.headers.get("content-length")
-            if length and int(length) > max_bytes:
-                return b""
-            return response.content[:max_bytes]
+            client = _thread_http_client()
+            with client.stream(
+                "GET",
+                source,
+                timeout=httpx.Timeout(remote_timeout),
+                follow_redirects=True,
+            ) as response:
+                if response.status_code >= 400:
+                    return b""
+                length = response.headers.get("content-length")
+                if length and int(length) > max_bytes:
+                    return b""
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in response.iter_bytes():
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > max_bytes:
+                        return b""
+                    chunks.append(chunk)
+            data = b"".join(chunks)
+            _store_cached_bytes(cache_key, data)
+            return data
         except Exception:
             return b""
 
@@ -379,11 +437,59 @@ def _read_source_bytes(source: str, *, max_bytes: int, remote_timeout: float) ->
         source = parsed.path or ""
     path = Path(source)
     try:
-        if not path.exists() or not path.is_file() or path.stat().st_size > max_bytes:
+        stat = path.stat()
+        if not path.is_file() or stat.st_size > max_bytes:
             return b""
-        return path.read_bytes()
+        local_key = f"file:{path.resolve()}:{stat.st_mtime_ns}:{stat.st_size}"
+        cached = _get_cached_bytes(local_key)
+        if cached:
+            return cached[:max_bytes]
+        data = path.read_bytes()
+        _store_cached_bytes(local_key, data)
+        return data
     except OSError:
         return b""
+
+
+def _thread_http_client() -> httpx.Client:
+    client = getattr(_THREAD_LOCAL, "http_client", None)
+    if client is None:
+        client = httpx.Client(trust_env=False)
+        _THREAD_LOCAL.http_client = client
+    return client
+
+
+def _bytes_cache_key(source: str) -> str:
+    parsed = urlparse(source)
+    if parsed.scheme.lower() in {"http", "https"}:
+        return f"url:{source}"
+    return ""
+
+
+def _get_cached_bytes(key: str) -> bytes:
+    if not key:
+        return b""
+    now = time.monotonic()
+    with _BYTES_CACHE_LOCK:
+        cached = _BYTES_CACHE.get(key)
+        if not cached:
+            return b""
+        expires_at, data = cached
+        if expires_at <= now:
+            _BYTES_CACHE.pop(key, None)
+            return b""
+        return data
+
+
+def _store_cached_bytes(key: str, data: bytes) -> None:
+    if not key or not data or len(data) > _BYTES_CACHE_MAX_ITEM_SIZE:
+        return
+    now = time.monotonic()
+    with _BYTES_CACHE_LOCK:
+        if len(_BYTES_CACHE) >= _BYTES_CACHE_MAX_ITEMS:
+            oldest_key = min(_BYTES_CACHE, key=lambda item: _BYTES_CACHE[item][0])
+            _BYTES_CACHE.pop(oldest_key, None)
+        _BYTES_CACHE[key] = (now + _BYTES_CACHE_TTL, data)
 
 
 def _image_block_height(previews: list[_ImagePreview], width: int) -> int:
@@ -433,11 +539,13 @@ def _draw_header(
     margin: int,
     name_font: ImageFont.ImageFont,
     time_font: ImageFont.ImageFont,
+    *,
+    avatar_preview: _ImagePreview | None = None,
 ) -> None:
     avatar_size = 76
     avatar_x = margin
     avatar_y = 26
-    _draw_avatar(draw, image, profile, avatar_x, avatar_y, avatar_size)
+    _draw_avatar(draw, image, profile, avatar_x, avatar_y, avatar_size, preview=avatar_preview)
     text_x = avatar_x + avatar_size + 18
     _safe_text(draw, (text_x, 32), profile.nickname, name_font, TEXT)
     _safe_text(draw, (text_x, 72), profile.time_text, time_font, MUTED)
@@ -454,14 +562,14 @@ def _draw_avatar(
     x: int,
     y: int,
     size: int,
+    *,
+    preview: _ImagePreview | None = None,
 ) -> None:
-    avatar_media = PostMedia(kind="image", source=profile.avatar_source, name="avatar")
-    preview = _load_image_preview(avatar_media, remote_timeout=0.8) if profile.avatar_source else None
     mask = Image.new("L", (size, size), 0)
     mask_draw = ImageDraw.Draw(mask)
     mask_draw.ellipse((0, 0, size - 1, size - 1), fill=255)
     if preview and preview.image:
-        avatar = ImageOps.fit(preview.image, (size, size), method=Image.Resampling.LANCZOS)
+        avatar = ImageOps.fit(preview.image, (size, size), method=FAST_RESAMPLE)
         image.paste(avatar, (x, y), mask)
         return
 
@@ -529,9 +637,9 @@ def _draw_preview_tile(
 ) -> None:
     if preview.image is not None:
         if crop:
-            rendered = ImageOps.fit(preview.image, (width, height), method=Image.Resampling.LANCZOS)
+            rendered = ImageOps.fit(preview.image, (width, height), method=FAST_RESAMPLE)
         else:
-            rendered = ImageOps.contain(preview.image, (width, height), method=Image.Resampling.LANCZOS)
+            rendered = ImageOps.contain(preview.image, (width, height), method=FAST_RESAMPLE)
             width, height = rendered.size
         image.paste(rendered, (x, y))
         return
@@ -684,6 +792,11 @@ def _draw_comment_box(
 
 
 def _prune_output_dir(output_dir: Path, *, keep: int = 128, max_age_seconds: int = 3 * 24 * 3600) -> None:
+    global _LAST_PRUNE_AT
+    now = time.monotonic()
+    if now - _LAST_PRUNE_AT < _PRUNE_INTERVAL_SECONDS:
+        return
+    _LAST_PRUNE_AT = now
     try:
         files = sorted(
             [path for path in output_dir.glob("publish_result_*.png") if path.is_file()],

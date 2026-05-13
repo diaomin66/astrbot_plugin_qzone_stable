@@ -1,6 +1,9 @@
+import io
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image, ImageChops, ImageDraw
 
@@ -109,6 +112,44 @@ class PublishRendererTests(unittest.TestCase):
         self.assertLessEqual(bbox[2], 56)
         self.assertLessEqual(bbox[3], 46)
         self.assertIn(ACTION, image.getdata())
+
+    def test_render_loads_multiple_previews_concurrently(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            active = 0
+            max_active = 0
+
+            def fake_read(source, *, max_bytes, remote_timeout):
+                nonlocal active, max_active
+                active += 1
+                max_active = max(max_active, active)
+                time.sleep(0.03)
+                active -= 1
+                image = Image.new("RGB", (64, 64), (120, 180, 210))
+                buffer = io.BytesIO()
+                image.save(buffer, format="PNG")
+                buffer.seek(0)
+                return buffer.read()
+
+            post = PostPayload(
+                content="parallel",
+                media=[
+                    PostMedia(kind="image", source="a.png", name="a.png"),
+                    PostMedia(kind="image", source="b.png", name="b.png"),
+                    PostMedia(kind="image", source="c.png", name="c.png"),
+                ],
+            )
+
+            with patch("qzone_bridge.publish_renderer._read_source_bytes", side_effect=fake_read):
+                rendered = render_publish_result_image(
+                    post,
+                    temp_path,
+                    profile=RenderProfile(nickname="Coconut", time_text="06:34"),
+                    width=700,
+                )
+
+            self.assertTrue(rendered.exists())
+            self.assertGreater(max_active, 1)
 
 
 if __name__ == "__main__":

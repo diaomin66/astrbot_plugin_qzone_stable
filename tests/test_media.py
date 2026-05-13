@@ -1,5 +1,7 @@
 import types
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from qzone_bridge.media import collect_post_payload
 
@@ -297,6 +299,31 @@ class MediaPayloadTests(unittest.TestCase):
 
         self.assertEqual(payload.content, "")
         self.assertEqual(payload.media[0].source, "https://example.com/a.png")
+
+    def test_onebot_image_prefers_existing_local_file_over_url(self):
+        with TemporaryDirectory() as temp:
+            image_path = Path(temp) / "photo.png"
+            image_path.write_bytes(b"image")
+
+            payload = collect_post_payload(
+                self.event(
+                    [
+                        {"type": "text", "data": {"text": "/qzone post"}},
+                        {
+                            "type": "image",
+                            "data": {
+                                "file": str(image_path),
+                                "url": "https://example.com/slow.png",
+                            },
+                        },
+                    ]
+                ),
+                include_event_text=True,
+                command_prefixes=("qzone post",),
+            )
+
+        self.assertEqual(payload.content, "")
+        self.assertEqual(payload.media[0].source, str(image_path))
 
     def test_non_image_file_becomes_readable_reference(self):
         payload = collect_post_payload(

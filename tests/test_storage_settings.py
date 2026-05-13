@@ -26,6 +26,7 @@ class StorageSettingsTests(unittest.TestCase):
                 "public_feed_limit": 7,
                 "auto_bind_cookie": False,
                 "cookie_domain": "https://user.qzone.qq.com/",
+                "render_remote_timeout": 0.25,
             }
         )
         self.assertEqual(settings.daemon_port, 19001)
@@ -33,6 +34,7 @@ class StorageSettingsTests(unittest.TestCase):
         self.assertEqual(settings.public_feed_limit, 7)
         self.assertFalse(settings.auto_bind_cookie)
         self.assertEqual(settings.cookie_domain, "https://user.qzone.qq.com/")
+        self.assertEqual(settings.render_remote_timeout, 0.25)
 
 
 if __name__ == "__main__":
