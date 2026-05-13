@@ -36,10 +36,11 @@ _prepare_local_qzone_bridge_imports()
 
 from qzone_bridge.controller import QzoneDaemonController
 from qzone_bridge.errors import DaemonUnavailableError, QzoneBridgeError, QzoneCookieAcquireError, QzoneNeedsRebind
-from qzone_bridge.media import collect_post_payload
+from qzone_bridge.media import PostPayload, collect_post_payload
 from qzone_bridge.models import FeedEntry
 from qzone_bridge.onebot_cookie import fetch_cookie_text
 from qzone_bridge.parser import normalize_uin, parse_cookie_text
+from qzone_bridge.publish_renderer import profile_from_event, render_publish_result_image
 from qzone_bridge.render import format_action_result, format_feed_detail, format_feed_list, format_status
 from qzone_bridge.settings import PluginSettings
 from qzone_bridge.utils import truncate
@@ -90,6 +91,32 @@ class QzoneStablePlugin(Star):
     def _command_result(self, event: AstrMessageEvent, text: str):
         self._stop_event(event)
         return event.plain_result(text)
+
+    async def _publish_result(self, event: AstrMessageEvent, post: PostPayload, payload: dict[str, Any]):
+        text = format_action_result("发布成功", payload)
+        if not self.settings.render_publish_result:
+            self._stop_event(event)
+            return event.plain_result(text)
+        try:
+            image_path = await asyncio.to_thread(
+                render_publish_result_image,
+                post,
+                self.data_dir / "rendered_posts",
+                profile=profile_from_event(event),
+                result=payload,
+                width=self.settings.render_result_width,
+            )
+        except Exception as exc:
+            logger.exception("qzone publish result render failed: %s", exc)
+            self._stop_event(event)
+            return event.plain_result(text)
+
+        image_result = getattr(event, "image_result", None)
+        if callable(image_result):
+            self._stop_event(event)
+            return image_result(str(image_path))
+        self._stop_event(event)
+        return event.plain_result(f"{text}\n渲染图: {image_path}")
 
     def _stop_event(self, event: AstrMessageEvent) -> None:
         stopper = getattr(event, "stop_event", None)
@@ -393,7 +420,7 @@ class QzoneStablePlugin(Star):
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
             return
-        yield self._command_result(event, format_action_result("发布成功", payload))
+        yield await self._publish_result(event, post, payload)
 
     @qzone.command("comment")
     async def qzone_comment(self, event: AstrMessageEvent, hostuin: int, fid: str, content: str):
@@ -526,7 +553,7 @@ class QzoneStablePlugin(Star):
         except QzoneBridgeError as exc:
             yield event.plain_result(self._error_text(exc))
             return
-        yield event.plain_result(format_action_result("发布成功", payload))
+        yield await self._publish_result(event, post, payload)
 
     @filter.llm_tool(name="qzone_comment_post")
     async def tool_comment_post(

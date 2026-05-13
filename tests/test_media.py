@@ -306,6 +306,8 @@ class MediaPayloadTests(unittest.TestCase):
         )
 
         self.assertEqual(payload.media, [])
+        self.assertEqual(len(payload.attachments), 1)
+        self.assertEqual(payload.attachments[0].name, "notes.txt")
         self.assertEqual(payload.content, "report\n[文件: notes.txt]")
 
     def test_llm_mode_keeps_explicit_content_and_file_reference(self):
@@ -317,6 +319,8 @@ class MediaPayloadTests(unittest.TestCase):
 
         self.assertEqual(payload.content, "weekly report\n[文件: report.pdf]")
         self.assertEqual(payload.media, [])
+        self.assertEqual(len(payload.attachments), 1)
+        self.assertEqual(payload.attachments[0].name, "report.pdf")
 
     def test_stringified_image_fallback_is_ignored_when_image_component_exists(self):
         payload = collect_post_payload(
