@@ -1,4 +1,4 @@
 httpx>=0.27,<1
 # AstrBot 4.24.x ships aiohttp 3.13.5; keep this aligned with the core runtime.
 aiohttp>=3.13.5,<4
-Pillow>=10,<12
+Pillow>=10
