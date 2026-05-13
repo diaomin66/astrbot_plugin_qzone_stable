@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import importlib
 import json
 import sys
@@ -257,42 +258,158 @@ class QzoneStablePlugin(Star):
                 return f"{exc.message}（{', '.join(parts)}）"
         return f"{exc.message}\n{exc.detail}"
 
-    def _llm_tool_result(self, payload: dict[str, Any]) -> str:
-        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    async def _maybe_await(self, value: Any) -> Any:
+        if inspect.isawaitable(value):
+            return await value
+        return value
 
-    def _llm_like_result(self, payload: dict[str, Any]) -> str:
+    @staticmethod
+    def _text_from_llm_response(response: Any) -> str:
+        if response is None:
+            return ""
+        if isinstance(response, str):
+            return response.strip()
+        for attr in ("completion_text", "text", "content", "message"):
+            value = getattr(response, attr, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        if isinstance(response, dict):
+            for key in ("completion_text", "text", "content", "message"):
+                value = response.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return ""
+
+    async def _current_provider_id(self, event: AstrMessageEvent) -> Any | None:
+        context = getattr(self, "_context", None) or getattr(self, "context", None)
+        getter = getattr(context, "get_current_chat_provider_id", None)
+        if not callable(getter):
+            return None
+        umo = getattr(event, "unified_msg_origin", None)
+        attempts: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        if umo is not None:
+            attempts.append(((), {"umo": umo}))
+            attempts.append(((umo,), {}))
+        attempts.append(((), {}))
+        for args, kwargs in attempts:
+            try:
+                provider_id = await self._maybe_await(getter(*args, **kwargs))
+            except TypeError:
+                continue
+            except Exception as exc:
+                logger.debug("qzone llm provider id lookup failed: %s", exc)
+                return None
+            if provider_id:
+                return provider_id
+        return None
+
+    async def _ask_llm_tool_reply(self, event: AstrMessageEvent, payload: dict[str, Any], fallback: str) -> str:
+        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        prompt = (
+            "下面是 QQ 空间工具执行结果 JSON，只用于你组织给用户的回复，不要原样输出。"
+            f"\n{data}\n"
+            "请直接用简短中文回复用户，不要输出 JSON，不要暴露字段名、tool、code、fid、cursor、raw、detail 等内部信息。"
+            "如果 ok 为 true，按已完成或已提交处理；verified 为 false 时说明 QQ 空间状态可能稍后刷新，不要说成失败。"
+            "如果 ok 为 false，只说明失败原因即可。"
+        )
+        system_prompt = "你是 AstrBot 的 QQ 空间助手，负责把工具执行结果改写成自然、简短、对用户友好的中文回复。"
+        context = getattr(self, "_context", None) or getattr(self, "context", None)
+
+        generator = getattr(context, "llm_generate", None)
+        if callable(generator):
+            kwargs: dict[str, Any] = {"prompt": prompt, "system_prompt": system_prompt}
+            provider_id = await self._current_provider_id(event)
+            if provider_id:
+                kwargs["chat_provider_id"] = provider_id
+            try:
+                response = await self._maybe_await(generator(**kwargs))
+            except TypeError:
+                kwargs.pop("chat_provider_id", None)
+                try:
+                    response = await self._maybe_await(generator(**kwargs))
+                except Exception as exc:
+                    logger.debug("qzone llm_generate reply failed: %s", exc)
+                else:
+                    text = self._text_from_llm_response(response)
+                    if text:
+                        return text
+            except Exception as exc:
+                logger.debug("qzone llm_generate reply failed: %s", exc)
+            else:
+                text = self._text_from_llm_response(response)
+                if text:
+                    return text
+
+        provider_getter = getattr(context, "get_using_provider", None)
+        provider = None
+        if callable(provider_getter):
+            umo = getattr(event, "unified_msg_origin", None)
+            attempts: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+            if umo is not None:
+                attempts.append(((), {"umo": umo}))
+                attempts.append(((umo,), {}))
+            attempts.append(((), {}))
+            for args, kwargs in attempts:
+                try:
+                    provider = await self._maybe_await(provider_getter(*args, **kwargs))
+                except TypeError:
+                    continue
+                except Exception as exc:
+                    logger.debug("qzone provider lookup failed: %s", exc)
+                    provider = None
+                    break
+                if provider is not None:
+                    break
+
+        text_chat = getattr(provider, "text_chat", None)
+        if callable(text_chat):
+            for kwargs in (
+                {"prompt": prompt, "contexts": [], "system_prompt": system_prompt},
+                {"prompt": prompt, "context": [], "system_prompt": system_prompt},
+                {"prompt": prompt},
+            ):
+                try:
+                    response = await self._maybe_await(text_chat(**kwargs))
+                except TypeError:
+                    continue
+                except Exception as exc:
+                    logger.debug("qzone provider text_chat reply failed: %s", exc)
+                    break
+                text = self._text_from_llm_response(response)
+                if text:
+                    return text
+
+        return fallback
+
+    def _llm_like_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         visible_payload = {
             key: value
             for key, value in payload.items()
             if key not in {"raw", "detail"} and not isinstance(value, (dict, list))
         }
-        return self._llm_tool_result(
-            {
-                "ok": True,
-                "tool": "qzone_like_post",
-                "result": visible_payload,
-                "reply_guidance": (
-                    "请根据 result 用自然语言回复用户。"
-                    "如果 verified 为 true，说明 QQ 空间状态已确认；"
-                    "如果 verified 为 false，请说明请求已提交但状态暂未确认。"
-                    "不要暴露 fid、cursor、raw 或内部字段。"
-                ),
-            }
-        )
+        return {
+            "ok": True,
+            "tool": "qzone_like_post",
+            "result": visible_payload,
+            "reply_guidance": (
+                "请根据 result 用自然语言回复用户。"
+                "如果 verified 为 true，说明 QQ 空间状态已确认；"
+                "如果 verified 为 false，请说明请求已提交但状态暂未确认。"
+                "不要暴露 fid、cursor、raw 或内部字段。"
+            ),
+        }
 
-    def _llm_error_result(self, tool: str, exc: QzoneBridgeError) -> str:
-        return self._llm_tool_result(
-            {
-                "ok": False,
-                "tool": tool,
-                "error": {
-                    "type": type(exc).__name__,
-                    "code": exc.code,
-                    "message": exc.message,
-                },
-                "reply_guidance": "请根据 error 用自然语言简短告知用户失败原因，不要暴露内部字段。",
-            }
-        )
+    def _llm_error_payload(self, tool: str, exc: QzoneBridgeError) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "tool": tool,
+            "error": {
+                "type": type(exc).__name__,
+                "code": exc.code,
+                "message": exc.message,
+            },
+            "reply_guidance": "请根据 error 用自然语言简短告知用户失败原因，不要暴露内部字段。",
+        }
 
     async def _ensure_daemon(self, *, allow_needs_rebind: bool = False) -> None:
         status = await self.controller.get_status()
@@ -809,19 +926,19 @@ class QzoneStablePlugin(Star):
             unlike (boolean): 是否取消点赞。
         """
         if not self._is_admin(event):
+            payload = {
+                "ok": False,
+                "tool": "qzone_like_post",
+                "error": {
+                    "type": "PermissionError",
+                    "code": "QZONE_PERMISSION",
+                    "message": "仅管理员可点赞。",
+                },
+                "reply_guidance": "请用自然语言告诉用户没有权限执行点赞。",
+            }
+            text = await self._ask_llm_tool_reply(event, payload, "仅管理员可点赞。")
             yield event.plain_result(
-                self._llm_tool_result(
-                    {
-                        "ok": False,
-                        "tool": "qzone_like_post",
-                        "error": {
-                            "type": "PermissionError",
-                            "code": "QZONE_PERMISSION",
-                            "message": "仅管理员可点赞。",
-                        },
-                        "reply_guidance": "请用自然语言告诉用户没有权限执行点赞。",
-                    }
-                )
+                text
             )
             return
         try:
@@ -829,9 +946,19 @@ class QzoneStablePlugin(Star):
             await self._ensure_daemon()
             payload = await self.controller.like_post(hostuin=hostuin, fid=fid, appid=appid, unlike=unlike)
         except QzoneBridgeError as exc:
-            yield event.plain_result(self._llm_error_result("qzone_like_post", exc))
+            text = await self._ask_llm_tool_reply(
+                event,
+                self._llm_error_payload("qzone_like_post", exc),
+                exc.message,
+            )
+            yield event.plain_result(text)
             return
-        yield event.plain_result(self._llm_like_result(payload))
+        text = await self._ask_llm_tool_reply(
+            event,
+            self._llm_like_payload(payload),
+            format_like_result(payload),
+        )
+        yield event.plain_result(text)
 
     async def terminate(self):
         try:

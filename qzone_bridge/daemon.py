@@ -31,6 +31,7 @@ from .storage import StateStore, ensure_state_secret
 from .utils import now_iso, from_iso
 
 log = logging.getLogger(__name__)
+LIKE_VERIFY_RETRY_DELAYS_SECONDS = (0.35, 0.85, 1.6)
 
 
 class QzoneDaemonService:
@@ -442,6 +443,24 @@ class QzoneDaemonService:
                     return entry
         return None
 
+    async def _retry_like_entry_until_fresh(
+        self,
+        hostuin: int,
+        fid: str,
+        appid: int,
+        target_liked: bool,
+        current_entry: FeedEntry | None,
+    ) -> FeedEntry | None:
+        entry = current_entry
+        for delay in LIKE_VERIFY_RETRY_DELAYS_SECONDS:
+            await asyncio.sleep(delay)
+            refreshed = await self._refresh_like_entry(hostuin, fid, appid)
+            if refreshed is not None:
+                entry = refreshed
+            if entry is None or entry.liked == target_liked:
+                return entry
+        return entry
+
     @staticmethod
     def _normalize_action_payload(payload: Any) -> dict[str, Any]:
         payload = unwrap_payload(payload)
@@ -496,27 +515,42 @@ class QzoneDaemonService:
                 verified_entry = await self._refresh_like_entry(hostuin, fid, appid)
 
         if verified_entry is not None and verified_entry.liked != target_liked:
-            action_text = "取消点赞" if unlike else "点赞"
-            raise QzoneRequestError(
-                f"{action_text}请求已发送，但 QQ 空间未确认状态变更",
-                detail={
-                    "hostuin": hostuin,
-                    "fid": fid,
-                    "expected_liked": target_liked,
-                    "actual_liked": verified_entry.liked,
-                    "raw": payload,
-                },
+            verified_entry = await self._retry_like_entry_until_fresh(
+                hostuin,
+                fid,
+                appid,
+                target_liked,
+                verified_entry,
+            )
+
+        verification: dict[str, Any] | None = None
+        if verified_entry is not None and verified_entry.liked != target_liked:
+            verification = {
+                "expected_liked": target_liked,
+                "actual_liked": verified_entry.liked,
+            }
+            log.debug(
+                "qzone like request accepted but verification stayed stale: hostuin=%s fid=%s expected=%s actual=%s",
+                hostuin,
+                fid,
+                target_liked,
+                verified_entry.liked,
             )
         self._set_success(defer_save=True)
-        return {
+        result = {
             "action": "unlike" if unlike else "like",
-            "liked": verified_entry.liked if verified_entry is not None else target_liked,
-            "verified": verified_entry is not None,
+            "liked": verified_entry.liked
+            if verified_entry is not None and verified_entry.liked == target_liked
+            else target_liked,
+            "verified": verified_entry is not None and verified_entry.liked == target_liked,
             "already": False,
             "summary": verified_entry.summary if verified_entry is not None else "",
             "message": payload.get("msg") or payload.get("message") or "",
             "raw": payload,
         }
+        if verification is not None:
+            result["verification"] = verification
+        return result
 
     async def health(self) -> dict[str, Any]:
         if self.state.session.needs_rebind or not self.state.session.cookies or not self.state.session.uin:
