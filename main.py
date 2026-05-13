@@ -92,17 +92,78 @@ class QzoneStablePlugin(Star):
         self._stop_event(event)
         return event.plain_result(text)
 
+    async def _publisher_render_profile(self, event: AstrMessageEvent) -> Any:
+        profile = profile_from_event(event)
+        status: dict[str, Any] = {}
+        try:
+            status = await self.controller.get_status()
+        except QzoneBridgeError:
+            status = {}
+
+        login_uin = int(status.get("login_uin") or 0)
+        if not login_uin:
+            return profile
+
+        nickname = str(
+            status.get("login_nickname")
+            or status.get("nickname")
+            or status.get("publisher_nickname")
+            or ""
+        ).strip()
+        avatar_source = str(status.get("login_avatar") or status.get("avatar") or "").strip()
+        if not avatar_source:
+            avatar_source = f"https://q1.qlogo.cn/g?b=qq&nk={login_uin}&s=100"
+
+        bot = self._capture_onebot_client(event)
+        if bot is not None:
+            fetched = await self._fetch_onebot_user_info(bot, login_uin)
+            if fetched:
+                nickname = nickname or str(fetched.get("nickname") or fetched.get("name") or "").strip()
+                avatar_source = str(fetched.get("avatar") or fetched.get("avatar_url") or avatar_source).strip()
+
+        profile.user_id = str(login_uin)
+        profile.nickname = nickname or str(login_uin)
+        profile.avatar_source = avatar_source
+        return profile
+
+    async def _fetch_onebot_user_info(self, bot: Any, uin: int) -> dict[str, Any]:
+        for method_name, kwargs in (
+            ("get_stranger_info", {"user_id": uin, "no_cache": False}),
+            ("get_friend_info", {"user_id": uin}),
+            ("get_user_info", {"user_id": uin}),
+        ):
+            method = getattr(bot, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                result = method(**kwargs)
+                if asyncio.iscoroutine(result):
+                    result = await result
+            except TypeError:
+                try:
+                    result = method(uin)
+                    if asyncio.iscoroutine(result):
+                        result = await result
+                except Exception:
+                    continue
+            except Exception:
+                continue
+            if isinstance(result, dict):
+                return result
+        return {}
+
     async def _publish_result(self, event: AstrMessageEvent, post: PostPayload, payload: dict[str, Any]):
         text = format_action_result("发布成功", payload)
         if not self.settings.render_publish_result:
             self._stop_event(event)
             return event.plain_result(text)
+        profile = await self._publisher_render_profile(event)
         try:
             image_path = await asyncio.to_thread(
                 render_publish_result_image,
                 post,
                 self.data_dir / "rendered_posts",
-                profile=profile_from_event(event),
+                profile=profile,
                 result=payload,
                 width=self.settings.render_result_width,
             )

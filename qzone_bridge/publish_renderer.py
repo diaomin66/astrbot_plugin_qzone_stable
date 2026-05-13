@@ -173,9 +173,7 @@ def render_publish_result_image(
         y += attachment_height + 18
     actions_y = y + 6
     comment_y = actions_y + 54
-    footer = _result_footer(result)
-    footer_height = _line_height(scratch, meta_font, 1.2) + 10 if footer else 0
-    height = max(240, comment_y + 56 + footer_height + 22)
+    height = max(240, comment_y + 56 + 22)
 
     image = Image.new("RGB", (width, height), WHITE)
     draw = ImageDraw.Draw(image)
@@ -198,8 +196,6 @@ def render_publish_result_image(
     _draw_actions(draw, width, actions_y)
     comment_y = actions_y + 54
     _draw_comment_box(draw, margin, comment_y, content_width, 52, meta_font)
-    if footer:
-        _safe_text(draw, (margin, comment_y + 64), footer, meta_font, MUTED)
 
     path = output_dir / f"publish_result_{int(time.time())}_{uuid.uuid4().hex[:10]}.png"
     image.save(path, "PNG", optimize=True)
@@ -208,15 +204,6 @@ def render_publish_result_image(
 
 def _render_content_text(post: PostPayload) -> str:
     return str(post.content or "").strip()
-
-
-def _result_footer(result: dict[str, Any] | None) -> str:
-    if not isinstance(result, dict):
-        return ""
-    fid = result.get("fid") or result.get("tid") or result.get("id")
-    if fid:
-        return f"fid: {fid}"
-    return ""
 
 
 def _font(size: int, bold: bool = False) -> ImageFont.ImageFont:
@@ -674,8 +661,8 @@ def _draw_comment_icon(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
 
 
 def _draw_share_icon(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-    draw.line((x + 5, y + 34, x + 28, y + 13), fill=ACTION, width=5)
-    draw.polygon([(x + 25, y + 4), (x + 43, y + 17), (x + 25, y + 30)], fill=ACTION)
+    draw.line([(x + 6, y + 34), (x + 19, y + 22), (x + 29, y + 22)], fill=ACTION, width=5, joint="curve")
+    draw.polygon([(x + 27, y + 9), (x + 45, y + 22), (x + 27, y + 35)], fill=ACTION)
 
 
 def _draw_comment_box(
