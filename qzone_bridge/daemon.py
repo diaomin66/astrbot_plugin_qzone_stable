@@ -442,6 +442,13 @@ class QzoneDaemonService:
                     return entry
         return None
 
+    @staticmethod
+    def _normalize_action_payload(payload: Any) -> dict[str, Any]:
+        payload = unwrap_payload(payload)
+        if isinstance(payload, dict):
+            return payload
+        return {"value": payload}
+
     async def like_post(
         self,
         *,
@@ -469,16 +476,14 @@ class QzoneDaemonService:
                 "raw": {},
             }
 
-        payload = unwrap_payload(
+        payload = self._normalize_action_payload(
             await self.client.like_post(hostuin, fid, appid=appid, curkey=curkey, like=not unlike)
         )
-        if not isinstance(payload, dict):
-            raise QzoneParseError("点赞返回结构异常")
         verified_entry = await self._refresh_like_entry(hostuin, fid, appid)
         if verified_entry is not None and verified_entry.liked != target_liked:
             fallback_key = self._http_like_key(appid, hostuin, fid)
             if fallback_key not in {curkey, compute_unikey(appid, hostuin, fid)}:
-                payload = unwrap_payload(
+                payload = self._normalize_action_payload(
                     await self.client.like_post(
                         hostuin,
                         fid,
@@ -488,8 +493,6 @@ class QzoneDaemonService:
                         like=not unlike,
                     )
                 )
-                if not isinstance(payload, dict):
-                    raise QzoneParseError("点赞返回结构异常")
                 verified_entry = await self._refresh_like_entry(hostuin, fid, appid)
 
         if verified_entry is not None and verified_entry.liked != target_liked:

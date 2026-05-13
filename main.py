@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import sys
 import time
 from pathlib import Path
@@ -255,6 +256,43 @@ class QzoneStablePlugin(Star):
             if parts:
                 return f"{exc.message}（{', '.join(parts)}）"
         return f"{exc.message}\n{exc.detail}"
+
+    def _llm_tool_result(self, payload: dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    def _llm_like_result(self, payload: dict[str, Any]) -> str:
+        visible_payload = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"raw", "detail"} and not isinstance(value, (dict, list))
+        }
+        return self._llm_tool_result(
+            {
+                "ok": True,
+                "tool": "qzone_like_post",
+                "result": visible_payload,
+                "reply_guidance": (
+                    "请根据 result 用自然语言回复用户。"
+                    "如果 verified 为 true，说明 QQ 空间状态已确认；"
+                    "如果 verified 为 false，请说明请求已提交但状态暂未确认。"
+                    "不要暴露 fid、cursor、raw 或内部字段。"
+                ),
+            }
+        )
+
+    def _llm_error_result(self, tool: str, exc: QzoneBridgeError) -> str:
+        return self._llm_tool_result(
+            {
+                "ok": False,
+                "tool": tool,
+                "error": {
+                    "type": type(exc).__name__,
+                    "code": exc.code,
+                    "message": exc.message,
+                },
+                "reply_guidance": "请根据 error 用自然语言简短告知用户失败原因，不要暴露内部字段。",
+            }
+        )
 
     async def _ensure_daemon(self, *, allow_needs_rebind: bool = False) -> None:
         status = await self.controller.get_status()
@@ -724,7 +762,7 @@ class QzoneStablePlugin(Star):
             hostuin (number): 目标 QQ 号。
             fid (string): 说说 fid。
             content (string): 评论内容。
-            confirm (boolean): 是否确认执行。
+            confirm (boolean): 兼容旧参数；点赞工具会直接执行。
             appid (number): 应用 id。
             private (boolean): 是否私密评论。
         """
@@ -771,21 +809,29 @@ class QzoneStablePlugin(Star):
             unlike (boolean): 是否取消点赞。
         """
         if not self._is_admin(event):
-            yield event.plain_result("仅管理员可点赞。")
-            return
-        if self.settings.preview_writes and not confirm:
-            action = "取消点赞" if unlike else "点赞"
-            target = f"第 {fid} 条" if not hostuin and str(fid).isdigit() else "指定说说"
-            yield event.plain_result(f"待执行: {action}{target}。确认后将执行。")
+            yield event.plain_result(
+                self._llm_tool_result(
+                    {
+                        "ok": False,
+                        "tool": "qzone_like_post",
+                        "error": {
+                            "type": "PermissionError",
+                            "code": "QZONE_PERMISSION",
+                            "message": "仅管理员可点赞。",
+                        },
+                        "reply_guidance": "请用自然语言告诉用户没有权限执行点赞。",
+                    }
+                )
+            )
             return
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
             payload = await self.controller.like_post(hostuin=hostuin, fid=fid, appid=appid, unlike=unlike)
         except QzoneBridgeError as exc:
-            yield event.plain_result(self._error_text(exc))
+            yield event.plain_result(self._llm_error_result("qzone_like_post", exc))
             return
-        yield event.plain_result(format_like_result(payload))
+        yield event.plain_result(self._llm_like_result(payload))
 
     async def terminate(self):
         try:

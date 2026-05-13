@@ -319,6 +319,68 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await service.close()
 
+    async def test_like_post_accepts_scalar_success_response_when_verified(self):
+        with TemporaryDirectory() as tmp:
+            service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
+            service.state.session = SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+            service.client.update_session(service.state.session)
+            before = {
+                "tid": "fid-1",
+                "uin": 123456,
+                "content": "hello",
+                "like": {"isliked": "0"},
+            }
+            after = {
+                "tid": "fid-1",
+                "uin": 123456,
+                "content": "hello",
+                "like": {"isliked": "1"},
+            }
+            try:
+                with patch.object(service.client, "detail", new=AsyncMock(side_effect=[before, after])), patch.object(
+                    service.client,
+                    "like_post",
+                    new=AsyncMock(return_value={"data": 0}),
+                ):
+                    payload = await service.like_post(hostuin=123456, fid="fid-1")
+                self.assertTrue(payload["verified"])
+                self.assertTrue(payload["liked"])
+                self.assertEqual(payload["raw"]["value"], 0)
+            finally:
+                await service.close()
+
+    async def test_like_post_accepts_scalar_response_when_verification_unavailable(self):
+        with TemporaryDirectory() as tmp:
+            service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
+            service.state.session = SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+            service.client.update_session(service.state.session)
+            try:
+                with patch.object(
+                    service.client,
+                    "detail",
+                    new=AsyncMock(side_effect=QzoneRequestError("detail unavailable")),
+                ), patch.object(
+                    service.client,
+                    "legacy_feeds",
+                    new=AsyncMock(side_effect=QzoneRequestError("feed unavailable")),
+                ), patch.object(
+                    service.client,
+                    "like_post",
+                    new=AsyncMock(return_value={"data": 0}),
+                ):
+                    payload = await service.like_post(hostuin=123456, fid="fid-1")
+                self.assertFalse(payload["verified"])
+                self.assertTrue(payload["liked"])
+                self.assertEqual(payload["raw"]["value"], 0)
+            finally:
+                await service.close()
+
     async def test_like_post_retries_http_key_when_first_request_does_not_change_state(self):
         with TemporaryDirectory() as tmp:
             service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
