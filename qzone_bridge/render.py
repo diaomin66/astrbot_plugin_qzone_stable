@@ -47,25 +47,49 @@ def format_status(status: dict) -> str:
     return "\n".join(lines)
 
 
-def format_feed_entry(entry: FeedEntry, index: int | None = None) -> str:
+def format_feed_entry(entry: FeedEntry, index: int | None = None, *, include_internal: bool = True) -> str:
     prefix = f"{index}. " if index is not None else "- "
     headline = truncate(entry.summary or "(empty)", 90)
-    lines = [
-        f"{prefix}{to_local_time_text(entry.created_at)} | {entry.nickname or entry.hostuin}",
-        f"   fid={entry.fid} appid={entry.appid} like={entry.like_count} comment={entry.comment_count} liked={entry.liked}",
-        f"   {headline}",
-    ]
+    lines = [f"{prefix}{to_local_time_text(entry.created_at)} | {entry.nickname or entry.hostuin}"]
+    if include_internal:
+        lines.append(
+            f"   fid={entry.fid} appid={entry.appid} "
+            f"like={entry.like_count} comment={entry.comment_count} liked={entry.liked}"
+        )
+    else:
+        liked_text = "已点赞" if entry.liked else "未点赞"
+        lines.append(f"   {liked_text}，{entry.like_count} 赞，{entry.comment_count} 评论")
+    lines.append(f"   {headline}")
     return "\n".join(lines)
 
 
-def format_feed_list(entries: Iterable[FeedEntry], *, cursor: str = "", has_more: bool = False) -> str:
-    rendered = [format_feed_entry(entry, i + 1) for i, entry in enumerate(entries)]
+def format_feed_list(
+    entries: Iterable[FeedEntry],
+    *,
+    cursor: str = "",
+    has_more: bool = False,
+    include_internal: bool = True,
+    include_pagination: bool = True,
+) -> str:
+    rendered = [
+        format_feed_entry(entry, i + 1, include_internal=include_internal)
+        for i, entry in enumerate(entries)
+    ]
     footer = []
-    if cursor:
-        footer.append(f"cursor={cursor}")
-    footer.append(f"has_more={has_more}")
+    if include_pagination:
+        if cursor:
+            footer.append(f"cursor={cursor}")
+        footer.append(f"has_more={has_more}")
     body = "\n".join(rendered) if rendered else "(no feeds)"
     return "\n".join([body, *footer])
+
+
+def format_llm_feed_list(entries: Iterable[FeedEntry]) -> str:
+    entries = list(entries)
+    if not entries:
+        return "没有找到可操作的说说。"
+    body = format_feed_list(entries, include_internal=False, include_pagination=False)
+    return f"{body}\n可直接让我点赞或取消点赞对应编号。"
 
 
 def format_feed_detail(entry: FeedEntry) -> str:
@@ -92,3 +116,17 @@ def format_action_result(title: str, payload: dict) -> str:
             continue
         parts.append(f"- {key}: {value}")
     return "\n".join(parts)
+
+
+def format_like_result(payload: dict) -> str:
+    action = "取消点赞" if payload.get("action") == "unlike" else "点赞"
+    summary = truncate(str(payload.get("summary") or ""), 80)
+    suffix = f"：{summary}" if summary else ""
+    if payload.get("verified"):
+        if payload.get("already"):
+            state = "已是目标状态"
+        else:
+            state = "成功"
+        liked = "当前已点赞" if payload.get("liked") else "当前未点赞"
+        return f"{action}{state}{suffix}（{liked}）。"
+    return f"{action}请求已提交，但暂未能确认 QQ 空间状态{suffix}。"

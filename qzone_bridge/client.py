@@ -846,6 +846,7 @@ class QzoneClient:
         *,
         appid: int = 311,
         curkey: str = "",
+        unikey: str = "",
         like: bool = True,
     ) -> dict[str, Any]:
         cached = self.feed_cache.get((hostuin, fid))
@@ -855,11 +856,12 @@ class QzoneClient:
         if not curkey:
             curkey = compute_unikey(appid, hostuin, fid)
 
-        unikey = (
+        unikey = unikey or (
             cached.unikey
             if cached and cached.unikey
             else compute_unikey(appid, hostuin, fid)
         )
+        created_at = cached.created_at if cached else 0
         path = (
             "https://user.qzone.qq.com/proxy/domain/w.qzone.qq.com/cgi-bin/likes/internal_dolike_app"
             if like
@@ -873,8 +875,17 @@ class QzoneClient:
                 "curkey": curkey,
                 "appid": appid,
                 "opuin": self.login_uin,
+                "uin": self.login_uin,
+                "hostuin": hostuin,
+                "fid": fid,
+                "from": 1,
+                "typeid": 0,
+                "abstime": created_at,
+                "active": 0,
+                "fupdate": 1,
                 "opr_type": "like" if like else "unlike",
                 "format": "purejson",
+                "qzreferrer": f"https://user.qzone.qq.com/{hostuin}/mood/{fid}",
             },
             referer=f"https://user.qzone.qq.com/{hostuin}/mood/{fid}",
             origin="https://user.qzone.qq.com",

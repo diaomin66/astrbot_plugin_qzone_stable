@@ -4,6 +4,7 @@ import sys
 import tempfile
 import types
 import unittest
+from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -264,6 +265,56 @@ class MainPublishTests(unittest.TestCase):
         self.assertEqual(captured["profile"].nickname, "QzoneOwner")
         self.assertEqual(captured["profile"].user_id, "123456")
         self.assertIn("123456", captured["profile"].avatar_source)
+
+    def test_llm_list_feed_hides_cursor_and_internal_ids(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        entry = module.FeedEntry(
+            hostuin=3112333596,
+            fid="1c7182b96589046ad3380900",
+            appid=311,
+            summary="瘦了…………",
+            liked=False,
+        )
+        plugin.controller.list_feeds = AsyncMock(
+            return_value={
+                "items": [asdict(entry)],
+                "cursor": "back_server_info=secret",
+                "has_more": True,
+            }
+        )
+        event = Event([])
+
+        results = asyncio.run(collect_async_generator(plugin.tool_list_feed(event, limit=1)))
+
+        self.assertEqual(len(results), 1)
+        self.assertIn("瘦了", results[0])
+        self.assertIn("未点赞", results[0])
+        self.assertNotIn("cursor=", results[0])
+        self.assertNotIn("has_more", results[0])
+        self.assertNotIn("fid=", results[0])
+
+    def test_llm_like_tool_returns_natural_verified_result(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        plugin.controller.like_post = AsyncMock(
+            return_value={
+                "action": "like",
+                "liked": True,
+                "verified": True,
+                "already": False,
+                "summary": "瘦了…………",
+            }
+        )
+        event = Event([])
+
+        results = asyncio.run(
+            collect_async_generator(plugin.tool_like_post(event, hostuin=0, fid="1", confirm=True))
+        )
+
+        plugin.controller.like_post.assert_awaited_once_with(hostuin=0, fid="1", appid=311, unlike=False)
+        self.assertEqual(results, ["点赞成功：瘦了…………（当前已点赞）。"])
+        self.assertNotIn("fid=", results[0])
 
 
 if __name__ == "__main__":

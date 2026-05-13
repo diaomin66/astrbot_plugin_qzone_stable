@@ -148,6 +148,11 @@ class ClientErrorMappingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["message"], "ok")
         self.assertEqual(seen_form["curkey"][0], "cached-curkey")
         self.assertEqual(seen_form["unikey"][0], "cached-unikey")
+        self.assertEqual(seen_form["hostuin"][0], "123456")
+        self.assertEqual(seen_form["fid"][0], "fid-1")
+        self.assertEqual(seen_form["uin"][0], "123456")
+        self.assertEqual(seen_form["from"][0], "1")
+        self.assertEqual(seen_form["fupdate"][0], "1")
 
 
 if __name__ == "__main__":

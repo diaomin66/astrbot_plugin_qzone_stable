@@ -90,6 +90,22 @@ def _int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y"}:
+            return True
+        if normalized in {"0", "false", "no", "n", ""}:
+            return False
+    return bool(value)
+
+
 def parse_cookie_text(cookie_text: str) -> dict[str, str]:
     cookie_text = cookie_text.strip()
     if not cookie_text:
@@ -391,7 +407,19 @@ def extract_feed_entry(feed_item: dict[str, Any], *, default_hostuin: int = 0) -
     )
     if not comment_count and isinstance(raw_comments, list):
         comment_count = len(raw_comments)
-    liked = bool(like.get("isliked") or like.get("ismylike") or feed_item.get("isliked") or False)
+    liked = _bool(
+        like.get("isliked")
+        if "isliked" in like
+        else like.get("ismylike")
+        if "ismylike" in like
+        else like.get("isLike")
+        if "isLike" in like
+        else like.get("islike")
+        if "islike" in like
+        else feed_item.get("isliked")
+        if "isliked" in feed_item
+        else feed_item.get("liked")
+    )
     busi_param = operation.get("busi_param") or {}
     if not isinstance(busi_param, dict):
         busi_param = {}
@@ -458,10 +486,7 @@ def feed_page_has_more(feedpage: dict[str, Any]) -> bool:
     for key in FEED_HAS_MORE_KEYS:
         if key not in feedpage:
             continue
-        value = feedpage.get(key)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes"}
-        return bool(value)
+        return _bool(feedpage.get(key))
     return False
 
 

@@ -71,6 +71,27 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(entry.summary, "hello qzone")
         self.assertEqual(entry.unikey, "https://user.qzone.qq.com/123456/mood/fid-1")
 
+    def test_extract_feed_entry_parses_string_liked_flags(self):
+        entry = extract_feed_entry(
+            {
+                "tid": "fid-1",
+                "uin": 123456,
+                "content": "hello",
+                "like": {"isliked": "0"},
+            }
+        )
+        self.assertFalse(entry.liked)
+
+        entry = extract_feed_entry(
+            {
+                "tid": "fid-2",
+                "uin": 123456,
+                "content": "hello",
+                "like": {"isliked": "1"},
+            }
+        )
+        self.assertTrue(entry.liked)
+
     def test_extract_legacy_feed_entry(self):
         raw = {
             "tid": "legacy-fid",
