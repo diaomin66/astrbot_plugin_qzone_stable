@@ -49,6 +49,7 @@ class QzoneDaemonService:
         self.keepalive_interval = max(30, int(keepalive_interval))
         self.health_state = "idle"
         self._keepalive_task: asyncio.Task | None = None
+        self._warmup_task: asyncio.Task | None = None
         self._closing = False
 
     def save(self) -> None:
@@ -120,10 +121,8 @@ class QzoneDaemonService:
     async def bootstrap(self) -> None:
         self.save()
         if self.state.session.cookies and self.state.session.uin and not self.state.session.needs_rebind:
-            try:
-                await self.warmup()
-            except Exception as exc:
-                self._set_error(exc)
+            self.health_state = "ready"
+            self._warmup_task = asyncio.create_task(self._background_warmup())
         else:
             self.health_state = "needs_rebind"
             self.save()
@@ -131,6 +130,10 @@ class QzoneDaemonService:
 
     async def close(self) -> None:
         self._closing = True
+        if self._warmup_task:
+            self._warmup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._warmup_task
         if self._keepalive_task:
             self._keepalive_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -147,6 +150,14 @@ class QzoneDaemonService:
         self._ensure_session_ready()
         await self.client.mfeeds_get_count()
         self._set_success()
+
+    async def _background_warmup(self) -> None:
+        try:
+            await self.warmup()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._set_error(exc)
 
     async def ensure_token(self, hostuin: int | None = None) -> None:
         self._ensure_session_ready()
@@ -451,7 +462,6 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
 
     async def health(request: web.Request) -> web.Response:
         service.touch()
-        service.save()
         return ok(service.snapshot())
 
     async def status(request: web.Request) -> web.Response:

@@ -67,6 +67,7 @@ class QzoneStablePlugin(Star):
             auto_start_daemon=self.settings.auto_start_daemon,
         )
         self._capture_onebot_client_from_context()
+        self._daemon_warmup_task: asyncio.Task | None = None
 
     def _sender_id(self, event: AstrMessageEvent) -> int:
         try:
@@ -300,7 +301,7 @@ class QzoneStablePlugin(Star):
                 raise QzoneCookieAcquireError(f"未捕获到 OneBot 客户端，无法自动获取 Cookie。{self._cookie_binding_hint()}")
 
             try:
-                status = await self.controller.get_status()
+                status = await self.controller.get_status(probe_daemon=False)
             except QzoneBridgeError:
                 status = {}
 
@@ -326,7 +327,7 @@ class QzoneStablePlugin(Star):
         source: str = "aiocqhttp",
     ) -> dict[str, Any] | None:
         try:
-            status = await self.controller.get_status()
+            status = await self.controller.get_status(probe_daemon=False)
         except QzoneBridgeError:
             status = {}
         if not force and status and int(status.get("cookie_count") or 0) > 0 and not bool(status.get("needs_rebind")):
@@ -336,11 +337,43 @@ class QzoneStablePlugin(Star):
     async def _bootstrap_auto_bind(self, trigger: str) -> None:
         client = self._capture_onebot_client_from_context()
         if client is None or not self.settings.auto_bind_cookie:
+            await self._prewarm_daemon_if_cookie_ready(trigger)
             return
         try:
             await self._ensure_cookie_ready(source="aiocqhttp")
         except QzoneBridgeError as exc:
             logger.warning("qzone auto bind on %s failed: %s", trigger, exc)
+            return
+        await self._prewarm_daemon_if_cookie_ready(trigger)
+
+    async def _prewarm_daemon_if_cookie_ready(self, trigger: str) -> None:
+        if not self.settings.auto_start_daemon:
+            return
+        try:
+            status = await self.controller.get_status(probe_daemon=False)
+        except QzoneBridgeError as exc:
+            logger.debug("qzone daemon prewarm status check on %s failed: %s", trigger, exc)
+            return
+        if int(status.get("cookie_count") or 0) <= 0 or bool(status.get("needs_rebind")):
+            return
+        self._schedule_daemon_warmup(trigger)
+
+    def _schedule_daemon_warmup(self, trigger: str) -> None:
+        if not self.settings.auto_start_daemon:
+            return
+        task = self._daemon_warmup_task
+        if task is not None and not task.done():
+            return
+
+        async def runner() -> None:
+            try:
+                await self.controller.ensure_running()
+            except QzoneBridgeError as exc:
+                logger.warning("qzone daemon prewarm on %s failed: %s", trigger, exc)
+            except Exception:
+                logger.warning("qzone daemon prewarm on %s failed unexpectedly", trigger, exc_info=True)
+
+        self._daemon_warmup_task = asyncio.create_task(runner())
 
     @filter.command_group("qzone")
     def qzone(self):
@@ -403,6 +436,7 @@ class QzoneStablePlugin(Star):
             logger.warning("qzone bind failed: %s", exc)
             yield self._command_result(event, self._error_text(exc))
             return
+        self._schedule_daemon_warmup("manual bind")
         yield self._command_result(event, format_status(payload))
 
     @qzone.command("autobind")
@@ -416,6 +450,7 @@ class QzoneStablePlugin(Star):
             logger.warning("qzone autobind failed: %s", exc)
             yield self._command_result(event, self._error_text(exc))
             return
+        self._schedule_daemon_warmup("autobind")
         yield self._command_result(event, format_status(payload))
 
     @qzone.command("unbind")
@@ -472,7 +507,6 @@ class QzoneStablePlugin(Star):
         )
         try:
             await self._ensure_cookie_ready(event)
-            await self._ensure_daemon()
             payload = await self.controller.publish_post(
                 content=post.content,
                 media=[item.to_dict() for item in post.media],
@@ -604,7 +638,6 @@ class QzoneStablePlugin(Star):
             return
         try:
             await self._ensure_cookie_ready(event)
-            await self._ensure_daemon()
             payload = await self.controller.publish_post(
                 content=post.content,
                 sync_weibo=sync_weibo,

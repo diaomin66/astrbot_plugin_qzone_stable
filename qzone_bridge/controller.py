@@ -157,27 +157,38 @@ class QzoneDaemonController:
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(request_timeout), trust_env=False)
         self._lock = asyncio.Lock()
         self._process: subprocess.Popen | None = None
+        self._health_cache: tuple[int, str, bool, float] | None = None
+        self._health_cache_ttl = 1.0
 
     def _runtime(self):
-        state = ensure_state_secret(self.store.read())
+        state = self.store.read()
+        original_secret = state.runtime.secret
+        original_started_at = state.runtime.started_at
+        original_port = state.runtime.daemon_port
+        state = ensure_state_secret(state)
         if not state.runtime.daemon_port:
             state.runtime.daemon_port = self.default_port
-        if not state.runtime.secret:
-            import secrets
-
-            state.runtime.secret = secrets.token_urlsafe(32)
-        self.store.write(state)
+        if (
+            state.runtime.secret != original_secret
+            or state.runtime.started_at != original_started_at
+            or state.runtime.daemon_port != original_port
+        ):
+            self.store.write(state)
         return state.runtime
 
     def _base_url(self, port: int | None = None) -> str:
-        runtime = self._runtime()
-        return f"http://127.0.0.1:{port or runtime.daemon_port}"
+        if port is None:
+            port = self._runtime().daemon_port
+        return f"http://127.0.0.1:{port}"
 
     def _secret(self) -> str:
         return self._runtime().secret
 
     def _daemon_script(self) -> Path:
         return self.plugin_root / "daemon_main.py"
+
+    def _invalidate_health_cache(self) -> None:
+        self._health_cache = None
 
     def _spawn_daemon(self, port: int) -> subprocess.Popen:
         runtime = self._runtime()
@@ -207,29 +218,80 @@ class QzoneDaemonController:
         kwargs["env"] = env
         return subprocess.Popen(cmd, cwd=str(self.plugin_root), **kwargs)
 
-    async def _probe_health(self, port: int | None = None, *, secret: str | None = None) -> bool:
+    async def _probe_health(
+        self,
+        port: int | None = None,
+        *,
+        secret: str | None = None,
+        use_cache: bool = True,
+    ) -> bool:
         runtime = self._runtime()
+        resolved_port = int(port or runtime.daemon_port or self.default_port or 0)
+        resolved_secret = secret or runtime.secret
+        if not resolved_port or not resolved_secret:
+            self._invalidate_health_cache()
+            return False
+
+        now = asyncio.get_running_loop().time()
+        if use_cache and self._health_cache:
+            cached_port, cached_secret, cached_ok, expires_at = self._health_cache
+            if cached_port == resolved_port and cached_secret == resolved_secret and expires_at > now:
+                return cached_ok
+
         try:
             response = await self._client.get(
-                f"{self._base_url(port)}/health",
-                headers={SECRET_HEADER: secret or runtime.secret},
+                f"{self._base_url(resolved_port)}/health",
+                headers={SECRET_HEADER: resolved_secret},
             )
         except httpx.HTTPError:
+            self._invalidate_health_cache()
             return False
         if response.status_code != 200:
+            self._invalidate_health_cache()
             return False
         try:
             payload = response.json()
         except Exception:
+            self._invalidate_health_cache()
             return False
-        return bool(payload.get("ok"))
+        ok = bool(payload.get("ok"))
+        if ok:
+            self._health_cache = (
+                resolved_port,
+                resolved_secret,
+                True,
+                now + self._health_cache_ttl,
+            )
+        else:
+            self._invalidate_health_cache()
+        return ok
+
+    def _status_from_state(self, state, *, daemon_state: str) -> dict[str, Any]:
+        runtime = state.runtime
+        return {
+            "daemon_state": daemon_state,
+            "daemon_pid": runtime.daemon_pid,
+            "daemon_port": runtime.daemon_port or self.default_port,
+            "daemon_version": runtime.version,
+            "started_at": runtime.started_at,
+            "last_seen_at": runtime.last_seen_at,
+            "login_uin": state.session.uin,
+            "cookie_summary": self.cookie_summary(state.session.cookies),
+            "cookie_count": len(state.session.cookies),
+            "needs_rebind": state.session.needs_rebind or not bool(state.session.cookies),
+            "last_ok_at": state.session.last_ok_at,
+            "last_error": state.session.last_error,
+            "qzonetoken_hosts": sorted(int(k) for k in state.session.qzonetokens.keys() if str(k).isdigit()),
+            "feed_cache_size": 0,
+            "session_revision": state.session.revision,
+        }
 
     async def ensure_running(self) -> dict[str, Any]:
         async with self._lock:
             runtime = self._runtime()
             port = runtime.daemon_port or self.default_port
             if await self._probe_health(port):
-                return await self.get_status()
+                return self._status_from_state(self.store.read(), daemon_state="ready")
 
             if not _port_is_free(port):
                 candidate = port
@@ -257,7 +319,13 @@ class QzoneDaemonController:
                     state = self.store.read()
                     state.runtime = runtime
                     self.store.write(state)
-                    return await self.get_status()
+                    self._health_cache = (
+                        port,
+                        runtime.secret,
+                        True,
+                        asyncio.get_running_loop().time() + self._health_cache_ttl,
+                    )
+                    return self._status_from_state(state, daemon_state="ready")
                 if self._process and self._process.poll() is not None:
                     break
                 await asyncio.sleep(0.5)
@@ -272,19 +340,37 @@ class QzoneDaemonController:
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
     ) -> Any:
-        runtime = self._runtime()
-        if self.auto_start_daemon:
-            await self.ensure_running()
+        last_exc: httpx.HTTPError | None = None
+        response: httpx.Response | None = None
+        for attempt in range(2):
             runtime = self._runtime()
-        elif not await self._probe_health(runtime.daemon_port):
-            raise DaemonUnavailableError("daemon 未运行")
-        response = await self._client.request(
-            method,
-            f"{self._base_url()}{path}",
-            headers={SECRET_HEADER: runtime.secret},
-            params=params,
-            json=json_body,
-        )
+            if self.auto_start_daemon:
+                await self.ensure_running()
+                runtime = self._runtime()
+            elif not await self._probe_health(runtime.daemon_port):
+                raise DaemonUnavailableError("daemon 未运行")
+            try:
+                response = await self._client.request(
+                    method,
+                    f"{self._base_url(runtime.daemon_port)}{path}",
+                    headers={SECRET_HEADER: runtime.secret},
+                    params=params,
+                    json=json_body,
+                )
+                break
+            except httpx.HTTPError as exc:
+                self._invalidate_health_cache()
+                last_exc = exc
+                if not self.auto_start_daemon or attempt > 0:
+                    raise DaemonUnavailableError(
+                        "daemon 请求失败",
+                        detail={"error": str(exc), "path": path},
+                    ) from exc
+        if response is None:
+            raise DaemonUnavailableError(
+                "daemon 请求失败",
+                detail={"error": str(last_exc), "path": path},
+            )
         try:
             payload = response.json()
         except Exception as exc:
@@ -303,31 +389,15 @@ class QzoneDaemonController:
             raise DaemonUnavailableError(message, detail=detail)
         return payload.get("data")
 
-    async def get_status(self) -> dict[str, Any]:
+    async def get_status(self, *, probe_daemon: bool = True) -> dict[str, Any]:
         state = self.store.read()
         runtime = state.runtime
         daemon_state = "offline"
-        if runtime.daemon_port and await self._probe_health(runtime.daemon_port):
+        if probe_daemon and runtime.daemon_port and await self._probe_health(runtime.daemon_port):
             daemon_state = "ready"
         elif state.session.cookies:
             daemon_state = "degraded"
-        return {
-            "daemon_state": daemon_state,
-            "daemon_pid": runtime.daemon_pid,
-            "daemon_port": runtime.daemon_port or self.default_port,
-            "daemon_version": runtime.version,
-            "started_at": runtime.started_at,
-            "last_seen_at": runtime.last_seen_at,
-            "login_uin": state.session.uin,
-            "cookie_summary": self.cookie_summary(state.session.cookies),
-            "cookie_count": len(state.session.cookies),
-            "needs_rebind": state.session.needs_rebind or not bool(state.session.cookies),
-            "last_ok_at": state.session.last_ok_at,
-            "last_error": state.session.last_error,
-            "qzonetoken_hosts": sorted(int(k) for k in state.session.qzonetokens.keys() if str(k).isdigit()),
-            "feed_cache_size": 0,
-            "session_revision": state.session.revision,
-        }
+        return self._status_from_state(state, daemon_state=daemon_state)
 
     @staticmethod
     def cookie_summary(cookies: dict[str, str]) -> str:
@@ -554,6 +624,7 @@ class QzoneDaemonController:
         return killed
 
     def _clear_runtime_process_state(self) -> None:
+        self._invalidate_health_cache()
         state = self.store.read()
         state.runtime.daemon_pid = 0
         state.runtime.started_at = ""
