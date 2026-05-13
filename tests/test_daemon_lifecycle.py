@@ -99,7 +99,14 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
                 ) as index, patch.object(
                     service.client,
                     "legacy_recent_feeds",
-                    new=AsyncMock(return_value={"msglist": [{"tid": "fid-1", "uin": 123456, "content": "hello"}]}),
+                    new=AsyncMock(
+                        return_value={
+                            "main": {
+                                "hasMoreFeeds": False,
+                                "data": [{"tid": "fid-1", "uin": 123456, "content": "hello"}],
+                            }
+                        }
+                    ),
                 ) as legacy:
                     payload = await service.list_feeds(limit=1)
                 index.assert_awaited_once()

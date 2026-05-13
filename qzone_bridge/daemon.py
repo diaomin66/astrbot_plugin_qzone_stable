@@ -17,7 +17,7 @@ from .client import FeedPageResult, QzoneClient
 from .errors import QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
 from .media import QZONE_MAX_IMAGES, media_reference_text, normalize_media_list, split_publishable_images, strip_command_prefix
 from .models import BridgeState, FeedEntry, SessionState
-from .parser import extract_feed_entry, extract_feed_page, normalize_uin, parse_cookie_text, unwrap_payload
+from .parser import extract_feed_page, feed_page_cursor, feed_page_has_more, normalize_uin, parse_cookie_text, unwrap_payload
 from .protocol import SECRET_HEADER, fail, ok
 from .storage import StateStore, ensure_state_secret
 from .utils import now_iso, from_iso
@@ -264,38 +264,21 @@ class QzoneDaemonService:
                         payload = await self.client.legacy_recent_feeds()
                 else:
                     payload = unwrap_payload(await self.client.get_active_feeds(next_cursor))
-                feedpage = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else payload
+                feedpage = payload
             else:
                 if page_round == 0 and not next_cursor:
                     payload = await self.client.profile(hostuin)
                 else:
                     payload = unwrap_payload(await self.client.get_feeds(hostuin, next_cursor))
-                if isinstance(payload, dict) and isinstance(payload.get("feedpage"), dict):
-                    feedpage = payload["feedpage"]
-                else:
-                    feedpage = payload
+                feedpage = payload
 
+            feedpage, page_items = extract_feed_page(feedpage, default_hostuin=hostuin)
             if not isinstance(feedpage, dict):
                 break
-            raw_items = feedpage.get("vFeeds") or feedpage.get("vfeeds") or feedpage.get("msglist") or feedpage.get("data") or []
-            if isinstance(raw_items, dict):
-                raw_items = raw_items.get("vFeeds") or raw_items.get("vfeeds") or raw_items.get("msglist") or raw_items.get("data") or []
-            if not isinstance(raw_items, list):
-                raw_items = []
-            page_items = [
-                self.client.feed_entry_from_payload(item, default_hostuin=hostuin)
-                for item in raw_items
-                if isinstance(item, dict)
-            ]
             self.client.cache_feed_page(hostuin, page_items)
             items.extend(page_items)
-            has_more = bool(feedpage.get("hasmore") or feedpage.get("hasMore") or False)
-            next_cursor = str(
-                feedpage.get("attachinfo")
-                or feedpage.get("attach_info")
-                or feedpage.get("attachInfo")
-                or ""
-            )
+            has_more = feed_page_has_more(feedpage)
+            next_cursor = feed_page_cursor(feedpage)
             if not has_more or not next_cursor:
                 break
             page_round += 1

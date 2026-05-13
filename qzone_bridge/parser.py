@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html as html_lib
 import json
 import re
 from typing import Any
@@ -19,6 +20,14 @@ COOKIE_KEY_ALIASES = {
     "bkn": "g_tk",
     "csrf_token": "g_tk",
 }
+FEED_CONTAINER_KEYS = ("feedpage", "main")
+FEED_LIST_KEYS = ("vFeeds", "vfeeds", "msglist", "data", "feeds", "feedlist", "feedList")
+FEED_CURSOR_KEYS = ("attachinfo", "attach_info", "attachInfo", "attach", "externparam", "res_attach")
+FEED_HAS_MORE_KEYS = ("hasmore", "hasMore", "hasMoreFeeds", "has_more")
+HTML_ATTR_RE_TEMPLATE = r"""\b{name}\s*=\s*(["'])(.*?)\1"""
+HTML_BREAK_RE = re.compile(r"<\s*br\s*/?\s*>", re.I)
+HTML_BLOCK_RE = re.compile(r"</\s*(?:p|div|li|tr)\s*>", re.I)
+HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
 def _dig(value: Any, *keys: str) -> Any:
@@ -50,6 +59,28 @@ def _text(value: Any) -> str:
                     return result
         return ""
     return str(value)
+
+
+def _html_to_text(value: Any) -> str:
+    text = _text(value)
+    if not text:
+        return ""
+    text = HTML_BREAK_RE.sub("\n", text)
+    text = HTML_BLOCK_RE.sub("\n", text)
+    text = HTML_TAG_RE.sub("", text)
+    text = html_lib.unescape(text)
+    return re.sub(r"[ \t\r\f\v]+", " ", text).strip()
+
+
+def _html_attr(markup: Any, name: str) -> str:
+    text = _text(markup)
+    if not text:
+        return ""
+    pattern = HTML_ATTR_RE_TEMPLATE.format(name=re.escape(name))
+    match = re.search(pattern, text, re.S | re.I)
+    if not match:
+        return ""
+    return html_lib.unescape(match.group(2)).strip()
 
 
 def _int(value: Any, default: int = 0) -> int:
@@ -223,10 +254,13 @@ def unwrap_payload(payload: Any) -> Any:
 
 
 def extract_hostuin(feed_item: dict[str, Any], default: int = 0) -> int:
+    html_markup = feed_item.get("html")
     candidates = [
         feed_item.get("uin"),
         feed_item.get("hostuin"),
         feed_item.get("hostUin"),
+        _html_attr(html_markup, "data-uin"),
+        _html_attr(html_markup, "uin"),
         _dig(feed_item, "userinfo", "uin"),
         _dig(feed_item, "user", "uin"),
         _dig(feed_item, "userinfo", "user", "uin"),
@@ -245,10 +279,19 @@ def extract_hostuin(feed_item: dict[str, Any], default: int = 0) -> int:
 
 
 def extract_fid(feed_item: dict[str, Any]) -> str:
+    html_markup = feed_item.get("html")
     candidates = [
         feed_item.get("fid"),
         feed_item.get("tid"),
         feed_item.get("cellid"),
+        feed_item.get("key"),
+        feed_item.get("ugckey"),
+        feed_item.get("ugcrightkey"),
+        _html_attr(html_markup, "data-fid"),
+        _html_attr(html_markup, "fid"),
+        _html_attr(html_markup, "data-tid"),
+        _html_attr(html_markup, "tid"),
+        _html_attr(html_markup, "data-cellid"),
         _dig(feed_item, "id", "cellid"),
         _dig(feed_item, "common", "ugcrightkey"),
         _dig(feed_item, "common", "ugckey"),
@@ -267,6 +310,7 @@ def extract_summary_text(feed_item: dict[str, Any]) -> str:
         _text(feed_item.get("summary")),
         _dig(feed_item, "original", "summary", "summary"),
         _text(feed_item.get("text")),
+        _html_to_text(feed_item.get("html")),
     ]
     for candidate in candidates:
         if candidate:
@@ -293,9 +337,16 @@ def extract_feed_entry(feed_item: dict[str, Any], *, default_hostuin: int = 0) -
     original = feed_item.get("original") or {}
     if not isinstance(original, dict):
         original = {}
+    html_markup = feed_item.get("html")
 
     hostuin = extract_hostuin(feed_item, default_hostuin)
-    appid = _int(common.get("appid") or feed_item.get("appid") or 311, 311)
+    appid = _int(
+        common.get("appid")
+        or feed_item.get("appid")
+        or _html_attr(html_markup, "data-appid")
+        or 311,
+        311,
+    )
     fid = extract_fid(feed_item)
     created_at = _int(common.get("time") or feed_item.get("abstime") or feed_item.get("created_time") or 0)
     summary = extract_summary_text(feed_item)
@@ -307,12 +358,24 @@ def extract_feed_entry(feed_item: dict[str, Any], *, default_hostuin: int = 0) -
         or feed_item.get("curlikekey")
         or common.get("curkey")
         or common.get("curlikekey")
+        or _html_attr(html_markup, "data-curkey")
+        or _html_attr(html_markup, "curkey")
         or compute_unikey(appid, hostuin, fid)
         or ""
     )
-    unikey = compute_unikey(appid, hostuin, fid)
+    unikey = (
+        _html_attr(html_markup, "data-unikey")
+        or _html_attr(html_markup, "unikey")
+        or compute_unikey(appid, hostuin, fid)
+    )
     topic = topic_id(appid, hostuin, fid, created_at)
-    nickname = str(feed_item.get("name") or userinfo.get("nickname") or userinfo.get("name") or "")
+    nickname = str(
+        feed_item.get("name")
+        or feed_item.get("nickname")
+        or userinfo.get("nickname")
+        or userinfo.get("name")
+        or ""
+    )
     like_count = _int(
         like.get("num")
         or like.get("likeNum")
@@ -351,14 +414,73 @@ def extract_feed_entry(feed_item: dict[str, Any], *, default_hostuin: int = 0) -
     )
 
 
+def _looks_like_feed_page(value: dict[str, Any]) -> bool:
+    return any(key in value for key in (*FEED_LIST_KEYS, *FEED_CURSOR_KEYS, *FEED_HAS_MORE_KEYS))
+
+
+def normalize_feed_page(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    for key in FEED_CONTAINER_KEYS:
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return value
+
+    data = payload.get("data")
+    if isinstance(data, dict):
+        for key in FEED_CONTAINER_KEYS:
+            value = data.get(key)
+            if isinstance(value, dict):
+                return value
+        if _looks_like_feed_page(data):
+            return data
+
+    return payload
+
+
+def extract_raw_feeds(feedpage: dict[str, Any]) -> list[Any]:
+    if not isinstance(feedpage, dict):
+        return []
+    raw_feeds: Any = []
+    for key in FEED_LIST_KEYS:
+        value = feedpage.get(key)
+        if value:
+            raw_feeds = value
+            break
+    if isinstance(raw_feeds, dict):
+        raw_feeds = extract_raw_feeds(raw_feeds)
+    if not isinstance(raw_feeds, list):
+        return []
+    return raw_feeds
+
+
+def feed_page_has_more(feedpage: dict[str, Any]) -> bool:
+    for key in FEED_HAS_MORE_KEYS:
+        if key not in feedpage:
+            continue
+        value = feedpage.get(key)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes"}
+        return bool(value)
+    return False
+
+
+def feed_page_cursor(feedpage: dict[str, Any]) -> str:
+    for key in FEED_CURSOR_KEYS:
+        value = feedpage.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
 def extract_feed_page(payload: dict[str, Any], *, default_hostuin: int = 0) -> tuple[dict[str, Any], list[FeedEntry]]:
-    feedpage = payload.get("feedpage") if isinstance(payload.get("feedpage"), dict) else payload
+    feedpage = normalize_feed_page(payload)
     if not isinstance(feedpage, dict):
         return {}, []
-    raw_feeds = feedpage.get("vFeeds") or feedpage.get("vfeeds") or feedpage.get("msglist") or feedpage.get("data") or []
-    if isinstance(raw_feeds, dict):
-        raw_feeds = raw_feeds.get("vFeeds") or raw_feeds.get("vfeeds") or raw_feeds.get("msglist") or raw_feeds.get("data") or []
-    if not isinstance(raw_feeds, list):
-        raw_feeds = []
-    items = [extract_feed_entry(item, default_hostuin=default_hostuin) for item in raw_feeds if isinstance(item, dict)]
+    raw_feeds = extract_raw_feeds(feedpage)
+    items = [
+        extract_feed_entry(item, default_hostuin=default_hostuin)
+        for item in raw_feeds
+        if isinstance(item, dict)
+    ]
     return feedpage, items

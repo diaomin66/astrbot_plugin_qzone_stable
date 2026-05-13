@@ -30,7 +30,7 @@ from .parser import (
     unwrap_payload,
 )
 from .render import cookie_summary
-from .utils import extract_callback_json, now_iso
+from .utils import extract_callback_json, json_loads, now_iso
 
 log = logging.getLogger(__name__)
 
@@ -316,6 +316,40 @@ class QzoneClient:
         assert last_exc is not None
         raise last_exc
 
+    @staticmethod
+    def _parse_response_payload(text: str, response: httpx.Response) -> Any:
+        if not text:
+            return {}
+
+        json_like = text.startswith(("{", "["))
+        callback_error: Exception | None = None
+        if not json_like:
+            try:
+                callback_payload = extract_callback_json(text)
+            except Exception as exc:
+                callback_error = exc
+            else:
+                if callback_payload is not None:
+                    return callback_payload
+
+        try:
+            return json.loads(text)
+        except Exception as json_exc:
+            if not json_like:
+                detail = {"text": text[:500], "url": str(response.request.url)}
+                raise QzoneParseError(
+                    "QQ 空间接口返回了非 JSON 响应",
+                    detail=detail,
+                ) from (callback_error or json_exc)
+            try:
+                return json_loads(text)
+            except Exception as js_exc:
+                detail = {"text": text[:500], "url": str(response.request.url)}
+                raise QzoneParseError(
+                    "无法解析 QQ 空间 JSON 响应",
+                    detail=detail,
+                ) from (js_exc or json_exc)
+
     async def _request_json(
         self,
         method: str,
@@ -342,27 +376,8 @@ class QzoneClient:
             attach_token=attach_token,
             login_required=login_required,
         )
-        payload: Any
         text = response.text.strip()
-        if not text:
-            payload = {}
-        elif text.startswith("{") or text.startswith("["):
-            try:
-                payload = response.json()
-            except Exception as exc:
-                raise QzoneParseError("无法解析 QQ 空间 JSON 响应", detail={"text": text[:500]}) from exc
-        else:
-            callback_payload = extract_callback_json(text)
-            if callback_payload is not None:
-                payload = callback_payload
-            else:
-                try:
-                    payload = json.loads(text)
-                except Exception:
-                    raise QzoneParseError(
-                        "QQ 空间接口返回了非 JSON 响应",
-                        detail={"text": text[:500], "url": str(response.request.url)},
-                    )
+        payload = self._parse_response_payload(text, response)
         self._raise_payload_error(payload, response)
         payload = unwrap_payload(payload)
         self._raise_payload_error(payload, response)
@@ -833,14 +848,18 @@ class QzoneClient:
         curkey: str = "",
         like: bool = True,
     ) -> dict[str, Any]:
+        cached = self.feed_cache.get((hostuin, fid))
         if not curkey:
-            cached = self.feed_cache.get((hostuin, fid))
             if cached and cached.curkey:
                 curkey = cached.curkey
         if not curkey:
             curkey = compute_unikey(appid, hostuin, fid)
 
-        unikey = compute_unikey(appid, hostuin, fid)
+        unikey = (
+            cached.unikey
+            if cached and cached.unikey
+            else compute_unikey(appid, hostuin, fid)
+        )
         path = (
             "https://user.qzone.qq.com/proxy/domain/w.qzone.qq.com/cgi-bin/likes/internal_dolike_app"
             if like
