@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import json
 import sys
 import tempfile
 import types
@@ -294,7 +295,7 @@ class MainPublishTests(unittest.TestCase):
         self.assertNotIn("has_more", results[0])
         self.assertNotIn("fid=", results[0])
 
-    def test_llm_like_tool_returns_natural_verified_result(self):
+    def test_llm_like_tool_returns_structured_result_for_llm_reply(self):
         module = self.load_main_module()
         plugin = self.make_plugin(module)
         plugin.controller.like_post = AsyncMock(
@@ -309,12 +310,59 @@ class MainPublishTests(unittest.TestCase):
         event = Event([])
 
         results = asyncio.run(
-            collect_async_generator(plugin.tool_like_post(event, hostuin=0, fid="1", confirm=True))
+            collect_async_generator(plugin.tool_like_post(event, hostuin=0, fid="1"))
         )
 
         plugin.controller.like_post.assert_awaited_once_with(hostuin=0, fid="1", appid=311, unlike=False)
-        self.assertEqual(results, ["点赞成功：瘦了…………（当前已点赞）。"])
+        payload = json.loads(results[0])
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["tool"], "qzone_like_post")
+        self.assertTrue(payload["result"]["verified"])
+        self.assertTrue(payload["result"]["liked"])
+        self.assertEqual(payload["result"]["summary"], "瘦了…………")
+        self.assertIn("reply_guidance", payload)
+        self.assertNotIn("raw", payload["result"])
         self.assertNotIn("fid=", results[0])
+
+    def test_llm_like_tool_ignores_preview_confirmation(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        plugin.settings.preview_writes = True
+        plugin.controller.like_post = AsyncMock(
+            return_value={
+                "action": "like",
+                "liked": True,
+                "verified": False,
+                "already": False,
+                "summary": "hello",
+            }
+        )
+        event = Event([])
+
+        results = asyncio.run(
+            collect_async_generator(plugin.tool_like_post(event, hostuin=0, fid="1", confirm=False))
+        )
+
+        plugin.controller.like_post.assert_awaited_once()
+        payload = json.loads(results[0])
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["result"]["verified"])
+
+    def test_llm_like_tool_returns_structured_error_for_llm_reply(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        plugin.controller.like_post = AsyncMock(side_effect=module.QzoneBridgeError("点赞失败"))
+        event = Event([])
+
+        results = asyncio.run(
+            collect_async_generator(plugin.tool_like_post(event, hostuin=0, fid="1", confirm=False))
+        )
+
+        payload = json.loads(results[0])
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["tool"], "qzone_like_post")
+        self.assertEqual(payload["error"]["message"], "点赞失败")
+        self.assertIn("reply_guidance", payload)
 
 
 if __name__ == "__main__":
