@@ -5,7 +5,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 
 class Plain:
@@ -19,6 +19,7 @@ class Event:
         self.message_str = message_str
         self.stopped = False
         self.images = []
+        self.bot = None
 
     def is_admin(self):
         return True
@@ -142,7 +143,8 @@ class MainPublishTests(unittest.TestCase):
         plugin._ensure_cookie_ready = AsyncMock()
         plugin._ensure_daemon = AsyncMock()
         plugin.controller = types.SimpleNamespace(
-            publish_post=AsyncMock(return_value={"fid": "fid-1", "message": "ok"})
+            get_status=AsyncMock(return_value={"login_uin": 0}),
+            publish_post=AsyncMock(return_value={"fid": "fid-1", "message": "ok"}),
         )
         return plugin
 
@@ -233,6 +235,33 @@ class MainPublishTests(unittest.TestCase):
         self.assertEqual(plugin.controller.publish_post.await_args.kwargs["media"], [])
         self.assertEqual(plugin.controller.publish_post.await_args.kwargs["content"], "report\n[文件: report.pdf]")
         self.assertTrue(Path(results[0]["image"]).exists())
+
+    def test_qzone_post_renders_logged_in_qzone_publisher(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        plugin.controller.get_status = AsyncMock(return_value={"login_uin": 123456})
+        fake_image = plugin.data_dir / "rendered.png"
+        fake_image.write_bytes(b"png")
+        captured = {}
+
+        async def get_stranger_info(**kwargs):
+            self.assertEqual(kwargs["user_id"], 123456)
+            return {"nickname": "QzoneOwner"}
+
+        event = Event([Plain("/qzone post hello")])
+        event.bot = types.SimpleNamespace(get_stranger_info=get_stranger_info)
+
+        def fake_render(post, output_dir, **kwargs):
+            captured.update(kwargs)
+            return fake_image
+
+        with patch.object(module, "render_publish_result_image", side_effect=fake_render):
+            results = asyncio.run(collect_async_generator(plugin.qzone_post(event, content="/qzone post hello")))
+
+        self.assertEqual(results, [{"image": str(fake_image)}])
+        self.assertEqual(captured["profile"].nickname, "QzoneOwner")
+        self.assertEqual(captured["profile"].user_id, "123456")
+        self.assertIn("123456", captured["profile"].avatar_source)
 
 
 if __name__ == "__main__":

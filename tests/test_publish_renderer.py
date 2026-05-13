@@ -2,10 +2,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageDraw
 
 from qzone_bridge.media import PostMedia, PostPayload
-from qzone_bridge.publish_renderer import RenderProfile, render_publish_result_image
+from qzone_bridge.publish_renderer import ACTION, RenderProfile, _draw_share_icon, render_publish_result_image
 
 
 class PublishRendererTests(unittest.TestCase):
@@ -73,6 +73,42 @@ class PublishRendererTests(unittest.TestCase):
             with Image.open(rendered) as image:
                 self.assertEqual(image.format, "PNG")
                 self.assertEqual(image.width, 700)
+
+    def test_result_fid_does_not_add_footer(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            post = PostPayload(content="no footer", media=[])
+
+            without_result = render_publish_result_image(
+                post,
+                temp_path,
+                profile=RenderProfile(nickname="Coconut", time_text="06:34"),
+                width=700,
+            )
+            with_result = render_publish_result_image(
+                post,
+                temp_path,
+                profile=RenderProfile(nickname="Coconut", time_text="06:34"),
+                result={"fid": "fid-1"},
+                width=700,
+            )
+
+            with Image.open(without_result) as base, Image.open(with_result) as rendered:
+                self.assertEqual(rendered.size, base.size)
+
+    def test_share_icon_stays_within_action_bounds(self):
+        image = Image.new("RGB", (70, 60), "white")
+        draw = ImageDraw.Draw(image)
+
+        _draw_share_icon(draw, 10, 10)
+
+        mask = ImageChops.difference(image, Image.new("RGB", image.size, "white"))
+        bbox = mask.getbbox()
+        self.assertIsNotNone(bbox)
+        self.assertGreater(bbox[2] - bbox[0], 28)
+        self.assertLessEqual(bbox[2], 56)
+        self.assertLessEqual(bbox[3], 46)
+        self.assertIn(ACTION, image.getdata())
 
 
 if __name__ == "__main__":
