@@ -421,6 +421,77 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await service.close()
 
+    async def test_like_post_retries_stale_verification_before_marking_unconfirmed(self):
+        with TemporaryDirectory() as tmp:
+            service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
+            service.state.session = SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+            service.client.update_session(service.state.session)
+            false_state = {
+                "tid": "fid-1",
+                "uin": 123456,
+                "content": "hello",
+                "like": {"isliked": "0"},
+            }
+            true_state = {
+                "tid": "fid-1",
+                "uin": 123456,
+                "content": "hello",
+                "like": {"isliked": "1"},
+            }
+            try:
+                with patch("qzone_bridge.daemon.LIKE_VERIFY_RETRY_DELAYS_SECONDS", (0,)), patch.object(
+                    service.client,
+                    "detail",
+                    new=AsyncMock(side_effect=[false_state, false_state, false_state, true_state]),
+                ) as detail, patch.object(
+                    service.client,
+                    "like_post",
+                    new=AsyncMock(return_value={"message": "ok"}),
+                ) as like:
+                    payload = await service.like_post(hostuin=123456, fid="fid-1")
+                self.assertEqual(detail.await_count, 4)
+                self.assertEqual(like.await_count, 2)
+                self.assertTrue(payload["verified"])
+                self.assertTrue(payload["liked"])
+            finally:
+                await service.close()
+
+    async def test_like_post_keeps_success_when_verification_state_stays_stale(self):
+        with TemporaryDirectory() as tmp:
+            service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
+            service.state.session = SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+            service.client.update_session(service.state.session)
+            false_state = {
+                "tid": "fid-1",
+                "uin": 123456,
+                "content": "hello",
+                "like": {"isliked": "0"},
+            }
+            try:
+                with patch("qzone_bridge.daemon.LIKE_VERIFY_RETRY_DELAYS_SECONDS", (0,)), patch.object(
+                    service.client,
+                    "detail",
+                    new=AsyncMock(side_effect=[false_state, false_state, false_state, false_state]),
+                ), patch.object(
+                    service.client,
+                    "like_post",
+                    new=AsyncMock(return_value={"message": "ok"}),
+                ) as like:
+                    payload = await service.like_post(hostuin=123456, fid="fid-1")
+                self.assertEqual(like.await_count, 2)
+                self.assertFalse(payload["verified"])
+                self.assertTrue(payload["liked"])
+                self.assertEqual(payload["verification"]["expected_liked"], True)
+                self.assertEqual(payload["verification"]["actual_liked"], False)
+            finally:
+                await service.close()
+
     async def test_like_post_verification_falls_back_to_legacy_feed_page(self):
         with TemporaryDirectory() as tmp:
             service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
