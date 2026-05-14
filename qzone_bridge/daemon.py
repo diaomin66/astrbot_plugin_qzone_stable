@@ -1,4 +1,4 @@
-"""Standalone QQ空间 daemon."""
+"""Standalone QQ?? daemon."""
 
 from __future__ import annotations
 
@@ -38,12 +38,12 @@ LATEST_FEED_REFERENCES = {
     "newest",
     "recent",
     "last",
-    "最新",
-    "最新一条",
-    "最近一条",
-    "最后一条",
+    "??",
+    "????",
+    "????",
+    "????",
 }
-FEED_REFERENCE_PATTERN = re.compile(r"^第?\s*(\d+)\s*条?$")
+FEED_REFERENCE_PATTERN = re.compile(r"^??\s*(\d+)\s*??$")
 
 
 class QzoneDaemonService:
@@ -221,10 +221,10 @@ class QzoneDaemonService:
     async def bind_cookie(self, cookie_text: str, *, uin: int = 0, source: str = "manual") -> dict[str, Any]:
         cookies = parse_cookie_text(cookie_text)
         if not cookies:
-            raise QzoneParseError("Cookie 为空，无法绑定")
+            raise QzoneParseError("Cookie ???????")
         resolved_uin = normalize_uin(cookies, override=uin)
         if not resolved_uin:
-            raise QzoneParseError("Cookie 中未找到 uin / p_uin，请补齐后重试")
+            raise QzoneParseError("Cookie ???? uin / p_uin???????")
         self.state.session = SessionState(
             uin=resolved_uin,
             cookies=cookies,
@@ -266,6 +266,16 @@ class QzoneDaemonService:
         self.health_state = "needs_rebind"
         return self.snapshot()
 
+    @staticmethod
+    def _should_fallback_feed_fetch(exc: Exception) -> bool:
+        if isinstance(exc, QzoneParseError):
+            return True
+        if not isinstance(exc, QzoneRequestError):
+            return False
+        if exc.status_code in {301, 302, 303, 307, 308, 403, 429}:
+            return True
+        return exc.status_code is not None and exc.status_code >= 500
+
     async def list_feeds(self, *, hostuin: int = 0, limit: int = 5, cursor: str = "", scope: str = "") -> dict[str, Any]:
         self._ensure_session_ready()
         if limit <= 0:
@@ -283,9 +293,10 @@ class QzoneDaemonService:
                 if page_round == 0 and not next_cursor:
                     try:
                         payload = unwrap_payload(await self.client.index())
-                    except QzoneRequestError as exc:
-                        if exc.status_code not in {301, 302, 303, 307, 308}:
+                    except (QzoneRequestError, QzoneParseError) as exc:
+                        if not self._should_fallback_feed_fetch(exc):
                             raise
+                        log.warning("qzone self feed primary fetch failed, using legacy fallback: %s", exc)
                         payload = await self.client.legacy_recent_feeds()
                 else:
                     payload = unwrap_payload(await self.client.get_active_feeds(next_cursor))
@@ -294,9 +305,10 @@ class QzoneDaemonService:
                 if page_round == 0 and not next_cursor:
                     try:
                         payload = await self.client.profile(hostuin)
-                    except QzoneRequestError as exc:
-                        if exc.status_code not in {301, 302, 303, 307, 308}:
+                    except (QzoneRequestError, QzoneParseError) as exc:
+                        if not self._should_fallback_feed_fetch(exc):
                             raise
+                        log.warning("qzone profile feed primary fetch failed, using legacy fallback: %s", exc)
                         payload = await self.client.legacy_feeds(hostuin, page=1, num=max(limit, 20))
                 else:
                     payload = unwrap_payload(await self.client.get_feeds(hostuin, next_cursor))
@@ -331,7 +343,7 @@ class QzoneDaemonService:
         await self.ensure_token(hostuin)
         payload = unwrap_payload(await self.client.detail(hostuin, fid, appid=appid, busi_param=busi_param))
         if not isinstance(payload, dict):
-            raise QzoneParseError("说说详情返回结构异常")
+            raise QzoneParseError("??????????")
         entry = self.client.feed_entry_from_payload(payload, default_hostuin=hostuin)
         self.client.cache_feed_page(hostuin, [entry])
         comments = []
@@ -368,12 +380,12 @@ class QzoneDaemonService:
         normalized_media = normalize_media_list(media)
         photos, fallback_media = split_publishable_images(normalized_media)
         if len(photos) > QZONE_MAX_IMAGES:
-            raise QzoneParseError(f"QQ空间说说最多支持 {QZONE_MAX_IMAGES} 张图片")
+            raise QzoneParseError(f"QQ???????? {QZONE_MAX_IMAGES} ???")
         if fallback_media:
             refs = "\n".join(media_reference_text(item) for item in fallback_media)
             content = "\n".join(part for part in (content.strip(), refs) if part)
         if not content.strip() and not photos:
-            raise QzoneParseError("发布内容不能为空")
+            raise QzoneParseError("????????")
         self._ensure_session_ready()
         payload = unwrap_payload(
             await self.client.publish_mood(
@@ -383,7 +395,7 @@ class QzoneDaemonService:
             )
         )
         if not isinstance(payload, dict):
-            raise QzoneParseError("发布说说返回结构异常")
+            raise QzoneParseError("??????????")
         self._set_success(defer_save=True)
         return {
             "fid": payload.get("fid") or payload.get("tid") or "",
@@ -403,11 +415,11 @@ class QzoneDaemonService:
         private: bool = False,
     ) -> dict[str, Any]:
         if not content.strip():
-            raise QzoneParseError("评论内容不能为空")
+            raise QzoneParseError("????????")
         self._ensure_session_ready()
         payload = unwrap_payload(await self.client.add_comment(hostuin, fid, content, appid=appid, private=private))
         if not isinstance(payload, dict):
-            raise QzoneParseError("评论返回结构异常")
+            raise QzoneParseError("????????")
         self._set_success(defer_save=True)
         return {
             "commentid": payload.get("commentid") or payload.get("commentId") or 0,
@@ -474,7 +486,7 @@ class QzoneDaemonService:
             feed_payload = await self.list_feeds(hostuin=target_hostuin, limit=reference_index, scope="profile")
             items = feed_payload.get("items") or []
             if reference_index > len(items):
-                raise QzoneParseError(f"未找到第 {reference_index} 条可点赞的说说")
+                raise QzoneParseError(f"???? {reference_index} ???????")
             entry = FeedEntry(**items[reference_index - 1])
             return entry.hostuin, entry.fid, entry.appid or appid, curkey or entry.curkey
         return target_hostuin, fid_text, int(appid or 311), curkey
@@ -560,7 +572,7 @@ class QzoneDaemonService:
             index=index,
         )
         if not hostuin or not fid:
-            raise QzoneParseError("点赞目标不完整，请先选择一条说说")
+            raise QzoneParseError("????????????????")
 
         target_liked = not unlike
         before_entry = await self._refresh_like_entry(hostuin, fid, appid)
@@ -677,6 +689,20 @@ async def _json_body(request: web.Request) -> dict[str, Any]:
     return payload
 
 
+def _error_detail(exc: QzoneBridgeError):
+    detail = exc.detail
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        return detail
+    if isinstance(detail, dict):
+        merged = dict(detail)
+        merged.setdefault("status_code", status_code)
+        return merged
+    if detail is None:
+        return {"status_code": status_code}
+    return {"status_code": status_code, "detail": detail}
+
+
 def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None = None) -> web.Application:
     app = web.Application(client_max_size=32 * 1024 * 1024)
     app["service"] = service
@@ -687,7 +713,7 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
     async def auth_middleware(request: web.Request, handler):
         secret = request.headers.get(SECRET_HEADER) or request.query.get("secret") or ""
         if secret != service.state.runtime.secret:
-            return fail("UNAUTHORIZED", "secret 不匹配", status=401)
+            return fail("UNAUTHORIZED", "secret ???", status=401)
         return await handler(request)
 
     app.middlewares.append(auth_middleware)
@@ -710,7 +736,7 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
             payload = await service.bind_cookie(cookie_text, uin=uin, source=source)
         except QzoneBridgeError as exc:
             service._set_error(exc)
-            return fail(exc.code, exc.message, detail=exc.detail)
+            return fail(exc.code, exc.message, detail=_error_detail(exc))
         return ok(payload)
 
     async def unbind(request: web.Request) -> web.Response:
@@ -726,7 +752,7 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
             payload = await service.list_feeds(hostuin=hostuin, limit=limit, cursor=cursor, scope=scope)
         except QzoneBridgeError as exc:
             service._set_error(exc)
-            return fail(exc.code, exc.message, detail=exc.detail)
+            return fail(exc.code, exc.message, detail=_error_detail(exc))
         return ok(payload)
 
     async def detail(request: web.Request) -> web.Response:
@@ -738,7 +764,7 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
             payload = await service.detail_feed(hostuin=hostuin, fid=fid, appid=appid, busi_param=busi_param)
         except QzoneBridgeError as exc:
             service._set_error(exc)
-            return fail(exc.code, exc.message, detail=exc.detail)
+            return fail(exc.code, exc.message, detail=_error_detail(exc))
         return ok(payload)
 
     async def post(request: web.Request) -> web.Response:
@@ -756,7 +782,7 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
             )
         except QzoneBridgeError as exc:
             service._set_error(exc)
-            return fail(exc.code, exc.message, detail=exc.detail)
+            return fail(exc.code, exc.message, detail=_error_detail(exc))
         return ok(payload)
 
     async def comment(request: web.Request) -> web.Response:
@@ -771,7 +797,7 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
             )
         except QzoneBridgeError as exc:
             service._set_error(exc)
-            return fail(exc.code, exc.message, detail=exc.detail)
+            return fail(exc.code, exc.message, detail=_error_detail(exc))
         return ok(payload)
 
     async def like(request: web.Request) -> web.Response:
@@ -788,7 +814,7 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
             )
         except QzoneBridgeError as exc:
             service._set_error(exc)
-            return fail(exc.code, exc.message, detail=exc.detail)
+            return fail(exc.code, exc.message, detail=_error_detail(exc))
         return ok(payload)
 
     async def shutdown(request: web.Request) -> web.Response:

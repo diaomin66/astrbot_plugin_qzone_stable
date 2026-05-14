@@ -1,4 +1,4 @@
-"""AstrBot entry point for the QQ空间 bridge."""
+"""AstrBot entry point for the QQ?? bridge."""
 
 from __future__ import annotations
 
@@ -10,12 +10,95 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
+
+SENSITIVE_LOG_KEYS = {
+    "cookie",
+    "cookies",
+    "p_skey",
+    "skey",
+    "pt4_token",
+    "pt_key",
+    "qzonetoken",
+    "secret",
+    "token",
+}
+SENSITIVE_URL_QUERY_KEYS = {"g_tk", "gtk", "p_skey", "skey", "pt4_token", "pt_key", "qzonetoken", "token", "secret"}
+LLM_INTERNAL_KEYS = SENSITIVE_LOG_KEYS | {"raw", "cursor", "fid", "curkey", "unikey", "busi_param"}
+
+
+def _redact_url(value: str) -> str:
+    try:
+        parsed = urlparse(value)
+    except Exception:
+        return value
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return value
+    query = []
+    changed = False
+    for key, item_value in parse_qsl(parsed.query, keep_blank_values=True):
+        lowered = key.lower()
+        if lowered in SENSITIVE_URL_QUERY_KEYS or "token" in lowered or "skey" in lowered:
+            query.append((key, "***"))
+            changed = True
+        else:
+            query.append((key, item_value))
+    if not changed:
+        return value
+    return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
+
+
+def _redact_for_log(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            lowered = key_text.lower()
+            if lowered in SENSITIVE_LOG_KEYS or "cookie" in lowered or "skey" in lowered or "secret" in lowered:
+                redacted[key_text] = "***"
+            else:
+                redacted[key_text] = _redact_for_log(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_for_log(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_for_log(item) for item in value]
+    if isinstance(value, str):
+        return _redact_url(value)
+    return value
+
+
+def _safe_for_llm(value: Any) -> Any:
+    if isinstance(value, dict):
+        visible: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            lowered = key_text.lower()
+            if (
+                lowered in LLM_INTERNAL_KEYS
+                or "cookie" in lowered
+                or "skey" in lowered
+                or "secret" in lowered
+                or "token" in lowered
+            ):
+                continue
+            visible[key_text] = _safe_for_llm(item)
+        return visible
+    if isinstance(value, list):
+        return [_safe_for_llm(item) for item in value]
+    if isinstance(value, tuple):
+        return [_safe_for_llm(item) for item in value]
+    if isinstance(value, str):
+        return truncate(_redact_url(value), 500)
+    if isinstance(value, (bool, int, float)) or value is None:
+        return value
+    return truncate(str(value), 500)
 
 
 def _prepare_local_qzone_bridge_imports() -> None:
@@ -202,7 +285,7 @@ class QzoneStablePlugin(Star):
         *,
         profile_task: asyncio.Task | None = None,
     ):
-        text = format_action_result("发布成功", payload)
+        text = format_action_result("????", payload)
         if not self.settings.render_publish_result:
             self._stop_event(event)
             return event.plain_result(text)
@@ -230,7 +313,7 @@ class QzoneStablePlugin(Star):
             self._stop_event(event)
             return image_result(str(image_path))
         self._stop_event(event)
-        return event.plain_result(f"{text}\n渲染图: {image_path}")
+        return event.plain_result(f"{text}\n???: {image_path}")
 
     def _stop_event(self, event: AstrMessageEvent) -> None:
         stopper = getattr(event, "stop_event", None)
@@ -250,13 +333,46 @@ class QzoneStablePlugin(Star):
                 parts.append(f"HTTP {status_code}")
             location = exc.detail.get("location")
             if location:
-                parts.append(f"跳转 {location}")
+                parts.append(f"?? {location}")
             url = exc.detail.get("url")
             if url:
-                parts.append(f"来源 {url}")
+                parts.append(f"?? {url}")
             if parts:
-                return f"{exc.message}（{', '.join(parts)}）"
+                return f"{exc.message}?{', '.join(parts)}?"
         return f"{exc.message}\n{exc.detail}"
+
+    def _log_tool_call_result(self, payload: dict[str, Any]) -> None:
+        try:
+            data = json.dumps(
+                _redact_for_log(payload),
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+        except Exception:
+            data = str(_redact_for_log(payload))
+        if payload.get("ok"):
+            logger.info("qzone llm tool result: %s", data)
+        else:
+            logger.warning("qzone llm tool result: %s", data)
+
+    @staticmethod
+    def _bridge_error_log_payload(tool: str, exc: QzoneBridgeError, arguments: dict[str, Any]) -> dict[str, Any]:
+        error: dict[str, Any] = {
+            "type": type(exc).__name__,
+            "code": exc.code,
+            "message": exc.message,
+        }
+        status_code = getattr(exc, "status_code", None)
+        if status_code is not None:
+            error["status_code"] = status_code
+        return {
+            "ok": False,
+            "tool": tool,
+            "arguments": arguments,
+            "error": error,
+            "detail": exc.detail,
+        }
 
 
     async def _maybe_await(self, value: Any) -> Any:
@@ -307,13 +423,13 @@ class QzoneStablePlugin(Star):
     async def _ask_llm_tool_reply(self, event: AstrMessageEvent, payload: dict[str, Any], fallback: str) -> str:
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         prompt = (
-            "下面是 QQ 空间工具执行结果 JSON，只用于你组织给用户的回复，不要原样输出。"
+            "??? QQ ???????? JSON?????????????????????"
             f"\n{data}\n"
-            "请直接用简短中文回复用户，不要输出 JSON，不要暴露字段名、tool、code、fid、cursor、raw、detail 等内部信息。"
-            "如果 ok 为 true，按已完成或已提交处理；verified 为 false 时说明 QQ 空间状态可能稍后刷新，不要说成失败。"
-            "如果 ok 为 false，只说明失败原因即可。"
+            "????????????????? JSON?????????tool?code?fid?cursor?raw?detail?diagnostic ??????"
+            "?? ok ? true????????????verified ? false ??? QQ ??????????????????"
+            "?? ok ? false????? diagnostic/status_code/text ???????????????????????????"
         )
-        system_prompt = "你是 AstrBot 的 QQ 空间助手，负责把工具执行结果改写成自然、简短、对用户友好的中文回复。"
+        system_prompt = "?? AstrBot ? QQ ??????????????????????????????????"
         context = getattr(self, "_context", None) or getattr(self, "context", None)
 
         generator = getattr(context, "llm_generate", None)
@@ -383,39 +499,43 @@ class QzoneStablePlugin(Star):
         return fallback
 
     def _llm_like_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
-        visible_payload = {
-            key: value
-            for key, value in payload.items()
-            if key not in {"raw", "detail"} and not isinstance(value, (dict, list))
-        }
+        visible_payload = _safe_for_llm(payload)
         return {
             "ok": True,
             "tool": "qzone_like_post",
             "result": visible_payload,
             "reply_guidance": (
-                "请根据 result 用自然语言回复用户。"
-                "如果 verified 为 true，说明 QQ 空间状态已确认；"
-                "如果 verified 为 false，请说明请求已提交但状态暂未确认。"
-                "不要暴露 fid、cursor、raw 或内部字段。"
+                "??? result ??????????"
+                "?? verified ? true??? QQ ????????"
+                "?? verified ? false?????????????????"
+                "???? fid?cursor?raw ??????"
             ),
         }
 
     def _llm_error_payload(self, tool: str, exc: QzoneBridgeError) -> dict[str, Any]:
-        return {
+        error: dict[str, Any] = {
+            "type": type(exc).__name__,
+            "code": exc.code,
+            "message": exc.message,
+        }
+        status_code = getattr(exc, "status_code", None)
+        if status_code is not None:
+            error["status_code"] = status_code
+        result: dict[str, Any] = {
             "ok": False,
             "tool": tool,
-            "error": {
-                "type": type(exc).__name__,
-                "code": exc.code,
-                "message": exc.message,
-            },
-            "reply_guidance": "请根据 error 用自然语言简短告知用户失败原因，不要暴露内部字段。",
+            "error": error,
+            "reply_guidance": "??? error ? diagnostic ?????????????????????????",
         }
+        diagnostic = _safe_for_llm(exc.detail)
+        if diagnostic not in (None, {}, []):
+            result["diagnostic"] = diagnostic
+        return result
 
     async def _ensure_daemon(self, *, allow_needs_rebind: bool = False) -> None:
         status = await self.controller.get_status()
         if status.get("needs_rebind") and not allow_needs_rebind:
-            raise QzoneNeedsRebind("QQ空间登录失效，请重新绑定 Cookie")
+            raise QzoneNeedsRebind("QQ???????????? Cookie")
         if allow_needs_rebind:
             if status.get("daemon_state") != "ready":
                 await self.controller.ensure_running()
@@ -424,7 +544,7 @@ class QzoneStablePlugin(Star):
             if status.get("daemon_state") != "ready":
                 await self.controller.ensure_running()
         elif status.get("daemon_state") != "ready":
-            raise DaemonUnavailableError("daemon 未运行")
+            raise DaemonUnavailableError("daemon ???")
 
     def _limit(self, limit: int | None) -> int:
         if not limit or limit <= 0:
@@ -445,7 +565,7 @@ class QzoneStablePlugin(Star):
         text = format_feed_detail(entry)
         comments = payload.get("comments") or []
         if comments:
-            lines = [text, "", "评论"]
+            lines = [text, "", "??"]
             for comment in comments[:5]:
                 nickname = comment.get("nickname") or comment.get("uin") or "-"
                 lines.append(f"- {nickname}: {truncate(str(comment.get('content') or ''), 80)}")
@@ -489,7 +609,7 @@ class QzoneStablePlugin(Star):
         return self._capture_onebot_client_from_context()
 
     def _cookie_binding_hint(self) -> str:
-        return "请确认 AstrBot 正在使用 aiocqhttp(OneBot v11) 平台，或手动使用 /qzone bind 绑定 Cookie。"
+        return "??? AstrBot ???? aiocqhttp(OneBot v11) ???????? /qzone bind ?? Cookie?"
 
     async def _auto_bind_cookie(
         self,
@@ -500,11 +620,11 @@ class QzoneStablePlugin(Star):
     ) -> dict[str, Any]:
         async with self._get_cookie_lock():
             if not self.settings.auto_bind_cookie and not force:
-                raise QzoneCookieAcquireError("自动获取 Cookie 已关闭。请手动绑定。")
+                raise QzoneCookieAcquireError("???? Cookie ??????????")
 
             bot = self._capture_onebot_client(event)
             if bot is None:
-                raise QzoneCookieAcquireError(f"未捕获到 OneBot 客户端，无法自动获取 Cookie。{self._cookie_binding_hint()}")
+                raise QzoneCookieAcquireError(f"???? OneBot ?????????? Cookie?{self._cookie_binding_hint()}")
 
             try:
                 status = await self.controller.get_status(probe_daemon=False)
@@ -516,7 +636,7 @@ class QzoneStablePlugin(Star):
 
             cookie_text = await fetch_cookie_text(bot, domain=self.settings.cookie_domain)
             if not cookie_text:
-                raise QzoneCookieAcquireError(f"OneBot 未返回可用 Cookie。{self._cookie_binding_hint()}")
+                raise QzoneCookieAcquireError(f"OneBot ????? Cookie?{self._cookie_binding_hint()}")
 
             try:
                 cookie_uin = normalize_uin(parse_cookie_text(cookie_text))
@@ -597,14 +717,14 @@ class QzoneStablePlugin(Star):
     async def qzone_help(self, event: AstrMessageEvent):
         text = "\n".join(
             [
-                "QQ空间插件",
+                "QQ????",
                 "/qzone status",
                 "/qzone bind <cookie>",
                 "/qzone autobind",
                 "/qzone unbind",
                 "/qzone feed [hostuin] [limit] [cursor]",
                 "/qzone detail <hostuin> <fid> [appid]",
-                "/qzone post <content> [图片/图片文件]",
+                "/qzone post <content> [??/????]",
                 "/qzone comment <hostuin> <fid> <content>",
                 "/qzone like <hostuin> <fid> [appid] [unlike]",
                 "",
@@ -622,7 +742,7 @@ class QzoneStablePlugin(Star):
     @qzone.command("status")
     async def qzone_status(self, event: AstrMessageEvent):
         if not self._is_admin(event):
-            yield self._command_result(event, "仅管理员可查看状态。")
+            yield self._command_result(event, "??????????")
             return
         try:
             payload = await self.controller.get_status()
@@ -634,7 +754,7 @@ class QzoneStablePlugin(Star):
     @qzone.command("bind")
     async def qzone_bind(self, event: AstrMessageEvent, cookie: str):
         if not self._is_admin(event):
-            yield self._command_result(event, "仅管理员可绑定 Cookie。")
+            yield self._command_result(event, "??????? Cookie?")
             return
         try:
             payload = await self.controller.bind_cookie_local(cookie)
@@ -648,7 +768,7 @@ class QzoneStablePlugin(Star):
     @qzone.command("autobind")
     async def qzone_autobind(self, event: AstrMessageEvent):
         if not self._is_admin(event):
-            yield self._command_result(event, "仅管理员可自动绑定 Cookie。")
+            yield self._command_result(event, "????????? Cookie?")
             return
         try:
             payload = await self._auto_bind_cookie(event, force=True, source="aiocqhttp")
@@ -662,7 +782,7 @@ class QzoneStablePlugin(Star):
     @qzone.command("unbind")
     async def qzone_unbind(self, event: AstrMessageEvent):
         if not self._is_admin(event):
-            yield self._command_result(event, "仅管理员可解绑。")
+            yield self._command_result(event, "????????")
             return
         try:
             payload = await self.controller.unbind_local()
@@ -703,7 +823,7 @@ class QzoneStablePlugin(Star):
     async def qzone_post(self, event: AstrMessageEvent, content: str = ""):
         self._stop_event(event)
         if not self._is_admin(event):
-            yield self._command_result(event, "仅管理员可发说说。")
+            yield self._command_result(event, "?????????")
             return
         post = collect_post_payload(
             event,
@@ -730,7 +850,7 @@ class QzoneStablePlugin(Star):
     @qzone.command("comment")
     async def qzone_comment(self, event: AstrMessageEvent, hostuin: int, fid: str, content: str):
         if not self._is_admin(event):
-            yield self._command_result(event, "仅管理员可评论。")
+            yield self._command_result(event, "????????")
             return
         try:
             await self._ensure_cookie_ready(event)
@@ -739,12 +859,12 @@ class QzoneStablePlugin(Star):
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
             return
-        yield self._command_result(event, format_action_result("评论成功", payload))
+        yield self._command_result(event, format_action_result("????", payload))
 
     @qzone.command("like")
     async def qzone_like(self, event: AstrMessageEvent, hostuin: int, fid: str, appid: int = 311, unlike: bool = False):
         if not self._is_admin(event):
-            yield self._command_result(event, "仅管理员可点赞。")
+            yield self._command_result(event, "????????")
             return
         try:
             await self._ensure_cookie_ready(event)
@@ -757,13 +877,13 @@ class QzoneStablePlugin(Star):
 
     @filter.llm_tool(name="qzone_get_status")
     async def tool_get_status(self, event: AstrMessageEvent):
-        """获取 QQ 空间 daemon 状态。
+        """?? QQ ?? daemon ???
 
         Returns:
-            文本状态摘要。
+            ???????
         """
         if not self._is_admin(event):
-            yield event.plain_result("仅管理员可以查看状态。")
+            yield event.plain_result("???????????")
             return
         try:
             payload = await self.controller.get_status()
@@ -774,13 +894,13 @@ class QzoneStablePlugin(Star):
 
     @filter.llm_tool(name="qzone_list_feed")
     async def tool_list_feed(self, event: AstrMessageEvent, hostuin: int = 0, limit: int = 5, cursor: str = "", scope: str = ""):
-        """列出 QQ 空间说说。
+        """?? QQ ?????
 
         Args:
-            hostuin (number): 目标 QQ 号。0 表示当前登录账号。
-            limit (number): 返回条数。
-            cursor (string): 翻页游标。
-            scope (string): self 或 profile。
+            hostuin (number): ?? QQ ??0 ?????????
+            limit (number): ?????
+            cursor (string): ?????
+            scope (string): self ? profile?
         """
         try:
             await self._ensure_cookie_ready(event)
@@ -799,12 +919,12 @@ class QzoneStablePlugin(Star):
 
     @filter.llm_tool(name="qzone_detail_feed")
     async def tool_detail_feed(self, event: AstrMessageEvent, hostuin: int, fid: str, appid: int = 311):
-        """获取单条说说详情。
+        """?????????
 
         Args:
-            hostuin (number): 说说所属 QQ 号。
-            fid (string): 说说 fid。
-            appid (number): 应用 id，默认 311。
+            hostuin (number): ???? QQ ??
+            fid (string): ?? fid?
+            appid (number): ?? id??? 311?
         """
         try:
             await self._ensure_cookie_ready(event)
@@ -824,15 +944,15 @@ class QzoneStablePlugin(Star):
         sync_weibo: bool = False,
         media: list[str] | None = None,
     ):
-        """发布一条 QQ 空间说说。
+        """???? QQ ?????
 
         Args:
-            content (string): 说说内容。
-            confirm (boolean): 是否确认执行。
-            sync_weibo (boolean): 是否同步微博。
+            content (string): ?????
+            confirm (boolean): ???????
+            sync_weibo (boolean): ???????
         """
         if not self._is_admin(event):
-            yield event.plain_result("仅管理员可发布说说。")
+            yield event.plain_result("??????????")
             return
         post = collect_post_payload(
             event,
@@ -842,9 +962,9 @@ class QzoneStablePlugin(Star):
             extra_media=media,
         )
         if self.settings.preview_writes and not confirm:
-            draft = truncate(post.content or "（仅附件）", 120)
-            suffix = f"；附件 {len(post.media)} 个" if post.media else ""
-            yield event.plain_result(f"待发布草稿: {draft}{suffix}。确认后将执行。")
+            draft = truncate(post.content or "?????", 120)
+            suffix = f"??? {len(post.media)} ?" if post.media else ""
+            yield event.plain_result(f"?????: {draft}{suffix}????????")
             return
         profile_task: asyncio.Task | None = None
         try:
@@ -874,22 +994,22 @@ class QzoneStablePlugin(Star):
         appid: int = 311,
         private: bool = False,
     ):
-        """评论一条说说。
+        """???????
 
         Args:
-            hostuin (number): 目标 QQ 号。
-            fid (string): 说说 fid。
-            content (string): 评论内容。
-            confirm (boolean): 兼容旧参数；点赞工具会直接执行。
-            appid (number): 应用 id。
-            private (boolean): 是否私密评论。
+            hostuin (number): ?? QQ ??
+            fid (string): ?? fid?
+            content (string): ?????
+            confirm (boolean): ????????????????
+            appid (number): ?? id?
+            private (boolean): ???????
         """
         if not self._is_admin(event):
-            yield event.plain_result("仅管理员可评论。")
+            yield event.plain_result("????????")
             return
         if self.settings.preview_writes and not confirm:
             yield event.plain_result(
-                f"待评论草稿: hostuin={hostuin}, fid={fid}, content={truncate(content, 120)}。确认后将执行。"
+                f"?????: hostuin={hostuin}, fid={fid}, content={truncate(content, 120)}????????"
             )
             return
         try:
@@ -905,7 +1025,7 @@ class QzoneStablePlugin(Star):
         except QzoneBridgeError as exc:
             yield event.plain_result(self._error_text(exc))
             return
-        yield event.plain_result(format_action_result("评论成功", payload))
+        yield event.plain_result(format_action_result("????", payload))
 
     @filter.llm_tool(name="qzone_like_post")
     async def tool_like_post(
@@ -919,17 +1039,26 @@ class QzoneStablePlugin(Star):
         latest: bool = False,
         index: int = 0,
     ):
-        """点赞或取消点赞一条说说。
+        """????????????
 
         Args:
-            hostuin (number): 目标 QQ 号。`0` 表示当前登录 QQ，也可以复用最近一次列出的说说列表上下文。
-            fid (string): 精确的说说 fid。若按“最新一条”或“第 N 条”操作，优先使用 `latest` / `index`，也兼容 `latest`、`第3条` 这类文本引用。
-            confirm (boolean): 兼容旧参数；该工具会直接执行。
-            appid (number): 说说 appid，通常为 `311`。
-            unlike (boolean): 为 `true` 时取消点赞，否则执行点赞。
-            latest (boolean): 为 `true` 时自动定位目标 QQ 的最新一条说说。
-            index (number): 自动定位目标 QQ 的第 N 条说说；`1` 表示最新一条。
+            hostuin (number): ?? QQ ??`0` ?????? QQ?????????????????????
+            fid (string): ????? fid???????????? N ????????? `latest` / `index`???? `latest`?`?3?` ???????
+            confirm (boolean): ???????????????
+            appid (number): ?? appid???? `311`?
+            unlike (boolean): ? `true` ?????????????
+            latest (boolean): ? `true` ??????? QQ ????????
+            index (number): ?????? QQ ?? N ????`1` ???????
         """
+        arguments = {
+            "hostuin": hostuin,
+            "fid": fid,
+            "confirm": confirm,
+            "appid": appid,
+            "unlike": unlike,
+            "latest": latest,
+            "index": index,
+        }
         if not self._is_admin(event):
             payload = {
                 "ok": False,
@@ -937,11 +1066,12 @@ class QzoneStablePlugin(Star):
                 "error": {
                     "type": "PermissionError",
                     "code": "QZONE_PERMISSION",
-                    "message": "仅管理员可点赞。",
+                    "message": "????????",
                 },
-                "reply_guidance": "请用自然语言告诉用户没有权限执行点赞。",
+                "reply_guidance": "???????????????????",
             }
-            text = await self._ask_llm_tool_reply(event, payload, "仅管理员可点赞。")
+            self._log_tool_call_result({**payload, "arguments": arguments})
+            text = await self._ask_llm_tool_reply(event, payload, "????????")
             yield event.plain_result(text)
             return
         try:
@@ -956,13 +1086,24 @@ class QzoneStablePlugin(Star):
                 index=index,
             )
         except QzoneBridgeError as exc:
+            log_payload = self._bridge_error_log_payload("qzone_like_post", exc, arguments)
+            self._log_tool_call_result(log_payload)
+            llm_payload = self._llm_error_payload("qzone_like_post", exc)
             text = await self._ask_llm_tool_reply(
                 event,
-                self._llm_error_payload("qzone_like_post", exc),
+                llm_payload,
                 exc.message,
             )
             yield event.plain_result(text)
             return
+        self._log_tool_call_result(
+            {
+                "ok": True,
+                "tool": "qzone_like_post",
+                "arguments": arguments,
+                "result": payload,
+            }
+        )
         text = await self._ask_llm_tool_reply(
             event,
             self._llm_like_payload(payload),

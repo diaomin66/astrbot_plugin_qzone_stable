@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import json
 import sys
 import tempfile
 import types
@@ -236,7 +237,7 @@ class MainPublishTests(unittest.TestCase):
 
         plugin.controller.publish_post.assert_awaited_once()
         self.assertEqual(plugin.controller.publish_post.await_args.kwargs["media"], [])
-        self.assertEqual(plugin.controller.publish_post.await_args.kwargs["content"], "report\n[文件: report.pdf]")
+        self.assertEqual(plugin.controller.publish_post.await_args.kwargs["content"], "report\n[??: report.pdf]")
         self.assertTrue(Path(results[0]["image"]).exists())
 
     def test_qzone_post_renders_logged_in_qzone_publisher(self):
@@ -273,7 +274,7 @@ class MainPublishTests(unittest.TestCase):
             hostuin=3112333596,
             fid="1c7182b96589046ad3380900",
             appid=311,
-            summary="瘦了…………",
+            summary="??????",
             liked=False,
         )
         plugin.controller.list_feeds = AsyncMock(
@@ -288,8 +289,8 @@ class MainPublishTests(unittest.TestCase):
         results = asyncio.run(collect_async_generator(plugin.tool_list_feed(event, limit=1)))
 
         self.assertEqual(len(results), 1)
-        self.assertIn("瘦了", results[0])
-        self.assertIn("未点赞", results[0])
+        self.assertIn("??", results[0])
+        self.assertIn("???", results[0])
         self.assertNotIn("cursor=", results[0])
         self.assertNotIn("has_more", results[0])
         self.assertNotIn("fid=", results[0])
@@ -299,7 +300,7 @@ class MainPublishTests(unittest.TestCase):
         plugin = self.make_plugin(module)
         plugin._context = types.SimpleNamespace(
             get_current_chat_provider_id=AsyncMock(return_value="provider-1"),
-            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="已经帮你点赞成功。")),
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="?????????")),
         )
         plugin.controller.like_post = AsyncMock(
             return_value={
@@ -307,7 +308,7 @@ class MainPublishTests(unittest.TestCase):
                 "liked": True,
                 "verified": True,
                 "already": False,
-                "summary": "瘦了…………",
+                "summary": "??????",
             }
         )
         event = Event([])
@@ -324,20 +325,52 @@ class MainPublishTests(unittest.TestCase):
             latest=False,
             index=0,
         )
-        self.assertEqual(results[0], "已经帮你点赞成功。")
+        self.assertEqual(results[0], "?????????")
         plugin._context.llm_generate.assert_awaited_once()
         prompt = plugin._context.llm_generate.await_args.kwargs["prompt"]
         self.assertIn('"ok":true', prompt)
         self.assertIn('"verified":true', prompt)
-        self.assertIn("瘦了…………", prompt)
+        self.assertIn("??????", prompt)
         self.assertNotIn("fid=", results[0])
         self.assertFalse(results[0].lstrip().startswith("{"))
+
+    def test_llm_like_tool_logs_success_payload_to_astrbot_logger(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        plugin._context = types.SimpleNamespace(
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="????")),
+        )
+        plugin.controller.like_post = AsyncMock(
+            return_value={
+                "action": "like",
+                "liked": True,
+                "verified": True,
+                "already": False,
+                "summary": "hello",
+                "raw": {"message": "ok"},
+            }
+        )
+        event = Event([])
+
+        with patch.object(module.logger, "info") as log_info:
+            asyncio.run(collect_async_generator(plugin.tool_like_post(event, hostuin=0, fid="1")))
+
+        log_line = next(
+            call.args[1]
+            for call in log_info.call_args_list
+            if call.args and call.args[0] == "qzone llm tool result: %s"
+        )
+        logged = json.loads(log_line)
+        self.assertTrue(logged["ok"])
+        self.assertEqual(logged["tool"], "qzone_like_post")
+        self.assertEqual(logged["arguments"]["fid"], "1")
+        self.assertEqual(logged["result"]["raw"]["message"], "ok")
 
     def test_llm_like_tool_forwards_latest_and_index_reference(self):
         module = self.load_main_module()
         plugin = self.make_plugin(module)
         plugin._context = types.SimpleNamespace(
-            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="已经帮对方第 2 条说说点赞。")),
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="?????? 2 ??????")),
         )
         plugin.controller.like_post = AsyncMock(
             return_value={
@@ -369,7 +402,7 @@ class MainPublishTests(unittest.TestCase):
         module = self.load_main_module()
         plugin = self.make_plugin(module)
         plugin._context = types.SimpleNamespace(
-            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="点赞请求已提交，空间状态可能稍后刷新。")),
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="???????????????????")),
         )
         plugin.settings.preview_writes = True
         plugin.controller.like_post = AsyncMock(
@@ -388,7 +421,7 @@ class MainPublishTests(unittest.TestCase):
         )
 
         plugin.controller.like_post.assert_awaited_once()
-        self.assertEqual(results[0], "点赞请求已提交，空间状态可能稍后刷新。")
+        self.assertEqual(results[0], "???????????????????")
         prompt = plugin._context.llm_generate.await_args.kwargs["prompt"]
         self.assertIn('"verified":false', prompt)
         self.assertFalse(results[0].lstrip().startswith("{"))
@@ -397,20 +430,59 @@ class MainPublishTests(unittest.TestCase):
         module = self.load_main_module()
         plugin = self.make_plugin(module)
         plugin._context = types.SimpleNamespace(
-            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="点赞失败：QQ 空间暂时拒绝了请求。")),
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="?????QQ ??????????")),
         )
-        plugin.controller.like_post = AsyncMock(side_effect=module.QzoneBridgeError("点赞失败"))
+        plugin.controller.like_post = AsyncMock(side_effect=module.QzoneBridgeError("????"))
         event = Event([])
 
         results = asyncio.run(
             collect_async_generator(plugin.tool_like_post(event, hostuin=0, fid="1", confirm=False))
         )
 
-        self.assertEqual(results[0], "点赞失败：QQ 空间暂时拒绝了请求。")
+        self.assertEqual(results[0], "?????QQ ??????????")
         prompt = plugin._context.llm_generate.await_args.kwargs["prompt"]
         self.assertIn('"ok":false', prompt)
-        self.assertIn("点赞失败", prompt)
+        self.assertIn("????", prompt)
         self.assertFalse(results[0].lstrip().startswith("{"))
+
+    def test_llm_like_tool_logs_error_and_sends_diagnostic_to_llm(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        plugin._context = types.SimpleNamespace(
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="?????QQ ??????????")),
+        )
+        exc = module.QzoneBridgeError(
+            "QQ?????????? (503)",
+            detail={
+                "status_code": 503,
+                "url": "https://w.qzone.qq.com/cgi-bin/likes/internal_dolike_app?g_tk=123",
+                "text": "service unavailable",
+            },
+        )
+        exc.status_code = 503
+        plugin.controller.like_post = AsyncMock(side_effect=exc)
+        event = Event([])
+
+        with patch.object(module.logger, "warning") as log_warning:
+            results = asyncio.run(
+                collect_async_generator(plugin.tool_like_post(event, hostuin=0, fid="1", confirm=False))
+            )
+
+        self.assertEqual(results[0], "?????QQ ??????????")
+        prompt = plugin._context.llm_generate.await_args.kwargs["prompt"]
+        self.assertIn('"diagnostic"', prompt)
+        self.assertIn('"status_code":503', prompt)
+        self.assertIn("service unavailable", prompt)
+        log_line = next(
+            call.args[1]
+            for call in log_warning.call_args_list
+            if call.args and call.args[0] == "qzone llm tool result: %s"
+        )
+        logged = json.loads(log_line)
+        self.assertFalse(logged["ok"])
+        self.assertEqual(logged["error"]["status_code"], 503)
+        self.assertEqual(logged["detail"]["text"], "service unavailable")
+        self.assertIn("g_tk=%2A%2A%2A", logged["detail"]["url"])
 
     def test_llm_like_tool_falls_back_to_natural_text_without_llm_provider(self):
         module = self.load_main_module()
@@ -430,14 +502,14 @@ class MainPublishTests(unittest.TestCase):
             collect_async_generator(plugin.tool_like_post(event, hostuin=0, fid="1", confirm=False))
         )
 
-        self.assertIn("点赞请求已提交", results[0])
+        self.assertIn("???????", results[0])
         self.assertFalse(results[0].lstrip().startswith("{"))
 
     def test_llm_like_tool_error_fallback_does_not_expose_detail(self):
         module = self.load_main_module()
         plugin = self.make_plugin(module)
         plugin.controller.like_post = AsyncMock(
-            side_effect=module.QzoneBridgeError("点赞失败", detail={"fid": "secret-fid", "raw": {"code": 1}})
+            side_effect=module.QzoneBridgeError("????", detail={"fid": "secret-fid", "raw": {"code": 1}})
         )
         event = Event([])
 
@@ -445,7 +517,7 @@ class MainPublishTests(unittest.TestCase):
             collect_async_generator(plugin.tool_like_post(event, hostuin=0, fid="1", confirm=False))
         )
 
-        self.assertEqual(results[0], "点赞失败")
+        self.assertEqual(results[0], "????")
         self.assertNotIn("secret-fid", results[0])
         self.assertFalse(results[0].lstrip().startswith("{"))
 

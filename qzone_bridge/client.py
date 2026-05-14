@@ -1,4 +1,4 @@
-"""Low-level QQ空间 HTTP client."""
+"""Low-level QQ?? HTTP client."""
 
 from __future__ import annotations
 
@@ -35,12 +35,16 @@ from .utils import extract_callback_json, json_loads, now_iso
 log = logging.getLogger(__name__)
 
 AUTH_ERROR_CODES = {-3000}
-AUTH_ERROR_KEYWORDS = ("登录", "失效", "请先登录", "skey", "g_tk", "cookie", "expired", "login")
+AUTH_ERROR_KEYWORDS = ("??", "??", "????", "skey", "g_tk", "cookie", "expired", "login")
 LOGIN_REDIRECT_HOSTS = ("ptlogin", "ui.ptlogin", "xui.ptlogin", "ssl.ptlogin", "login")
 QZONE_IMAGE_UPLOAD_URL = "https://up.qzone.qq.com/cgi-bin/upload/cgi_upload_image"
 QZONE_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
-QZONE_LIKE_URL = "https://w.qzone.qq.com/cgi-bin/likes/internal_dolike_app"
-QZONE_UNLIKE_URL = "https://w.qzone.qq.com/cgi-bin/likes/internal_unlike_app"
+QZONE_LIKE_DIRECT_URL = "https://w.qzone.qq.com/cgi-bin/likes/internal_dolike_app"
+QZONE_UNLIKE_DIRECT_URL = "https://w.qzone.qq.com/cgi-bin/likes/internal_unlike_app"
+QZONE_LIKE_PROXY_URL = "https://user.qzone.qq.com/proxy/domain/w.qzone.qq.com/cgi-bin/likes/internal_dolike_app"
+QZONE_UNLIKE_PROXY_URL = "https://user.qzone.qq.com/proxy/domain/w.qzone.qq.com/cgi-bin/likes/internal_unlike_app"
+QZONE_LIKE_URL = QZONE_LIKE_DIRECT_URL
+QZONE_UNLIKE_URL = QZONE_UNLIKE_DIRECT_URL
 MAX_UPLOAD_IMAGE_BYTES = 32 * 1024 * 1024
 IMAGE_SOURCE_CACHE_TTL_SECONDS = 10 * 60
 IMAGE_SOURCE_CACHE_MAX_ITEMS = 16
@@ -162,9 +166,9 @@ class QzoneClient:
                     code = 0
                 message = str(payload.get("msg") or payload.get("message") or payload.get("text") or "")
                 if self._payload_needs_rebind(code, message):
-                    raise QzoneNeedsRebind(message or "QQ空间登录态已失效", detail=payload)
+                    raise QzoneNeedsRebind(message or "QQ????????", detail=payload)
                 code_text = raw_code if raw_code not in (None, "") else code
-                raise QzoneRequestError(message or f"QQ空间返回错误码 {code_text}", status_code=response.status_code, detail=payload)
+                raise QzoneRequestError(message or f"QQ??????? {code_text}", status_code=response.status_code, detail=payload)
 
     @staticmethod
     def _response_detail(response: httpx.Response) -> dict[str, Any]:
@@ -175,6 +179,12 @@ class QzoneClient:
         location = response.headers.get("location") or response.headers.get("Location")
         if location:
             detail["location"] = location
+        try:
+            text = response.text
+        except Exception:
+            text = ""
+        if text:
+            detail["text"] = text[:500]
         return detail
 
     @staticmethod
@@ -204,6 +214,14 @@ class QzoneClient:
             return False
         host = (parsed.hostname or "").lower()
         return host == "qq.com" or host.endswith(".qq.com")
+
+    @staticmethod
+    def _is_like_action_redirect(current_url: str, location: str) -> bool:
+        if not location:
+            return False
+        target = urljoin(current_url, location)
+        parsed = urlparse(target)
+        return "/cgi-bin/likes/internal_" in parsed.path
 
     @staticmethod
     def _redirect_url_with_params(target_url: str, params: dict[str, Any] | None) -> str:
@@ -266,15 +284,18 @@ class QzoneClient:
         attach_token: bool = False,
         login_required: bool = True,
         follow_qzone_redirects: bool = False,
+        accept_qzone_redirects: bool = False,
+        max_attempts: int | None = None,
     ) -> httpx.Response:
         if login_required and not self.session.cookies:
             raise QzoneNeedsRebind()
         if login_required and self.gtk == 0:
-            raise QzoneNeedsRebind("Cookie 中缺少 p_skey 或 skey，无法计算 g_tk")
+            raise QzoneNeedsRebind("Cookie ??? p_skey ? skey????? g_tk")
 
         params = self._merge_params(params, hostuin=hostuin, attach_token=attach_token)
+        attempts = self.max_retries if max_attempts is None else max(1, int(max_attempts))
         last_exc: Exception | None = None
-        for attempt in range(1, self.max_retries + 1):
+        for attempt in range(1, attempts + 1):
             try:
                 current_url = url
                 current_params = params
@@ -291,8 +312,10 @@ class QzoneClient:
                     self._persist_cookie_response(response)
                     location = response.headers.get("location") or response.headers.get("Location") or ""
                     if response.status_code in QZONE_REDIRECT_STATUS_CODES and self._is_qzone_home_redirect(response):
+                        if accept_qzone_redirects and self._is_allowed_qzone_redirect(str(response.request.url), location):
+                            return response
                         raise QzoneRequestError(
-                            "QQ空间 H5 入口跳转到个人主页，已切换备用接口",
+                            "QQ?? H5 ?????????????????",
                             status_code=response.status_code,
                             detail=self._response_detail(response),
                         )
@@ -300,56 +323,63 @@ class QzoneClient:
                         response.status_code in QZONE_REDIRECT_STATUS_CODES and self._is_login_redirect(location)
                     ):
                         raise QzoneNeedsRebind(
-                            "QQ空间登录失效，请重新绑定 Cookie",
+                            "QQ???????????? Cookie",
                             detail=self._response_detail(response),
                         )
                     if response.status_code in QZONE_REDIRECT_STATUS_CODES:
+                        allowed_redirect = self._is_allowed_qzone_redirect(str(response.request.url), location)
                         if (
                             follow_qzone_redirects
                             and redirects_left > 0
-                            and self._is_allowed_qzone_redirect(str(response.request.url), location)
+                            and allowed_redirect
+                            and (
+                                not accept_qzone_redirects
+                                or self._is_like_action_redirect(str(response.request.url), location)
+                            )
                         ):
                             target_url = urljoin(str(response.request.url), location)
                             current_url = self._redirect_url_with_params(target_url, params)
                             current_params = None
                             redirects_left -= 1
                             continue
+                        if accept_qzone_redirects and allowed_redirect:
+                            return response
                         raise QzoneRequestError(
-                            f"QQ空间返回跳转状态码 {response.status_code}",
+                            f"QQ????????? {response.status_code}",
                             status_code=response.status_code,
                             detail=self._response_detail(response),
                         )
                     break
                 if response.status_code == 403:
                     raise QzoneRequestError(
-                        "QQ空间访问受限或权限不足",
+                        "QQ???????????",
                         status_code=response.status_code,
                         detail=self._response_detail(response),
                     )
                 if response.status_code == 429:
                     raise QzoneRequestError(
-                        "QQ空间请求过于频繁，已被限流",
+                        "QQ?????????????",
                         status_code=response.status_code,
-                        detail={"url": url, "text": response.text[:500]},
+                        detail=self._response_detail(response),
                     )
                 if response.status_code >= 500:
                     raise QzoneRequestError(
-                        f"QQ空间服务器暂时不可用 ({response.status_code})",
+                        f"QQ?????????? ({response.status_code})",
                         status_code=response.status_code,
-                        detail={"url": url, "text": response.text[:500]},
+                        detail=self._response_detail(response),
                     )
                 if response.status_code >= 400:
                     raise QzoneRequestError(
-                        f"QQ空间返回 HTTP {response.status_code}",
+                        f"QQ???? HTTP {response.status_code}",
                         status_code=response.status_code,
-                        detail={"url": url, "text": response.text[:500]},
+                        detail=self._response_detail(response),
                     )
                 return response
             except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPError, QzoneRequestError) as exc:
                 last_exc = exc
                 if isinstance(exc, QzoneRequestError) and exc.status_code is not None and exc.status_code < 500:
                     raise
-                if attempt >= self.max_retries:
+                if attempt >= attempts:
                     raise
                 await asyncio.sleep(min(2.0 * attempt, 6.0))
         assert last_exc is not None
@@ -377,7 +407,7 @@ class QzoneClient:
             if not json_like:
                 detail = {"text": text[:500], "url": str(response.request.url)}
                 raise QzoneParseError(
-                    "QQ 空间接口返回了非 JSON 响应",
+                    "QQ ???????? JSON ??",
                     detail=detail,
                 ) from (callback_error or json_exc)
             try:
@@ -385,7 +415,7 @@ class QzoneClient:
             except Exception as js_exc:
                 detail = {"text": text[:500], "url": str(response.request.url)}
                 raise QzoneParseError(
-                    "无法解析 QQ 空间 JSON 响应",
+                    "???? QQ ?? JSON ??",
                     detail=detail,
                 ) from (js_exc or json_exc)
 
@@ -403,6 +433,8 @@ class QzoneClient:
         attach_token: bool = False,
         login_required: bool = True,
         follow_qzone_redirects: bool = False,
+        accept_qzone_redirects: bool = False,
+        max_attempts: int | None = None,
     ) -> dict[str, Any]:
         response = await self._request_text(
             method,
@@ -416,7 +448,11 @@ class QzoneClient:
             attach_token=attach_token,
             login_required=login_required,
             follow_qzone_redirects=follow_qzone_redirects,
+            accept_qzone_redirects=accept_qzone_redirects,
+            max_attempts=max_attempts,
         )
+        if accept_qzone_redirects and response.status_code in QZONE_REDIRECT_STATUS_CODES:
+            return {"message": "accepted redirect", "redirect": self._response_detail(response)}
         text = response.text.strip()
         payload = self._parse_response_payload(text, response)
         self._raise_payload_error(payload, response)
@@ -428,7 +464,7 @@ class QzoneClient:
         try:
             payload = parse_profile_html(response_text) if profile else parse_index_html(response_text)
         except Exception as exc:
-            raise QzoneParseError("QQ 空间页面解析失败", detail={"text": response_text[:500]}) from exc
+            raise QzoneParseError("QQ ????????", detail={"text": response_text[:500]}) from exc
         return payload
 
     def _store_token(self, hostuin: int, token: str) -> None:
@@ -605,7 +641,7 @@ class QzoneClient:
     async def _load_image_source(self, media: dict[str, Any]) -> tuple[bytes, str, str]:
         item = normalize_media_item(media, default_kind="image")
         if item is None or not item.source:
-            raise QzoneParseError("图片来源为空，无法上传")
+            raise QzoneParseError("???????????")
 
         source = item.source.strip()
         filename = item.name or source_name(source) or "image.jpg"
@@ -619,19 +655,19 @@ class QzoneClient:
             try:
                 return base64.b64decode(source[len("base64://") :], validate=False), filename, mime_type
             except Exception as exc:
-                raise QzoneParseError("无法解析 base64 图片数据") from exc
+                raise QzoneParseError("???? base64 ????") from exc
         if source.startswith("data:"):
             try:
                 header, encoded = source.split(",", 1)
             except ValueError as exc:
-                raise QzoneParseError("无法解析 data URI 图片数据") from exc
+                raise QzoneParseError("???? data URI ????") from exc
             header_mime = header[5:].split(";", 1)[0]
             if ";base64" not in header:
-                raise QzoneParseError("data URI 图片必须使用 base64 编码")
+                raise QzoneParseError("data URI ?????? base64 ??")
             try:
                 data = base64.b64decode(encoded, validate=False)
             except Exception as exc:
-                raise QzoneParseError("无法解析 data URI 图片数据") from exc
+                raise QzoneParseError("???? data URI ????") from exc
             return data, filename, mime_type or header_mime
 
         if parsed.scheme.lower() in {"http", "https"}:
@@ -646,14 +682,14 @@ class QzoneClient:
                     if response.status_code >= 400:
                         text = (await response.aread()).decode("utf-8", errors="ignore")
                         raise QzoneRequestError(
-                            f"下载图片返回 HTTP {response.status_code}",
+                            f"?????? HTTP {response.status_code}",
                             status_code=response.status_code,
                             detail={"url": source, "text": text[:500]},
                         )
                     length = response.headers.get("content-length")
                     try:
                         if length and int(length) > MAX_UPLOAD_IMAGE_BYTES:
-                            raise QzoneParseError("图片文件过大，无法快速上传", detail={"url": source})
+                            raise QzoneParseError("?????????????", detail={"url": source})
                     except ValueError:
                         pass
                     chunks: list[bytes] = []
@@ -663,10 +699,10 @@ class QzoneClient:
                             continue
                         total += len(chunk)
                         if total > MAX_UPLOAD_IMAGE_BYTES:
-                            raise QzoneParseError("图片文件过大，无法快速上传", detail={"url": source})
+                            raise QzoneParseError("?????????????", detail={"url": source})
                         chunks.append(chunk)
             except httpx.HTTPError as exc:
-                raise QzoneRequestError("下载图片失败", detail={"url": source}) from exc
+                raise QzoneRequestError("??????", detail={"url": source}) from exc
             content_type = response.headers.get("content-type", "").split(";", 1)[0]
             data = b"".join(chunks)
             self._store_image_source_cache(source, data, content_type)
@@ -675,10 +711,10 @@ class QzoneClient:
         path = Path(source)
         def read_local_image() -> bytes:
             if not path.exists() or not path.is_file():
-                raise QzoneParseError("图片文件不存在", detail={"path": source})
+                raise QzoneParseError("???????", detail={"path": source})
             stat = path.stat()
             if stat.st_size > MAX_UPLOAD_IMAGE_BYTES:
-                raise QzoneParseError("图片文件过大，无法快速上传", detail={"path": source})
+                raise QzoneParseError("?????????????", detail={"path": source})
             return path.read_bytes()
 
         data = await asyncio.to_thread(read_local_image)
@@ -688,7 +724,7 @@ class QzoneClient:
     def _photo_payload_from_upload(payload: dict[str, Any], *, filename: str = "", mime_type: str = "") -> dict[str, Any]:
         data = unwrap_payload(payload)
         if not isinstance(data, dict):
-            raise QzoneParseError("图片上传返回结构异常", detail=payload)
+            raise QzoneParseError("??????????", detail=payload)
         albumid = str(data.get("albumid") or data.get("albumId") or "")
         lloc = str(data.get("lloc") or data.get("LLoc") or "")
         sloc = str(data.get("sloc") or data.get("SLoc") or "")
@@ -696,7 +732,7 @@ class QzoneClient:
         height = str(data.get("height") or data.get("h") or 0)
         width = str(data.get("width") or data.get("w") or 0)
         if not albumid or not lloc or not sloc:
-            raise QzoneParseError("图片上传返回缺少 richval 字段", detail=data)
+            raise QzoneParseError("???????? richval ??", detail=data)
         url = str(data.get("url") or data.get("origin_url") or data.get("originUrl") or data.get("pre") or "")
         pic_bo = str(data.get("pic_bo") or data.get("picBo") or QzoneClient._extract_pic_bo(url) or "")
         richval = f",{albumid},{lloc},{sloc},{photo_type},{height},{width},,{height},{width}"
@@ -715,10 +751,10 @@ class QzoneClient:
     async def upload_photo(self, media: dict[str, Any]) -> dict[str, Any]:
         item = normalize_media_item(media, default_kind="image")
         if item is None or not is_supported_image(item):
-            raise QzoneParseError("QQ空间说说仅支持上传图片附件", detail=media)
+            raise QzoneParseError("QQ?????????????", detail=media)
         data, filename, mime_type = await self._load_image_source(item.to_dict())
         if not data:
-            raise QzoneParseError("图片内容为空，无法上传", detail={"name": filename})
+            raise QzoneParseError("???????????", detail={"name": filename})
 
         encoded_bytes = await asyncio.to_thread(base64.b64encode, data)
         encoded = encoded_bytes.decode("ascii")
@@ -765,7 +801,7 @@ class QzoneClient:
 
     async def _prepare_publish_photos(self, photos: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
         if photos and len(photos) > QZONE_MAX_IMAGES:
-            raise QzoneParseError(f"QQ空间说说最多支持 {QZONE_MAX_IMAGES} 张图片")
+            raise QzoneParseError(f"QQ???????? {QZONE_MAX_IMAGES} ???")
         source_photos = list(photos or [])
         prepared: list[dict[str, Any] | None] = [None] * len(source_photos)
         pending: list[tuple[int, dict[str, Any]]] = []
@@ -805,7 +841,7 @@ class QzoneClient:
 
         final = [photo for photo in prepared if photo is not None]
         if len(final) > QZONE_MAX_IMAGES:
-            raise QzoneParseError(f"QQ空间说说最多支持 {QZONE_MAX_IMAGES} 张图片")
+            raise QzoneParseError(f"QQ???????? {QZONE_MAX_IMAGES} ???")
         return final
 
     async def publish_mood(self, content: str, *, sync_weibo: bool = False, photos: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -885,6 +921,27 @@ class QzoneClient:
         )
         return payload
 
+    @staticmethod
+    def _like_endpoint_candidates(like: bool) -> tuple[str, ...]:
+        if like:
+            return (QZONE_LIKE_PROXY_URL, QZONE_LIKE_DIRECT_URL)
+        return (QZONE_UNLIKE_PROXY_URL, QZONE_UNLIKE_DIRECT_URL)
+
+    @staticmethod
+    def _like_attempt_detail(endpoint: str, exc: Exception) -> dict[str, Any]:
+        detail: dict[str, Any] = {
+            "endpoint": endpoint,
+            "type": type(exc).__name__,
+            "message": getattr(exc, "message", str(exc)),
+        }
+        status_code = getattr(exc, "status_code", None)
+        if status_code is not None:
+            detail["status_code"] = status_code
+        exc_detail = getattr(exc, "detail", None)
+        if exc_detail is not None:
+            detail["detail"] = exc_detail
+        return detail
+
     async def like_post(
         self,
         hostuin: int,
@@ -908,34 +965,60 @@ class QzoneClient:
             else compute_unikey(appid, hostuin, fid)
         )
         created_at = cached.created_at if cached else 0
-        path = QZONE_LIKE_URL if like else QZONE_UNLIKE_URL
-        payload = await self._request_json(
-            "POST",
-            path,
-            data={
-                "unikey": unikey,
-                "curkey": curkey,
-                "appid": appid,
-                "opuin": self.login_uin,
-                "uin": self.login_uin,
-                "hostuin": hostuin,
-                "fid": fid,
-                "from": 1,
-                "typeid": 0,
-                "abstime": created_at,
-                "active": 0,
-                "fupdate": 1,
-                "opr_type": "like" if like else "unlike",
-                "format": "purejson",
-                "qzreferrer": f"https://user.qzone.qq.com/{hostuin}/mood/{fid}",
-            },
-            referer=f"https://user.qzone.qq.com/{hostuin}/mood/{fid}",
-            origin="https://user.qzone.qq.com",
-            hostuin=hostuin,
-            attach_token=False,
-            follow_qzone_redirects=True,
-        )
-        return payload
+        data = {
+            "unikey": unikey,
+            "curkey": curkey,
+            "appid": appid,
+            "opuin": self.login_uin,
+            "uin": self.login_uin,
+            "hostuin": hostuin,
+            "fid": fid,
+            "from": 1,
+            "typeid": 0,
+            "abstime": created_at,
+            "active": 0,
+            "fupdate": 1,
+            "opr_type": "like" if like else "unlike",
+            "format": "purejson",
+            "qzreferrer": f"https://user.qzone.qq.com/{hostuin}/mood/{fid}",
+        }
+        attempts: list[dict[str, Any]] = []
+        last_exc: Exception | None = None
+        for path in self._like_endpoint_candidates(like):
+            try:
+                return await self._request_json(
+                    "POST",
+                    path,
+                    data=data,
+                    referer=f"https://user.qzone.qq.com/{hostuin}/mood/{fid}",
+                    origin="https://user.qzone.qq.com",
+                    hostuin=hostuin,
+                    attach_token=False,
+                    follow_qzone_redirects=True,
+                    accept_qzone_redirects=True,
+                    max_attempts=1,
+                )
+            except (QzoneRequestError, QzoneParseError) as exc:
+                last_exc = exc
+                attempts.append(self._like_attempt_detail(path, exc))
+                log.warning(
+                    "qzone like endpoint failed endpoint=%s status=%s message=%s",
+                    path,
+                    getattr(exc, "status_code", None),
+                    getattr(exc, "message", str(exc)),
+                )
+                continue
+
+        if isinstance(last_exc, QzoneRequestError):
+            status_code = last_exc.status_code
+            message = f"{last_exc.message}??????????"
+        elif last_exc is not None:
+            status_code = None
+            message = f"{getattr(last_exc, 'message', str(last_exc))}??????????"
+        else:
+            status_code = None
+            message = "QQ???????????????????"
+        raise QzoneRequestError(message, status_code=status_code, detail={"attempts": attempts}) from last_exc
 
     async def detail(self, hostuin: int, fid: str, *, appid: int = 311, busi_param: str = "") -> dict[str, Any]:
         payload = await self.shuoshuo(fid=fid, uin=hostuin, appid=appid, busi_param=busi_param)
