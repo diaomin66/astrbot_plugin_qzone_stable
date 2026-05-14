@@ -11,7 +11,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
 
@@ -203,7 +203,16 @@ class QzoneClient:
         if parsed.scheme.lower() not in {"http", "https"}:
             return False
         host = (parsed.hostname or "").lower()
-        return host == "qzone.qq.com" or host.endswith(".qzone.qq.com")
+        return host == "qq.com" or host.endswith(".qq.com")
+
+    @staticmethod
+    def _redirect_url_with_params(target_url: str, params: dict[str, Any] | None) -> str:
+        if not params:
+            return target_url
+        parsed = urlparse(target_url)
+        query = parse_qsl(parsed.query, keep_blank_values=True)
+        query.extend((str(key), str(value)) for key, value in params.items())
+        return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
 
     def _persist_cookie_response(self, response: httpx.Response) -> None:
         for key, value in response.cookies.items():
@@ -300,8 +309,9 @@ class QzoneClient:
                             and redirects_left > 0
                             and self._is_allowed_qzone_redirect(str(response.request.url), location)
                         ):
-                            current_url = urljoin(str(response.request.url), location)
-                            current_params = None if urlparse(current_url).query else params
+                            target_url = urljoin(str(response.request.url), location)
+                            current_url = self._redirect_url_with_params(target_url, params)
+                            current_params = None
                             redirects_left -= 1
                             continue
                         raise QzoneRequestError(
@@ -466,6 +476,7 @@ class QzoneClient:
             referer=f"https://user.qzone.qq.com/{self.login_uin}",
             hostuin=self.login_uin,
             attach_token=True,
+            follow_qzone_redirects=True,
         )
         return payload
 
@@ -483,6 +494,7 @@ class QzoneClient:
             referer=f"https://user.qzone.qq.com/{hostuin}",
             hostuin=hostuin,
             attach_token=True,
+            follow_qzone_redirects=True,
         )
         return payload
 
@@ -506,6 +518,7 @@ class QzoneClient:
             origin="https://user.qzone.qq.com",
             hostuin=hostuin,
             attach_token=False,
+            follow_qzone_redirects=True,
         )
         return payload
 
@@ -533,6 +546,7 @@ class QzoneClient:
             origin="https://user.qzone.qq.com",
             hostuin=self.login_uin,
             attach_token=False,
+            follow_qzone_redirects=True,
         )
         return payload
 
@@ -553,6 +567,7 @@ class QzoneClient:
             referer=f"https://user.qzone.qq.com/{uin}/mood/{fid}",
             hostuin=uin,
             attach_token=True,
+            follow_qzone_redirects=True,
         )
         return payload
 

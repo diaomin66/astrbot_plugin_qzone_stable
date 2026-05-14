@@ -197,6 +197,38 @@ class ClientErrorMappingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen[1][2]["hostuin"][0], "123456")
         self.assertEqual(seen[1][2]["fid"][0], "fid-1")
 
+    async def test_legacy_feed_follows_qq_domain_redirect(self):
+        seen = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(str(request.url))
+            if len(seen) == 1:
+                return httpx.Response(
+                    302,
+                    headers={
+                        "location": (
+                            "https://taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6"
+                            "?redirected=1"
+                        )
+                    },
+                    request=request,
+                )
+            return httpx.Response(
+                200,
+                text='_Callback({"msglist":[{"tid":"fid-1","uin":123456,"content":"ok"}]})',
+                request=request,
+            )
+
+        await self._use_response(handler)
+
+        payload = await self.client.legacy_feeds(123456, page=1, num=1)
+
+        self.assertEqual(payload["msglist"][0]["tid"], "fid-1")
+        self.assertEqual(len(seen), 2)
+        self.assertIn("taotao.qq.com", seen[1])
+        self.assertIn("redirected=1", seen[1])
+        self.assertIn("g_tk=", seen[1])
+
     async def test_like_login_redirect_requires_rebind(self):
         await self._use_response(
             lambda request: httpx.Response(
