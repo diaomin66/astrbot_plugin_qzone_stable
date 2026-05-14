@@ -258,6 +258,7 @@ class QzoneStablePlugin(Star):
                 return f"{exc.message}（{', '.join(parts)}）"
         return f"{exc.message}\n{exc.detail}"
 
+
     async def _maybe_await(self, value: Any) -> Any:
         if inspect.isawaitable(value):
             return await value
@@ -915,15 +916,19 @@ class QzoneStablePlugin(Star):
         confirm: bool = False,
         appid: int = 311,
         unlike: bool = False,
+        latest: bool = False,
+        index: int = 0,
     ):
         """点赞或取消点赞一条说说。
 
         Args:
-            hostuin (number): 目标 QQ 号。为 0 且 fid 为数字时，表示最近列表中的编号。
-            fid (string): 说说 fid，或最近列表中的编号。
-            confirm (boolean): 是否确认执行。
-            appid (number): 应用 id。
-            unlike (boolean): 是否取消点赞。
+            hostuin (number): 目标 QQ 号。`0` 表示当前登录 QQ，也可以复用最近一次列出的说说列表上下文。
+            fid (string): 精确的说说 fid。若按“最新一条”或“第 N 条”操作，优先使用 `latest` / `index`，也兼容 `latest`、`第3条` 这类文本引用。
+            confirm (boolean): 兼容旧参数；该工具会直接执行。
+            appid (number): 说说 appid，通常为 `311`。
+            unlike (boolean): 为 `true` 时取消点赞，否则执行点赞。
+            latest (boolean): 为 `true` 时自动定位目标 QQ 的最新一条说说。
+            index (number): 自动定位目标 QQ 的第 N 条说说；`1` 表示最新一条。
         """
         if not self._is_admin(event):
             payload = {
@@ -937,14 +942,19 @@ class QzoneStablePlugin(Star):
                 "reply_guidance": "请用自然语言告诉用户没有权限执行点赞。",
             }
             text = await self._ask_llm_tool_reply(event, payload, "仅管理员可点赞。")
-            yield event.plain_result(
-                text
-            )
+            yield event.plain_result(text)
             return
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
-            payload = await self.controller.like_post(hostuin=hostuin, fid=fid, appid=appid, unlike=unlike)
+            payload = await self.controller.like_post(
+                hostuin=hostuin,
+                fid=fid,
+                appid=appid,
+                unlike=unlike,
+                latest=latest,
+                index=index,
+            )
         except QzoneBridgeError as exc:
             text = await self._ask_llm_tool_reply(
                 event,

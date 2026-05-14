@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,17 @@ from .utils import now_iso, from_iso
 
 log = logging.getLogger(__name__)
 LIKE_VERIFY_RETRY_DELAYS_SECONDS = (0.35, 0.85, 1.6)
+LATEST_FEED_REFERENCES = {
+    "latest",
+    "newest",
+    "recent",
+    "last",
+    "最新",
+    "最新一条",
+    "最近一条",
+    "最后一条",
+}
+FEED_REFERENCE_PATTERN = re.compile(r"^第?\s*(\d+)\s*条?$")
 
 
 class QzoneDaemonService:
@@ -399,14 +411,68 @@ class QzoneDaemonService:
             "raw": payload,
         }
 
-    def _resolve_recent_feed_reference(self, hostuin: int, fid: str, appid: int, curkey: str = "") -> tuple[int, str, int, str]:
+    @staticmethod
+    def _feed_reference_index(fid: str, *, hostuin: int, latest: bool = False, index: int = 0) -> int:
+        if latest:
+            return 1
+        if index > 0:
+            return int(index)
         fid_text = str(fid or "").strip()
+        if not fid_text:
+            return 0
         if not hostuin and fid_text.isdigit():
-            index = int(fid_text) - 1
-            if 0 <= index < len(self.recent_feed_entries):
-                entry = self.recent_feed_entries[index]
-                return entry.hostuin, entry.fid, entry.appid or appid, curkey or entry.curkey
-        return int(hostuin or self.state.session.uin or 0), fid_text, int(appid or 311), curkey
+            return int(fid_text)
+        if fid_text.lower() in LATEST_FEED_REFERENCES or fid_text in LATEST_FEED_REFERENCES:
+            return 1
+        match = FEED_REFERENCE_PATTERN.fullmatch(fid_text)
+        if match and fid_text != match.group(1):
+            return int(match.group(1))
+        return 0
+
+    def _recent_feed_reference(self, reference_index: int, *, hostuin: int) -> FeedEntry | None:
+        if reference_index <= 0 or reference_index > len(self.recent_feed_entries):
+            return None
+        entry = self.recent_feed_entries[reference_index - 1]
+        if hostuin and entry.hostuin != hostuin:
+            return None
+        return entry
+
+    async def _resolve_recent_feed_reference(
+        self,
+        hostuin: int,
+        fid: str,
+        appid: int,
+        curkey: str = "",
+        *,
+        latest: bool = False,
+        index: int = 0,
+    ) -> tuple[int, str, int, str]:
+        fid_text = str(fid or "").strip()
+        target_hostuin = int(hostuin or self.state.session.uin or 0)
+        reference_index = self._feed_reference_index(
+            fid_text,
+            hostuin=int(hostuin or 0),
+            latest=latest,
+            index=index,
+        )
+        if reference_index > 0:
+            cached_entry = self._recent_feed_reference(reference_index, hostuin=target_hostuin if hostuin else 0)
+            if cached_entry is not None:
+                return (
+                    cached_entry.hostuin,
+                    cached_entry.fid,
+                    cached_entry.appid or appid,
+                    curkey or cached_entry.curkey,
+                )
+            if not target_hostuin:
+                raise QzoneNeedsRebind()
+            feed_payload = await self.list_feeds(hostuin=target_hostuin, limit=reference_index, scope="profile")
+            items = feed_payload.get("items") or []
+            if reference_index > len(items):
+                raise QzoneParseError(f"未找到第 {reference_index} 条可点赞的说说")
+            entry = FeedEntry(**items[reference_index - 1])
+            return entry.hostuin, entry.fid, entry.appid or appid, curkey or entry.curkey
+        return target_hostuin, fid_text, int(appid or 311), curkey
 
     @staticmethod
     def _http_like_key(appid: int, hostuin: int, fid: str) -> str:
@@ -443,6 +509,13 @@ class QzoneDaemonService:
                     return entry
         return None
 
+    @staticmethod
+    def _normalize_action_payload(payload: Any) -> dict[str, Any]:
+        payload = unwrap_payload(payload)
+        if isinstance(payload, dict):
+            return payload
+        return {"value": payload}
+
     async def _retry_like_entry_until_fresh(
         self,
         hostuin: int,
@@ -461,13 +534,6 @@ class QzoneDaemonService:
                 return entry
         return entry
 
-    @staticmethod
-    def _normalize_action_payload(payload: Any) -> dict[str, Any]:
-        payload = unwrap_payload(payload)
-        if isinstance(payload, dict):
-            return payload
-        return {"value": payload}
-
     async def like_post(
         self,
         *,
@@ -476,9 +542,18 @@ class QzoneDaemonService:
         appid: int = 311,
         curkey: str = "",
         unlike: bool = False,
+        latest: bool = False,
+        index: int = 0,
     ) -> dict[str, Any]:
         self._ensure_session_ready()
-        hostuin, fid, appid, curkey = self._resolve_recent_feed_reference(hostuin, fid, appid, curkey)
+        hostuin, fid, appid, curkey = await self._resolve_recent_feed_reference(
+            hostuin,
+            fid,
+            appid,
+            curkey,
+            latest=latest,
+            index=index,
+        )
         if not hostuin or not fid:
             raise QzoneParseError("点赞目标不完整，请先选择一条说说")
 
@@ -703,6 +778,8 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
                 appid=int(body.get("appid") or 311),
                 curkey=str(body.get("curkey") or ""),
                 unlike=bool(body.get("unlike") or False),
+                latest=bool(body.get("latest") or False),
+                index=int(body.get("index") or 0),
             )
         except QzoneBridgeError as exc:
             service._set_error(exc)
