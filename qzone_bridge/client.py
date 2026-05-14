@@ -11,7 +11,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 
@@ -38,6 +38,9 @@ AUTH_ERROR_CODES = {-3000}
 AUTH_ERROR_KEYWORDS = ("登录", "失效", "请先登录", "skey", "g_tk", "cookie", "expired", "login")
 LOGIN_REDIRECT_HOSTS = ("ptlogin", "ui.ptlogin", "xui.ptlogin", "ssl.ptlogin", "login")
 QZONE_IMAGE_UPLOAD_URL = "https://up.qzone.qq.com/cgi-bin/upload/cgi_upload_image"
+QZONE_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+QZONE_LIKE_URL = "https://w.qzone.qq.com/cgi-bin/likes/internal_dolike_app"
+QZONE_UNLIKE_URL = "https://w.qzone.qq.com/cgi-bin/likes/internal_unlike_app"
 MAX_UPLOAD_IMAGE_BYTES = 32 * 1024 * 1024
 IMAGE_SOURCE_CACHE_TTL_SECONDS = 10 * 60
 IMAGE_SOURCE_CACHE_MAX_ITEMS = 16
@@ -191,6 +194,17 @@ class QzoneClient:
         uin = str(self.login_uin)
         return lowered.rstrip("/").endswith(f"/{uin}") or lowered.rstrip("/").endswith("user.qzone.qq.com")
 
+    @staticmethod
+    def _is_allowed_qzone_redirect(current_url: str, location: str) -> bool:
+        if not location:
+            return False
+        target = urljoin(current_url, location)
+        parsed = urlparse(target)
+        if parsed.scheme.lower() not in {"http", "https"}:
+            return False
+        host = (parsed.hostname or "").lower()
+        return host == "qzone.qq.com" or host.endswith(".qzone.qq.com")
+
     def _persist_cookie_response(self, response: httpx.Response) -> None:
         for key, value in response.cookies.items():
             if value is not None:
@@ -242,6 +256,7 @@ class QzoneClient:
         hostuin: int | None = None,
         attach_token: bool = False,
         login_required: bool = True,
+        follow_qzone_redirects: bool = False,
     ) -> httpx.Response:
         if login_required and not self.session.cookies:
             raise QzoneNeedsRebind()
@@ -252,35 +267,49 @@ class QzoneClient:
         last_exc: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
             try:
-                response = await self._client.request(
-                    method,
-                    url,
-                    params=params,
-                    data=data,
-                    json=json_body,
-                    headers=self._headers(referer=referer, origin=origin),
-                )
-                self._persist_cookie_response(response)
-                location = response.headers.get("location") or response.headers.get("Location") or ""
-                if response.status_code in (301, 302, 303, 307, 308) and self._is_qzone_home_redirect(response):
-                    raise QzoneRequestError(
-                        "QQ空间 H5 入口跳转到个人主页，已切换备用接口",
-                        status_code=response.status_code,
-                        detail=self._response_detail(response),
+                current_url = url
+                current_params = params
+                redirects_left = 3
+                while True:
+                    response = await self._client.request(
+                        method,
+                        current_url,
+                        params=current_params,
+                        data=data,
+                        json=json_body,
+                        headers=self._headers(referer=referer, origin=origin),
                     )
-                if response.status_code == 401 or (
-                    response.status_code in (301, 302, 303, 307, 308) and self._is_login_redirect(location)
-                ):
-                    raise QzoneNeedsRebind(
-                        "QQ空间登录失效，请重新绑定 Cookie",
-                        detail=self._response_detail(response),
-                    )
-                if response.status_code in (301, 302, 303, 307, 308):
-                    raise QzoneRequestError(
-                        f"QQ空间返回跳转状态码 {response.status_code}",
-                        status_code=response.status_code,
-                        detail=self._response_detail(response),
-                    )
+                    self._persist_cookie_response(response)
+                    location = response.headers.get("location") or response.headers.get("Location") or ""
+                    if response.status_code in QZONE_REDIRECT_STATUS_CODES and self._is_qzone_home_redirect(response):
+                        raise QzoneRequestError(
+                            "QQ空间 H5 入口跳转到个人主页，已切换备用接口",
+                            status_code=response.status_code,
+                            detail=self._response_detail(response),
+                        )
+                    if response.status_code == 401 or (
+                        response.status_code in QZONE_REDIRECT_STATUS_CODES and self._is_login_redirect(location)
+                    ):
+                        raise QzoneNeedsRebind(
+                            "QQ空间登录失效，请重新绑定 Cookie",
+                            detail=self._response_detail(response),
+                        )
+                    if response.status_code in QZONE_REDIRECT_STATUS_CODES:
+                        if (
+                            follow_qzone_redirects
+                            and redirects_left > 0
+                            and self._is_allowed_qzone_redirect(str(response.request.url), location)
+                        ):
+                            current_url = urljoin(str(response.request.url), location)
+                            current_params = None if urlparse(current_url).query else params
+                            redirects_left -= 1
+                            continue
+                        raise QzoneRequestError(
+                            f"QQ空间返回跳转状态码 {response.status_code}",
+                            status_code=response.status_code,
+                            detail=self._response_detail(response),
+                        )
+                    break
                 if response.status_code == 403:
                     raise QzoneRequestError(
                         "QQ空间访问受限或权限不足",
@@ -363,6 +392,7 @@ class QzoneClient:
         hostuin: int | None = None,
         attach_token: bool = False,
         login_required: bool = True,
+        follow_qzone_redirects: bool = False,
     ) -> dict[str, Any]:
         response = await self._request_text(
             method,
@@ -375,6 +405,7 @@ class QzoneClient:
             hostuin=hostuin,
             attach_token=attach_token,
             login_required=login_required,
+            follow_qzone_redirects=follow_qzone_redirects,
         )
         text = response.text.strip()
         payload = self._parse_response_payload(text, response)
@@ -862,11 +893,7 @@ class QzoneClient:
             else compute_unikey(appid, hostuin, fid)
         )
         created_at = cached.created_at if cached else 0
-        path = (
-            "https://user.qzone.qq.com/proxy/domain/w.qzone.qq.com/cgi-bin/likes/internal_dolike_app"
-            if like
-            else "https://user.qzone.qq.com/proxy/domain/w.qzone.qq.com/cgi-bin/likes/internal_unlike_app"
-        )
+        path = QZONE_LIKE_URL if like else QZONE_UNLIKE_URL
         payload = await self._request_json(
             "POST",
             path,
@@ -891,6 +918,7 @@ class QzoneClient:
             origin="https://user.qzone.qq.com",
             hostuin=hostuin,
             attach_token=False,
+            follow_qzone_redirects=True,
         )
         return payload
 

@@ -154,6 +154,61 @@ class ClientErrorMappingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen_form["from"][0], "1")
         self.assertEqual(seen_form["fupdate"][0], "1")
 
+    async def test_like_uses_direct_w_qzone_endpoint(self):
+        seen_requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen_requests.append(request)
+            return httpx.Response(200, json={"code": 0, "message": "ok"}, request=request)
+
+        await self._use_response(handler)
+
+        payload = await self.client.like_post(123456, "fid-1")
+
+        self.assertEqual(payload["message"], "ok")
+        self.assertEqual(len(seen_requests), 1)
+        self.assertEqual(seen_requests[0].url.host, "w.qzone.qq.com")
+        self.assertEqual(seen_requests[0].url.path, "/cgi-bin/likes/internal_dolike_app")
+
+    async def test_like_follows_qzone_redirect_preserving_post_body(self):
+        seen = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            form = parse_qs(request.content.decode())
+            seen.append((request.method, str(request.url), form))
+            if len(seen) == 1:
+                return httpx.Response(
+                    302,
+                    headers={
+                        "location": "https://w.qzone.qq.com/cgi-bin/likes/internal_dolike_app?redirected=1"
+                    },
+                    request=request,
+                )
+            return httpx.Response(200, json={"code": 0, "message": "ok"}, request=request)
+
+        await self._use_response(handler)
+
+        payload = await self.client.like_post(123456, "fid-1")
+
+        self.assertEqual(payload["message"], "ok")
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(seen[1][0], "POST")
+        self.assertIn("redirected=1", seen[1][1])
+        self.assertEqual(seen[1][2]["hostuin"][0], "123456")
+        self.assertEqual(seen[1][2]["fid"][0], "fid-1")
+
+    async def test_like_login_redirect_requires_rebind(self):
+        await self._use_response(
+            lambda request: httpx.Response(
+                302,
+                headers={"location": "https://ptlogin2.qq.com/login"},
+                request=request,
+            )
+        )
+
+        with self.assertRaises(QzoneNeedsRebind):
+            await self.client.like_post(123456, "fid-1")
+
 
 if __name__ == "__main__":
     unittest.main()
