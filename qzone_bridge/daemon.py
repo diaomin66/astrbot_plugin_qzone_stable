@@ -292,7 +292,12 @@ class QzoneDaemonService:
                 feedpage = payload
             else:
                 if page_round == 0 and not next_cursor:
-                    payload = await self.client.profile(hostuin)
+                    try:
+                        payload = await self.client.profile(hostuin)
+                    except QzoneRequestError as exc:
+                        if exc.status_code not in {301, 302, 303, 307, 308}:
+                            raise
+                        payload = await self.client.legacy_feeds(hostuin, page=1, num=max(limit, 20))
                 else:
                     payload = unwrap_payload(await self.client.get_feeds(hostuin, next_cursor))
                 feedpage = payload

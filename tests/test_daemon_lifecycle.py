@@ -115,6 +115,37 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await service.close()
 
+    async def test_profile_list_feeds_falls_back_when_h5_redirects(self):
+        with TemporaryDirectory() as tmp:
+            service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
+            service.state.session = SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+            service.client.update_session(service.state.session)
+            try:
+                with patch.object(
+                    service.client,
+                    "profile",
+                    new=AsyncMock(side_effect=QzoneRequestError("profile redirect", status_code=302)),
+                ) as profile, patch.object(
+                    service.client,
+                    "legacy_feeds",
+                    new=AsyncMock(
+                        return_value={
+                            "msglist": [
+                                {"tid": "fid-latest", "uin": 123456, "content": "latest"}
+                            ]
+                        }
+                    ),
+                ) as legacy:
+                    payload = await service.list_feeds(hostuin=123456, limit=1, scope="profile")
+                profile.assert_awaited_once()
+                legacy.assert_awaited_once_with(123456, page=1, num=20)
+                self.assertEqual(payload["items"][0]["fid"], "fid-latest")
+            finally:
+                await service.close()
+
     async def test_publish_post_does_not_probe_h5_index_for_token(self):
         with TemporaryDirectory() as tmp:
             service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
