@@ -316,7 +316,14 @@ class MainPublishTests(unittest.TestCase):
             collect_async_generator(plugin.tool_like_post(event, hostuin=0, fid="1"))
         )
 
-        plugin.controller.like_post.assert_awaited_once_with(hostuin=0, fid="1", appid=311, unlike=False)
+        plugin.controller.like_post.assert_awaited_once_with(
+            hostuin=0,
+            fid="1",
+            appid=311,
+            unlike=False,
+            latest=False,
+            index=0,
+        )
         self.assertEqual(results[0], "已经帮你点赞成功。")
         plugin._context.llm_generate.assert_awaited_once()
         prompt = plugin._context.llm_generate.await_args.kwargs["prompt"]
@@ -325,6 +332,38 @@ class MainPublishTests(unittest.TestCase):
         self.assertIn("瘦了…………", prompt)
         self.assertNotIn("fid=", results[0])
         self.assertFalse(results[0].lstrip().startswith("{"))
+
+    def test_llm_like_tool_forwards_latest_and_index_reference(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        plugin._context = types.SimpleNamespace(
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="已经帮对方第 2 条说说点赞。")),
+        )
+        plugin.controller.like_post = AsyncMock(
+            return_value={
+                "action": "like",
+                "liked": True,
+                "verified": True,
+                "already": False,
+                "summary": "hello",
+            }
+        )
+        event = Event([])
+
+        asyncio.run(
+            collect_async_generator(
+                plugin.tool_like_post(event, hostuin=3112333596, latest=True, index=2)
+            )
+        )
+
+        plugin.controller.like_post.assert_awaited_once_with(
+            hostuin=3112333596,
+            fid="",
+            appid=311,
+            unlike=False,
+            latest=True,
+            index=2,
+        )
 
     def test_llm_like_tool_ignores_preview_confirmation(self):
         module = self.load_main_module()

@@ -531,6 +531,8 @@ class QzoneDaemonController:
         appid: int = 311,
         curkey: str = "",
         unlike: bool = False,
+        latest: bool = False,
+        index: int = 0,
     ) -> dict[str, Any]:
         return await self._request(
             "POST",
@@ -541,6 +543,8 @@ class QzoneDaemonController:
                 "appid": appid,
                 "curkey": curkey,
                 "unlike": unlike,
+                "latest": latest,
+                "index": index,
             },
         )
 
