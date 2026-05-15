@@ -431,6 +431,68 @@ class QzoneStablePlugin(Star):
                     return value.strip()
         return ""
 
+    @staticmethod
+    def _llm_reply_looks_structured(text: str) -> bool:
+        stripped = str(text or "").strip()
+        if not stripped:
+            return False
+        lowered = stripped.lower()
+        if stripped.startswith(("{", "[", "```")) or "```json" in lowered:
+            return True
+        structured_markers = (
+            '"ok"',
+            '"tool"',
+            '"raw"',
+            '"detail"',
+            '"diagnostic"',
+            '"status_code"',
+            "'ok'",
+            "'tool'",
+            "'raw'",
+            "'detail'",
+            "'diagnostic'",
+            "'status_code'",
+        )
+        return sum(1 for marker in structured_markers if marker in lowered) >= 2
+
+    @staticmethod
+    def _llm_reply_contradicts_payload(text: str, payload: dict[str, Any]) -> bool:
+        if not payload.get("ok") or payload.get("tool") != "qzone_like_post":
+            return False
+        result = payload.get("result")
+        if not isinstance(result, dict) or result.get("verified") is not False:
+            return False
+        lowered = str(text or "").lower()
+        bad_markers = (
+            "ok:false",
+            "ok: false",
+            '"ok":false',
+            '"ok": false',
+            "'ok':false",
+            "'ok': false",
+            "status_code",
+            "403",
+            "failed",
+            "failure",
+            "unsuccessful",
+            "not successful",
+            "intercepted",
+            "\u5931\u8d25",
+            "\u672a\u6210\u529f",
+            "\u4e0d\u6210\u529f",
+            "\u62e6\u622a",
+            "\u672a\u751f\u6548",
+        )
+        return any(marker in lowered for marker in bad_markers)
+
+    @classmethod
+    def _llm_tool_reply_is_safe(cls, text: str, payload: dict[str, Any]) -> bool:
+        if not text.strip():
+            return False
+        if cls._llm_reply_looks_structured(text):
+            return False
+        return not cls._llm_reply_contradicts_payload(text, payload)
+
     async def _current_provider_id(self, event: AstrMessageEvent) -> Any | None:
         context = getattr(self, "_context", None) or getattr(self, "context", None)
         getter = getattr(context, "get_current_chat_provider_id", None)
@@ -457,13 +519,21 @@ class QzoneStablePlugin(Star):
     async def _ask_llm_tool_reply(self, event: AstrMessageEvent, payload: dict[str, Any], fallback: str) -> str:
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         prompt = (
-            "??? QQ ???????? JSON?????????????????????"
-            f"\n{data}\n"
-            "????????????????? JSON?????????tool?code?fid?cursor?raw?detail?diagnostic ??????"
-            "?? ok ? true????????????verified ? false ??? QQ ??????????????????"
-            "?? ok ? false????? diagnostic/status_code/text ???????????????????????????"
+            "You are writing the final user-facing reply for an AstrBot Qzone tool call.\n"
+            "Input JSON:\n"
+            f"{data}\n"
+            "Rules:\n"
+            "- Reply in Chinese, using one or two short natural-language sentences.\n"
+            "- Do not output JSON, Markdown code fences, or field-by-field explanations.\n"
+            "- Do not expose internal keys such as tool, code, fid, cursor, raw, detail, diagnostic, or status_code.\n"
+            "- Treat ok=true as an accepted tool action. Never rewrite ok=true to ok=false.\n"
+            "- For qzone_like_post, verified=false means QQ readback is stale/eventually consistent after an accepted request. It is not a failure by itself.\n"
+            "- Only say the operation failed when ok=false or an error object is present.\n"
         )
-        system_prompt = "?? AstrBot ? QQ ??????????????????????????????????"
+        system_prompt = (
+            "You are a careful AstrBot assistant for Qzone. Preserve the tool result semantics and "
+            "turn the structured payload into concise Chinese user-facing text."
+        )
         context = getattr(self, "_context", None) or getattr(self, "context", None)
 
         generator = getattr(context, "llm_generate", None)
@@ -482,14 +552,18 @@ class QzoneStablePlugin(Star):
                     logger.debug("qzone llm_generate reply failed: %s", exc)
                 else:
                     text = self._text_from_llm_response(response)
-                    if text:
+                    if self._llm_tool_reply_is_safe(text, payload):
                         return text
+                    if text:
+                        logger.warning("discarded unsafe qzone llm tool reply: %s", truncate(text, 300))
             except Exception as exc:
                 logger.debug("qzone llm_generate reply failed: %s", exc)
             else:
                 text = self._text_from_llm_response(response)
-                if text:
+                if self._llm_tool_reply_is_safe(text, payload):
                     return text
+                if text:
+                    logger.warning("discarded unsafe qzone llm tool reply: %s", truncate(text, 300))
 
         provider_getter = getattr(context, "get_using_provider", None)
         provider = None
@@ -527,24 +601,50 @@ class QzoneStablePlugin(Star):
                     logger.debug("qzone provider text_chat reply failed: %s", exc)
                     break
                 text = self._text_from_llm_response(response)
-                if text:
+                if self._llm_tool_reply_is_safe(text, payload):
                     return text
+                if text:
+                    logger.warning("discarded unsafe qzone provider reply: %s", truncate(text, 300))
 
         return fallback
 
     def _llm_like_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         visible_payload = _safe_for_llm(payload)
+        if visible_payload.get("verified") is False:
+            visible_payload.pop("verification", None)
+            visible_payload["accepted"] = True
+            visible_payload["operation_status"] = "accepted_pending_verification"
+            visible_payload["verification_meaning"] = "QQ readback is stale; do not treat this as failure."
+        elif visible_payload.get("verified") is True:
+            visible_payload["accepted"] = True
+            visible_payload["operation_status"] = (
+                "already_in_target_state" if visible_payload.get("already") else "verified_success"
+            )
         return {
             "ok": True,
             "tool": "qzone_like_post",
             "result": visible_payload,
-            "reply_guidance": (
-                "??? result ??????????"
-                "?? verified ? true??? QQ ????????"
-                "?? verified ? false?????????????????"
-                "???? fid?cursor?raw ??????"
-            ),
+            "reply_guidance": [
+                "Reply in Chinese natural language only.",
+                "Do not output JSON or expose internal fields.",
+                "If verified is false but ok is true, say the request was accepted and QQ readback may sync shortly; do not call it a failure.",
+                "Only describe failure when ok is false.",
+            ],
         }
+
+    @staticmethod
+    def _like_fallback_text(payload: dict[str, Any]) -> str:
+        action = "\u53d6\u6d88\u70b9\u8d5e" if payload.get("action") == "unlike" else "\u70b9\u8d5e"
+        summary = truncate(str(payload.get("summary") or "").strip(), 60)
+        target = f"\u300c{summary}\u300d" if summary else "\u8fd9\u6761\u8bf4\u8bf4"
+        if payload.get("verified"):
+            if payload.get("already"):
+                return f"{target}\u5df2\u7ecf\u662f{action}\u72b6\u6001\u4e86\u3002"
+            return f"{target}{action}\u6210\u529f\uff0cQQ \u7a7a\u95f4\u72b6\u6001\u5df2\u786e\u8ba4\u3002"
+        return (
+            f"{target}{action}\u8bf7\u6c42\u5df2\u53d1\u9001\uff0cQQ \u7a7a\u95f4\u8bfb\u56de\u53ef\u80fd\u8fd8\u5728"
+            f"\u540c\u6b65\uff0c\u8fd9\u4e0d\u6309\u5931\u8d25\u5904\u7406\u3002"
+        )
 
     def _llm_error_payload(self, tool: str, exc: QzoneBridgeError) -> dict[str, Any]:
         error: dict[str, Any] = {
@@ -1149,7 +1249,7 @@ class QzoneStablePlugin(Star):
         text = await self._ask_llm_tool_reply(
             event,
             self._llm_like_payload(payload),
-            format_like_result(payload),
+            self._like_fallback_text(payload),
         )
         yield event.plain_result(text)
 
