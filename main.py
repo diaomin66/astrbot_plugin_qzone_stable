@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import importlib
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -31,6 +32,33 @@ SENSITIVE_LOG_KEYS = {
 }
 SENSITIVE_URL_QUERY_KEYS = {"g_tk", "gtk", "p_skey", "skey", "pt4_token", "pt_key", "qzonetoken", "token", "secret"}
 LLM_INTERNAL_KEYS = SENSITIVE_LOG_KEYS | {"raw", "cursor", "fid", "curkey", "unikey", "busi_param"}
+LLM_REPLY_FORBIDDEN_TERMS = (
+    "Result:",
+    "result:",
+    "[TOOL_",
+    "TOOL_",
+    "qzone_like_post",
+    "status_code",
+    "diagnostic",
+    "API",
+    "api",
+    "工具",
+    "系统",
+    "后台",
+    "参数",
+    "指令",
+    "命令",
+    "内部",
+    "错误代码",
+    "状态码",
+    "生成",
+    "绘制",
+    "绘图",
+    "渲染",
+    "处理完成",
+    "任务完成",
+    "已发送",
+)
 
 
 def _redact_url(value: str) -> str:
@@ -99,6 +127,17 @@ def _safe_for_llm(value: Any) -> Any:
     if isinstance(value, (bool, int, float)) or value is None:
         return value
     return truncate(str(value), 500)
+
+
+def _public_error_reason(message: Any) -> str:
+    text = str(message or "").strip()
+    text = re.sub(r"^\s*(?:Result|结果)\s*[:：]\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^\s*\[[A-Z0-9_:-]+\]\s*", "", text)
+    text = re.split(r"(?:\n|【对话要求】|请用|严格禁止|不要提)", text, maxsplit=1)[0].strip()
+    text = text.strip(" \t\r\n:：-—")
+    if not text:
+        return "现在还没办法继续"
+    return truncate(text, 80)
 
 
 def _prepare_local_qzone_bridge_imports() -> None:
@@ -439,6 +478,8 @@ class QzoneStablePlugin(Star):
         lowered = stripped.lower()
         if stripped.startswith(("{", "[", "```")) or "```json" in lowered:
             return True
+        if re.match(r"^\s*(?:result|结果)\s*[:：]", stripped, flags=re.IGNORECASE):
+            return True
         structured_markers = (
             '"ok"',
             '"tool"',
@@ -454,6 +495,11 @@ class QzoneStablePlugin(Star):
             "'status_code'",
         )
         return sum(1 for marker in structured_markers if marker in lowered) >= 2
+
+    @staticmethod
+    def _llm_reply_mentions_forbidden_terms(text: str) -> bool:
+        lowered = text.lower()
+        return any(term.lower() in lowered for term in LLM_REPLY_FORBIDDEN_TERMS)
 
     @staticmethod
     def _llm_reply_contradicts_payload(text: str, payload: dict[str, Any]) -> bool:
@@ -491,7 +537,56 @@ class QzoneStablePlugin(Star):
             return False
         if cls._llm_reply_looks_structured(text):
             return False
+        if cls._llm_reply_mentions_forbidden_terms(text):
+            return False
         return not cls._llm_reply_contradicts_payload(text, payload)
+
+    @staticmethod
+    def _llm_tool_reply_summary(payload: dict[str, Any]) -> str:
+        if payload.get("ok"):
+            result = payload.get("result")
+            if payload.get("tool") == "qzone_like_post" and isinstance(result, dict):
+                unlike = result.get("action") == "unlike"
+                action = "取消点赞" if unlike else "点赞"
+                summary = truncate(str(result.get("summary") or "").strip(), 60)
+                target = f"「{summary}」" if summary else "这条说说"
+                if result.get("already"):
+                    return f"{target}之前已经是{action}状态。"
+                if result.get("verified") is False:
+                    pending = "取消了" if unlike else "点上了"
+                    return f"{target}这次已经{pending}，QQ 空间显示可能会慢一点。"
+                done = "取消掉了" if unlike else "点好了"
+                return f"{target}这次已经{done}。"
+            visible = _safe_for_llm(result)
+            if isinstance(visible, dict):
+                message = visible.get("message") or visible.get("summary") or visible.get("text")
+                if message:
+                    return str(message)
+            return "这件事已经好了。"
+
+        reason = (
+            payload.get("public_reason")
+            or payload.get("public_message")
+            or payload.get("message")
+            or ""
+        )
+        error = payload.get("error")
+        if not reason and isinstance(error, dict):
+            reason = error.get("message") or ""
+        reason_text = _public_error_reason(reason)
+        return f"现在还没办法继续。可参考的简短原因：{reason_text}"
+
+    @staticmethod
+    def _llm_error_fallback_text(message: Any) -> str:
+        reason = _public_error_reason(message)
+        lowered = reason.lower()
+        if "参考图" in reason or "人设" in reason:
+            return "这会儿还没法弄，等参考内容准备好再来吧。"
+        if "cookie" in lowered or "登录" in reason or "登入" in reason:
+            return "这会儿还没法动空间，登录状态得先补一下。"
+        if "权限" in reason or "管理员" in reason:
+            return "这个我现在不能直接动，得让管理员来。"
+        return "这会儿还没法弄，晚点再试一下吧。"
 
     async def _current_provider_id(self, event: AstrMessageEvent) -> Any | None:
         context = getattr(self, "_context", None) or getattr(self, "context", None)
@@ -517,22 +612,21 @@ class QzoneStablePlugin(Star):
         return None
 
     async def _ask_llm_tool_reply(self, event: AstrMessageEvent, payload: dict[str, Any], fallback: str) -> str:
-        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        summary = self._llm_tool_reply_summary(payload)
         prompt = (
-            "You are writing the final user-facing reply for an AstrBot Qzone tool call.\n"
-            "Input JSON:\n"
-            f"{data}\n"
-            "Rules:\n"
-            "- Reply in Chinese, using one or two short natural-language sentences.\n"
-            "- Do not output JSON, Markdown code fences, or field-by-field explanations.\n"
-            "- Do not expose internal keys such as tool, code, fid, cursor, raw, detail, diagnostic, or status_code.\n"
-            "- Treat ok=true as an accepted tool action. Never rewrite ok=true to ok=false.\n"
-            "- For qzone_like_post, verified=false means QQ readback is stale/eventually consistent after an accepted request. It is not a failure by itself.\n"
-            "- Only say the operation failed when ok=false or an error object is present.\n"
+            "下面这句只是给你理解刚才发生了什么，不要照抄，也不要复述成固定格式：\n"
+            f"{summary}\n"
+            "请沿用当前聊天里的人设和说话习惯，给用户回一句自然中文，像真人顺口聊天。\n"
+            "要求：\n"
+            "- 一句话为主，最多两句；可以很短。\n"
+            "- 不要输出 JSON、Markdown 代码块、字段解释、前缀或标签。\n"
+            "- 不要提工具、系统、后台、API、参数、指令、命令、错误代码、状态码或内部流程。\n"
+            "- 不要说“生成”“绘制”“绘图”“渲染”“处理完成”“任务完成”“已发送”。\n"
+            "- 失败或暂时不可用时，只生活化地说现在还不行或晚点再来，不要展开技术原因。\n"
+            "- 成功时随口收尾一句就好；如果只是显示同步慢，不要说成失败。\n"
         )
         system_prompt = (
-            "You are a careful AstrBot assistant for Qzone. Preserve the tool result semantics and "
-            "turn the structured payload into concise Chinese user-facing text."
+            "沿用当前聊天角色和语气。你只负责把结果变成自然口语回复，不能暴露任何内部实现信息。"
         )
         context = getattr(self, "_context", None) or getattr(self, "context", None)
 
@@ -634,37 +728,24 @@ class QzoneStablePlugin(Star):
 
     @staticmethod
     def _like_fallback_text(payload: dict[str, Any]) -> str:
-        action = "\u53d6\u6d88\u70b9\u8d5e" if payload.get("action") == "unlike" else "\u70b9\u8d5e"
+        unlike = payload.get("action") == "unlike"
+        action = "\u53d6\u6d88\u70b9\u8d5e" if unlike else "\u70b9\u8d5e"
         summary = truncate(str(payload.get("summary") or "").strip(), 60)
         target = f"\u300c{summary}\u300d" if summary else "\u8fd9\u6761\u8bf4\u8bf4"
         if payload.get("verified"):
             if payload.get("already"):
-                return f"{target}\u5df2\u7ecf\u662f{action}\u72b6\u6001\u4e86\u3002"
-            return f"{target}{action}\u6210\u529f\uff0cQQ \u7a7a\u95f4\u72b6\u6001\u5df2\u786e\u8ba4\u3002"
-        return (
-            f"{target}{action}\u8bf7\u6c42\u5df2\u53d1\u9001\uff0cQQ \u7a7a\u95f4\u8bfb\u56de\u53ef\u80fd\u8fd8\u5728"
-            f"\u540c\u6b65\uff0c\u8fd9\u4e0d\u6309\u5931\u8d25\u5904\u7406\u3002"
-        )
+                return f"{target}\u4e4b\u524d\u5c31\u5df2\u7ecf{action}\u4e86\u3002"
+            done = "\u53d6\u6d88\u6389" if unlike else "\u70b9\u597d"
+            return f"{target}\u6211\u5e2e\u4f60{done}\u4e86\u3002"
+        pending = "\u53d6\u6d88\u4e86" if unlike else "\u70b9\u4e0a\u4e86"
+        return f"{target}\u6211\u5148\u5e2e\u4f60{pending}\uff0cQQ \u7a7a\u95f4\u90a3\u8fb9\u53ef\u80fd\u8981\u7b49\u4e00\u4f1a\u513f\u624d\u663e\u793a\u3002"
 
     def _llm_error_payload(self, tool: str, exc: QzoneBridgeError) -> dict[str, Any]:
-        error: dict[str, Any] = {
-            "type": type(exc).__name__,
-            "code": exc.code,
-            "message": exc.message,
-        }
-        status_code = getattr(exc, "status_code", None)
-        if status_code is not None:
-            error["status_code"] = status_code
-        result: dict[str, Any] = {
+        return {
             "ok": False,
-            "tool": tool,
-            "error": error,
-            "reply_guidance": "??? error ? diagnostic ?????????????????????????",
+            "public_reason": _public_error_reason(exc.message),
+            "reply_guidance": "Use a short natural reply in the active persona. Do not expose error details.",
         }
-        diagnostic = _safe_for_llm(exc.detail)
-        if diagnostic not in (None, {}, []):
-            result["diagnostic"] = diagnostic
-        return result
 
     async def _ensure_daemon(self, *, allow_needs_rebind: bool = False) -> None:
         status = await self.controller.get_status()
@@ -1202,7 +1283,7 @@ class QzoneStablePlugin(Star):
             "index": index,
         }
         if not self._is_admin(event):
-            payload = {
+            log_payload = {
                 "ok": False,
                 "tool": "qzone_like_post",
                 "error": {
@@ -1210,10 +1291,18 @@ class QzoneStablePlugin(Star):
                     "code": "QZONE_PERMISSION",
                     "message": "????????",
                 },
-                "reply_guidance": "???????????????????",
             }
-            self._log_tool_call_result({**payload, "arguments": arguments})
-            text = await self._ask_llm_tool_reply(event, payload, "????????")
+            self._log_tool_call_result({**log_payload, "arguments": arguments})
+            llm_payload = {
+                "ok": False,
+                "public_reason": "????????",
+                "reply_guidance": "Use a short natural reply in the active persona. Do not expose error details.",
+            }
+            text = await self._ask_llm_tool_reply(
+                event,
+                llm_payload,
+                self._llm_error_fallback_text("????????"),
+            )
             yield event.plain_result(text)
             return
         try:
@@ -1234,7 +1323,7 @@ class QzoneStablePlugin(Star):
             text = await self._ask_llm_tool_reply(
                 event,
                 llm_payload,
-                exc.message,
+                self._llm_error_fallback_text(exc.message),
             )
             yield event.plain_result(text)
             return
