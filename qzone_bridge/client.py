@@ -35,7 +35,16 @@ from .utils import extract_callback_json, json_loads, now_iso
 log = logging.getLogger(__name__)
 
 AUTH_ERROR_CODES = {-3000}
-AUTH_ERROR_KEYWORDS = ("??", "??", "????", "skey", "g_tk", "cookie", "expired", "login")
+AUTH_ERROR_KEYWORDS = (
+    "\u767b\u5f55",
+    "\u5931\u6548",
+    "\u8bf7\u5148\u767b\u5f55",
+    "skey",
+    "g_tk",
+    "cookie",
+    "expired",
+    "login",
+)
 LOGIN_REDIRECT_HOSTS = ("ptlogin", "ui.ptlogin", "xui.ptlogin", "ssl.ptlogin", "login")
 QZONE_IMAGE_UPLOAD_URL = "https://up.qzone.qq.com/cgi-bin/upload/cgi_upload_image"
 QZONE_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}

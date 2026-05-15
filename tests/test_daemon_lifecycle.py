@@ -25,6 +25,34 @@ def free_port() -> int:
 
 
 class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
+    def test_feed_reference_markers_are_ascii_safe_for_installers(self):
+        source = Path(__file__).resolve().parents[1] / "qzone_bridge" / "daemon.py"
+        lines = source.read_text(encoding="utf-8").splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith("LATEST_FEED_REFERENCES"))
+        end = next(i for i, line in enumerate(lines[start:], start) if line.startswith("FEED_REFERENCE_SUFFIXES"))
+        critical_block = "\n".join(lines[start : end + 1])
+
+        self.assertTrue(critical_block.isascii(), critical_block)
+        self.assertNotIn("re.compile", critical_block)
+
+    def test_feed_reference_index_uses_ascii_safe_localized_markers(self):
+        self.assertEqual(
+            QzoneDaemonService._feed_reference_index("\u6700\u65b0\u4e00\u6761", hostuin=123456),
+            1,
+        )
+        self.assertEqual(
+            QzoneDaemonService._feed_reference_index("\u7b2c 2 \u6761", hostuin=123456),
+            2,
+        )
+        self.assertEqual(
+            QzoneDaemonService._feed_reference_index("\u7b2c\uff12\u6761", hostuin=123456),
+            2,
+        )
+        self.assertEqual(QzoneDaemonService._feed_reference_index("?2?", hostuin=123456), 2)
+        self.assertEqual(QzoneDaemonService._feed_reference_index("??2??", hostuin=123456), 2)
+        self.assertEqual(QzoneDaemonService._feed_reference_index("????", hostuin=123456), 1)
+        self.assertEqual(QzoneDaemonService._feed_reference_index("2", hostuin=123456), 0)
+
     async def test_warmup_uses_json_health_check_instead_of_h5_index(self):
         with TemporaryDirectory() as tmp:
             service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())

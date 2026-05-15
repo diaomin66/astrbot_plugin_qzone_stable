@@ -322,7 +322,10 @@ class MainPublishTests(unittest.TestCase):
 
         plugin.controller.publish_post.assert_awaited_once()
         self.assertEqual(plugin.controller.publish_post.await_args.kwargs["media"], [])
-        self.assertEqual(plugin.controller.publish_post.await_args.kwargs["content"], "report\n[??: report.pdf]")
+        self.assertEqual(
+            plugin.controller.publish_post.await_args.kwargs["content"],
+            "report\n[\u6587\u4ef6: report.pdf]",
+        )
         self.assertTrue(Path(results[0]["image"]).exists())
 
     def test_qzone_post_renders_logged_in_qzone_publisher(self):
