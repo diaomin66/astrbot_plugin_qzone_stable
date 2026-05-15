@@ -68,25 +68,25 @@ class ClientErrorMappingTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(QzoneRequestError) as caught:
             await self.client._request_text("GET", "https://h5.qzone.qq.com/mqzone/profile")
         self.assertEqual(caught.exception.status_code, 403)
-        self.assertIn("权限", caught.exception.message)
+        self.assertIn("??", caught.exception.message)
 
     async def test_payload_login_code_requires_rebind(self):
         await self._use_response(
-            lambda request: httpx.Response(200, json={"code": -3000, "message": "登录态失效"}, request=request)
+            lambda request: httpx.Response(200, json={"code": -3000, "message": "?????"}, request=request)
         )
         with self.assertRaises(QzoneNeedsRebind):
             await self.client._request_json("GET", "https://mobile.qzone.qq.com/feeds/mfeeds_get_count")
 
     async def test_payload_login_code_inside_data_requires_rebind(self):
         await self._use_response(
-            lambda request: httpx.Response(200, json={"data": {"code": -3000, "message": "登录态失效"}}, request=request)
+            lambda request: httpx.Response(200, json={"data": {"code": -3000, "message": "?????"}}, request=request)
         )
         with self.assertRaises(QzoneNeedsRebind):
             await self.client._request_json("GET", "https://mobile.qzone.qq.com/feeds/mfeeds_get_count")
 
     async def test_generic_negative_code_is_not_forced_to_rebind(self):
         await self._use_response(
-            lambda request: httpx.Response(200, json={"code": -10000, "message": "系统繁忙"}, request=request)
+            lambda request: httpx.Response(200, json={"code": -10000, "message": "????"}, request=request)
         )
         with self.assertRaises(QzoneRequestError) as caught:
             await self.client._request_json("GET", "https://mobile.qzone.qq.com/feeds/mfeeds_get_count")
@@ -154,7 +154,7 @@ class ClientErrorMappingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen_form["from"][0], "1")
         self.assertEqual(seen_form["fupdate"][0], "1")
 
-    async def test_like_uses_direct_w_qzone_endpoint(self):
+    async def test_like_tries_proxy_endpoint_first(self):
         seen_requests = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -167,8 +167,63 @@ class ClientErrorMappingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload["message"], "ok")
         self.assertEqual(len(seen_requests), 1)
-        self.assertEqual(seen_requests[0].url.host, "w.qzone.qq.com")
-        self.assertEqual(seen_requests[0].url.path, "/cgi-bin/likes/internal_dolike_app")
+        self.assertEqual(seen_requests[0].url.host, "user.qzone.qq.com")
+        self.assertEqual(
+            seen_requests[0].url.path,
+            "/proxy/domain/w.qzone.qq.com/cgi-bin/likes/internal_dolike_app",
+        )
+
+    async def test_like_falls_back_to_direct_when_proxy_is_unavailable(self):
+        seen_hosts = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen_hosts.append(request.url.host)
+            if request.url.host == "user.qzone.qq.com":
+                return httpx.Response(503, text="proxy unavailable", request=request)
+            return httpx.Response(200, json={"code": 0, "message": "ok"}, request=request)
+
+        await self._use_response(handler)
+
+        payload = await self.client.like_post(123456, "fid-1")
+
+        self.assertEqual(payload["message"], "ok")
+        self.assertEqual(seen_hosts, ["user.qzone.qq.com", "w.qzone.qq.com"])
+
+    async def test_like_reports_all_endpoint_attempts_when_both_fail(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(503, text=f"{request.url.host} unavailable", request=request)
+
+        await self._use_response(handler)
+
+        with self.assertRaises(QzoneRequestError) as caught:
+            await self.client.like_post(123456, "fid-1")
+
+        self.assertIn("?????????", caught.exception.message)
+        self.assertEqual(caught.exception.status_code, 503)
+        attempts = caught.exception.detail["attempts"]
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0]["status_code"], 503)
+        self.assertEqual(attempts[0]["detail"]["text"], "user.qzone.qq.com unavailable")
+        self.assertEqual(attempts[1]["detail"]["text"], "w.qzone.qq.com unavailable")
+
+    async def test_like_accepts_post_action_redirect_without_following_page(self):
+        seen = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(str(request.url))
+            return httpx.Response(
+                302,
+                headers={"location": "https://user.qzone.qq.com/123456/mood/fid-1"},
+                request=request,
+            )
+
+        await self._use_response(handler)
+
+        payload = await self.client.like_post(123456, "fid-1")
+
+        self.assertEqual(payload["message"], "accepted redirect")
+        self.assertEqual(payload["redirect"]["status_code"], 302)
+        self.assertEqual(len(seen), 1)
 
     async def test_like_follows_qzone_redirect_preserving_post_body(self):
         seen = []

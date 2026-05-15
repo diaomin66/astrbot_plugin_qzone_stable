@@ -3,8 +3,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, patch
 
+import httpx
+
 from qzone_bridge.controller import QzoneDaemonController
-from qzone_bridge.errors import DaemonUnavailableError
+from qzone_bridge.errors import DaemonUnavailableError, QzoneRequestError
 
 
 class ControllerBindTests(unittest.IsolatedAsyncioTestCase):
@@ -125,6 +127,47 @@ class ControllerBindTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(request.await_args.kwargs["json_body"]["content"], "qzone post literal")
                 self.assertTrue(request.await_args.kwargs["json_body"]["content_sanitized"])
                 self.assertEqual(payload["fid"], "fid-1")
+            finally:
+                await controller.close()
+
+    async def test_daemon_request_error_preserves_status_code_from_detail(self):
+        with TemporaryDirectory() as tmp:
+            controller = QzoneDaemonController(
+                plugin_root=Path(tmp),
+                data_dir=Path(tmp) / "data",
+                default_port=19009,
+                request_timeout=1.0,
+                start_timeout=1.0,
+                keepalive_interval=30,
+                user_agent="test-agent",
+                auto_start_daemon=False,
+            )
+            try:
+                controller._runtime()
+                response = httpx.Response(
+                    400,
+                    json={
+                        "ok": False,
+                        "error": {
+                            "code": "QZONE_REQUEST",
+                            "message": "QQ?????????? (503)",
+                            "detail": {
+                                "status_code": 503,
+                                "url": "https://w.qzone.qq.com/cgi-bin/likes/internal_dolike_app",
+                                "text": "service unavailable",
+                            },
+                        },
+                    },
+                )
+                with patch.object(controller, "_probe_health", new=AsyncMock(return_value=True)), patch.object(
+                    controller._client,
+                    "request",
+                    new=AsyncMock(return_value=response),
+                ):
+                    with self.assertRaises(QzoneRequestError) as caught:
+                        await controller.like_post(hostuin=123456, fid="fid-1")
+                self.assertEqual(caught.exception.status_code, 503)
+                self.assertEqual(caught.exception.detail["text"], "service unavailable")
             finally:
                 await controller.close()
 

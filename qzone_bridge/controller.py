@@ -12,6 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 
@@ -25,6 +26,8 @@ from .utils import now_iso
 
 
 log = logging.getLogger(__name__)
+SENSITIVE_DETAIL_KEYS = {"cookie", "cookies", "p_skey", "skey", "pt4_token", "pt_key", "qzonetoken", "secret", "token"}
+SENSITIVE_URL_QUERY_KEYS = {"g_tk", "gtk", "p_skey", "skey", "pt4_token", "pt_key", "qzonetoken", "token", "secret"}
 
 
 def _port_is_free(port: int) -> bool:
@@ -115,6 +118,64 @@ def _is_plugin_daemon_pid(pid: int, plugin_root: Path) -> bool:
         return False
     root = str(plugin_root).lower()
     return "daemon_main.py" in command_line and root in command_line
+
+
+def _detail_status_code(detail: Any) -> int | None:
+    if not isinstance(detail, dict):
+        return None
+    raw_status = detail.get("status_code")
+    if raw_status is None:
+        attempts = detail.get("attempts")
+        if isinstance(attempts, list):
+            for attempt in reversed(attempts):
+                if isinstance(attempt, dict) and attempt.get("status_code") is not None:
+                    raw_status = attempt.get("status_code")
+                    break
+    try:
+        return int(raw_status) if raw_status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _redact_url(value: str) -> str:
+    try:
+        parsed = urlparse(value)
+    except Exception:
+        return value
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return value
+    query = []
+    changed = False
+    for key, item_value in parse_qsl(parsed.query, keep_blank_values=True):
+        lowered = key.lower()
+        if lowered in SENSITIVE_URL_QUERY_KEYS or "token" in lowered or "skey" in lowered:
+            query.append((key, "***"))
+            changed = True
+        else:
+            query.append((key, item_value))
+    if not changed:
+        return value
+    return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
+
+
+def _redact_detail_for_log(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            lowered = key_text.lower()
+            if lowered in SENSITIVE_DETAIL_KEYS or "cookie" in lowered or "skey" in lowered or "secret" in lowered:
+                redacted[key_text] = "***"
+            else:
+                redacted[key_text] = _redact_detail_for_log(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_detail_for_log(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_detail_for_log(item) for item in value]
+    if isinstance(value, str):
+        return _redact_url(value)
+    return value
 
 
 def _terminate_pid_tree(pid: int, *, force: bool = False) -> None:
@@ -305,7 +366,7 @@ class QzoneDaemonController:
                 self.store.write(state)
 
             if not self._daemon_script().exists():
-                raise DaemonUnavailableError("找不到 daemon_main.py")
+                raise DaemonUnavailableError("??? daemon_main.py")
 
             self._process = self._spawn_daemon(port)
 
@@ -330,7 +391,7 @@ class QzoneDaemonController:
                     break
                 await asyncio.sleep(0.5)
 
-            raise DaemonUnavailableError("QQ空间 daemon 启动失败")
+            raise DaemonUnavailableError("QQ?? daemon ????")
 
     async def _request(
         self,
@@ -348,7 +409,7 @@ class QzoneDaemonController:
                 await self.ensure_running()
                 runtime = self._runtime()
             elif not await self._probe_health(runtime.daemon_port):
-                raise DaemonUnavailableError("daemon 未运行")
+                raise DaemonUnavailableError("daemon ???")
             try:
                 response = await self._client.request(
                     method,
@@ -363,29 +424,36 @@ class QzoneDaemonController:
                 last_exc = exc
                 if not self.auto_start_daemon or attempt > 0:
                     raise DaemonUnavailableError(
-                        "daemon 请求失败",
+                        "daemon ????",
                         detail={"error": str(exc), "path": path},
                     ) from exc
         if response is None:
             raise DaemonUnavailableError(
-                "daemon 请求失败",
+                "daemon ????",
                 detail={"error": str(last_exc), "path": path},
             )
         try:
             payload = response.json()
         except Exception as exc:
-            raise DaemonUnavailableError("daemon 返回了非 JSON 响应", detail={"text": response.text[:500]}) from exc
+            raise DaemonUnavailableError("daemon ???? JSON ??", detail={"text": response.text[:500]}) from exc
         if not payload.get("ok", False):
             error = payload.get("error") or {}
             code = str(error.get("code") or "DAEMON_ERROR")
             message = str(error.get("message") or "daemon error")
             detail = error.get("detail")
+            log.warning(
+                "qzone daemon request failed path=%s code=%s message=%s detail=%s",
+                path,
+                code,
+                message,
+                _redact_detail_for_log(detail),
+            )
             if code == "QZONE_AUTH":
                 raise QzoneNeedsRebind(message, detail=detail)
             if code == "QZONE_PARSE":
                 raise QzoneParseError(message, detail=detail)
             if code == "QZONE_REQUEST":
-                raise QzoneRequestError(message, detail=detail)
+                raise QzoneRequestError(message, status_code=_detail_status_code(detail), detail=detail)
             raise DaemonUnavailableError(message, detail=detail)
         return payload.get("data")
 
@@ -402,10 +470,10 @@ class QzoneDaemonController:
     @staticmethod
     def cookie_summary(cookies: dict[str, str]) -> str:
         if not cookies:
-            return "未绑定"
+            return "???"
         keys = ["uin", "p_uin", "skey", "p_skey", "pt4_token", "pt_key"]
         found = [key for key in keys if key in cookies]
-        return f"{len(cookies)}个字段: " + ", ".join(found or ["未知字段"])
+        return f"{len(cookies)}???: " + ", ".join(found or ["????"])
 
     async def bind_cookie(self, cookie_text: str, *, uin: int = 0, source: str = "manual") -> dict[str, Any]:
         return await self._request("POST", "/bind", json_body={"cookie_text": cookie_text, "uin": uin, "source": source})
@@ -418,10 +486,10 @@ class QzoneDaemonController:
         except DaemonUnavailableError:
             cookies = parse_cookie_text(cookie_text)
             if not cookies:
-                raise QzoneParseError("Cookie 为空，无法绑定")
+                raise QzoneParseError("Cookie ???????")
             resolved_uin = normalize_uin(cookies, override=uin)
             if not resolved_uin:
-                raise QzoneParseError("Cookie 中未找到 uin / p_uin，请补齐后重试")
+                raise QzoneParseError("Cookie ???? uin / p_uin???????")
 
             state = self.store.read()
             runtime = self._runtime()

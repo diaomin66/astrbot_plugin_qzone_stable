@@ -53,7 +53,7 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
             service.client.update_session(service.state.session)
             service.health_state = "ready"
 
-            service._set_error(QzoneRequestError("无权限访问", status_code=403))
+            service._set_error(QzoneRequestError("?????", status_code=403))
 
             self.assertEqual(service.health_state, "ready")
             self.assertFalse(service.state.session.needs_rebind)
@@ -567,7 +567,7 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
                     hostuin=3112333596,
                     fid="1c7182b96589046ad3380900",
                     appid=311,
-                    summary="瘦了…………",
+                    summary="??????",
                     liked=False,
                     curkey="cached-curkey",
                 )
@@ -575,13 +575,13 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
             before = {
                 "tid": "1c7182b96589046ad3380900",
                 "uin": 3112333596,
-                "content": "瘦了…………",
+                "content": "??????",
                 "like": {"isliked": "0"},
             }
             after = {
                 "tid": "1c7182b96589046ad3380900",
                 "uin": 3112333596,
-                "content": "瘦了…………",
+                "content": "??????",
                 "like": {"isliked": "1"},
             }
             try:
@@ -595,7 +595,7 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(args[:2], (3112333596, "1c7182b96589046ad3380900"))
                 self.assertEqual(kwargs["curkey"], "cached-curkey")
                 self.assertTrue(payload["verified"])
-                self.assertEqual(payload["summary"], "瘦了…………")
+                self.assertEqual(payload["summary"], "??????")
             finally:
                 await service.close()
 
@@ -656,6 +656,64 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await service.close()
 
+    async def test_like_post_resolves_latest_reference_from_legacy_when_profile_5xx(self):
+        with TemporaryDirectory() as tmp:
+            service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
+            service.state.session = SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+            service.client.update_session(service.state.session)
+            legacy = {
+                "msglist": [
+                    {
+                        "tid": "fid-latest",
+                        "uin": 123456,
+                        "content": "legacy latest post",
+                        "isliked": "0",
+                    }
+                ]
+            }
+            before = {
+                "tid": "fid-latest",
+                "uin": 123456,
+                "content": "legacy latest post",
+                "like": {"isliked": "0"},
+            }
+            after = {
+                "tid": "fid-latest",
+                "uin": 123456,
+                "content": "legacy latest post",
+                "like": {"isliked": "1"},
+            }
+            try:
+                with patch.object(
+                    service.client,
+                    "profile",
+                    new=AsyncMock(side_effect=QzoneRequestError("profile unavailable", status_code=503)),
+                ) as profile, patch.object(
+                    service.client,
+                    "legacy_feeds",
+                    new=AsyncMock(return_value=legacy),
+                ) as legacy_feeds, patch.object(
+                    service.client,
+                    "detail",
+                    new=AsyncMock(side_effect=[before, after]),
+                ), patch.object(
+                    service.client,
+                    "like_post",
+                    new=AsyncMock(return_value={"message": "ok"}),
+                ) as like:
+                    payload = await service.like_post(hostuin=0, fid="", latest=True)
+                profile.assert_awaited_once_with(123456)
+                legacy_feeds.assert_awaited_once_with(123456, page=1, num=20)
+                args, _ = like.await_args
+                self.assertEqual(args[:2], (123456, "fid-latest"))
+                self.assertTrue(payload["verified"])
+                self.assertEqual(payload["summary"], "legacy latest post")
+            finally:
+                await service.close()
+
     async def test_like_post_resolves_named_index_reference_for_specific_host(self):
         with TemporaryDirectory() as tmp:
             service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
@@ -709,7 +767,7 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
                     "like_post",
                     new=AsyncMock(return_value={"message": "ok"}),
                 ) as like:
-                    payload = await service.like_post(hostuin=3112333596, fid="第2条")
+                    payload = await service.like_post(hostuin=3112333596, fid="?2?")
                 feeds.assert_awaited_once_with(hostuin=3112333596, limit=2, scope="profile")
                 args, kwargs = like.await_args
                 self.assertEqual(args[:2], (3112333596, "fid-2"))
