@@ -1,4 +1,5 @@
 import unittest
+import socket
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, patch
@@ -7,6 +8,13 @@ import httpx
 
 from qzone_bridge.controller import QzoneDaemonController
 from qzone_bridge.errors import DaemonUnavailableError, QzoneRequestError
+from qzone_bridge.models import SessionState
+
+
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 class ControllerBindTests(unittest.IsolatedAsyncioTestCase):
@@ -58,6 +66,7 @@ class ControllerBindTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(state.session.cookies["p_skey"], "def")
                 self.assertGreaterEqual(payload["cookie_count"], 4)
                 self.assertEqual(payload["login_uin"], 123456)
+                self.assertEqual(payload["session_source"], "aiocqhttp")
             finally:
                 await controller.close()
 
@@ -127,6 +136,44 @@ class ControllerBindTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(request.await_args.kwargs["json_body"]["content"], "qzone post literal")
                 self.assertTrue(request.await_args.kwargs["json_body"]["content_sanitized"])
                 self.assertEqual(payload["fid"], "fid-1")
+            finally:
+                await controller.close()
+
+    async def test_ensure_running_records_crashed_daemon_start_detail(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "daemon_main.py").write_text(
+                "import sys\nprint('daemon boom', file=sys.stderr)\nraise SystemExit(7)\n",
+                encoding="utf-8",
+            )
+            controller = QzoneDaemonController(
+                plugin_root=root,
+                data_dir=root / "data",
+                default_port=free_port(),
+                request_timeout=0.5,
+                start_timeout=2.0,
+                keepalive_interval=30,
+                user_agent="test-agent",
+            )
+            try:
+                state = controller.store.read()
+                state.session = SessionState(
+                    uin=123456,
+                    cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+                    needs_rebind=False,
+                )
+                controller.store.write(state)
+
+                with self.assertRaises(DaemonUnavailableError) as caught:
+                    await controller.ensure_running()
+
+                detail = caught.exception.detail
+                self.assertEqual(detail["returncode"], 7)
+                self.assertIn("daemon.log", detail["log_path"])
+                self.assertIn("daemon boom", detail["log_tail"])
+                stored_error = controller.store.read().session.last_error
+                self.assertEqual(stored_error["type"], "DaemonUnavailableError")
+                self.assertIn("daemon boom", stored_error["detail"]["log_tail"])
             finally:
                 await controller.close()
 

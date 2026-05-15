@@ -248,6 +248,49 @@ class QzoneDaemonController:
     def _daemon_script(self) -> Path:
         return self.plugin_root / "daemon_main.py"
 
+    def _daemon_log_path(self) -> Path:
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        return self.data_dir / "daemon.log"
+
+    @staticmethod
+    def _tail_text(path: Path, *, max_chars: int = 4000) -> str:
+        try:
+            if not path.exists():
+                return ""
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return ""
+        if len(text) <= max_chars:
+            return text
+        return text[-max_chars:]
+
+    def _daemon_start_detail(self, port: int, *, returncode: int | None = None, error: str = "") -> dict[str, Any]:
+        log_path = self._daemon_log_path()
+        detail: dict[str, Any] = {
+            "daemon_port": int(port or 0),
+            "log_path": str(log_path),
+        }
+        if returncode is not None:
+            detail["returncode"] = returncode
+        if error:
+            detail["error"] = error
+        log_tail = self._tail_text(log_path)
+        if log_tail:
+            detail["log_tail"] = log_tail
+        return detail
+
+    def _record_daemon_start_error(self, exc: DaemonUnavailableError, *, port: int) -> None:
+        self._invalidate_health_cache()
+        state = self.store.read()
+        state.runtime.daemon_pid = 0
+        state.runtime.daemon_port = int(port or state.runtime.daemon_port or self.default_port or 0)
+        state.session.last_error = {
+            "type": type(exc).__name__,
+            "message": exc.message,
+            "detail": exc.detail,
+        }
+        self.store.write(state)
+
     def _invalidate_health_cache(self) -> None:
         self._health_cache = None
 
@@ -277,7 +320,15 @@ class QzoneDaemonController:
         env = os.environ.copy()
         env["QZONE_BRIDGE_PLUGIN_ROOT"] = str(self.plugin_root)
         kwargs["env"] = env
-        return subprocess.Popen(cmd, cwd=str(self.plugin_root), **kwargs)
+        log_path = self._daemon_log_path()
+        log_file = log_path.open("a", encoding="utf-8", buffering=1)
+        try:
+            log_file.write(f"\n[{now_iso()}] starting qzone daemon on 127.0.0.1:{port}\n")
+            kwargs["stdout"] = log_file
+            kwargs["stderr"] = log_file
+            return subprocess.Popen(cmd, cwd=str(self.plugin_root), **kwargs)
+        finally:
+            log_file.close()
 
     async def _probe_health(
         self,
@@ -337,6 +388,7 @@ class QzoneDaemonController:
             "started_at": runtime.started_at,
             "last_seen_at": runtime.last_seen_at,
             "login_uin": state.session.uin,
+            "session_source": state.session.source,
             "cookie_summary": self.cookie_summary(state.session.cookies),
             "cookie_count": len(state.session.cookies),
             "needs_rebind": state.session.needs_rebind or not bool(state.session.cookies),
@@ -356,19 +408,41 @@ class QzoneDaemonController:
 
             if not _port_is_free(port):
                 candidate = port
+                found_port = 0
                 for _ in range(32):
                     candidate += 1
                     if _port_is_free(candidate):
-                        port = candidate
+                        found_port = candidate
                         break
+                if not found_port:
+                    exc = DaemonUnavailableError(
+                        "QQ?? daemon ????????????????",
+                        detail={"daemon_port": port, "checked_ports": f"{port + 1}-{port + 32}"},
+                    )
+                    self._record_daemon_start_error(exc, port=port)
+                    raise exc
+                port = found_port
                 state = self.store.read()
                 state.runtime.daemon_port = port
                 self.store.write(state)
 
             if not self._daemon_script().exists():
-                raise DaemonUnavailableError("??? daemon_main.py")
+                exc = DaemonUnavailableError(
+                    "??? daemon_main.py",
+                    detail={"path": str(self._daemon_script())},
+                )
+                self._record_daemon_start_error(exc, port=port)
+                raise exc
 
-            self._process = self._spawn_daemon(port)
+            try:
+                self._process = self._spawn_daemon(port)
+            except OSError as exc:
+                error = DaemonUnavailableError(
+                    "QQ?? daemon ????",
+                    detail=self._daemon_start_detail(port, error=str(exc)),
+                )
+                self._record_daemon_start_error(error, port=port)
+                raise error from exc
 
             deadline = asyncio.get_running_loop().time() + self.start_timeout
             while asyncio.get_running_loop().time() < deadline:
@@ -379,6 +453,8 @@ class QzoneDaemonController:
                     runtime.last_seen_at = now_iso()
                     state = self.store.read()
                     state.runtime = runtime
+                    if isinstance(state.session.last_error, dict) and state.session.last_error.get("type") == "DaemonUnavailableError":
+                        state.session.last_error = None
                     self.store.write(state)
                     self._health_cache = (
                         port,
@@ -391,7 +467,13 @@ class QzoneDaemonController:
                     break
                 await asyncio.sleep(0.5)
 
-            raise DaemonUnavailableError("QQ?? daemon ????")
+            returncode = self._process.poll() if self._process else None
+            error = DaemonUnavailableError(
+                "QQ?? daemon ????",
+                detail=self._daemon_start_detail(port, returncode=returncode),
+            )
+            self._record_daemon_start_error(error, port=port)
+            raise error
 
     async def _request(
         self,

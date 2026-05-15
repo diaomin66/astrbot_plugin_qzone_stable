@@ -374,6 +374,40 @@ class QzoneStablePlugin(Star):
             "detail": exc.detail,
         }
 
+    @staticmethod
+    def _status_error_payload(exc: QzoneBridgeError) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "type": type(exc).__name__,
+            "code": exc.code,
+            "message": exc.message,
+        }
+        detail = _safe_for_llm(exc.detail)
+        if detail not in (None, {}, []):
+            payload["detail"] = detail
+        return payload
+
+    async def _status_with_recovery(self) -> dict[str, Any]:
+        status = await self.controller.get_status()
+        should_start = (
+            self.settings.auto_start_daemon
+            and status.get("daemon_state") != "ready"
+            and int(status.get("cookie_count") or 0) > 0
+            and not bool(status.get("needs_rebind"))
+        )
+        if not should_start:
+            return status
+        try:
+            return await self.controller.ensure_running()
+        except QzoneBridgeError as exc:
+            try:
+                detail_text = json.dumps(_redact_for_log(exc.detail), ensure_ascii=False, default=str)
+            except Exception:
+                detail_text = str(_redact_for_log(exc.detail))
+            logger.warning("qzone daemon status recovery failed: %s detail=%s", exc.message, detail_text)
+            fallback = await self.controller.get_status(probe_daemon=False)
+            fallback["daemon_start_error"] = self._status_error_payload(exc)
+            return fallback
+
 
     async def _maybe_await(self, value: Any) -> Any:
         if inspect.isawaitable(value):
@@ -745,7 +779,7 @@ class QzoneStablePlugin(Star):
             yield self._command_result(event, "??????????")
             return
         try:
-            payload = await self.controller.get_status()
+            payload = await self._status_with_recovery()
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
             return
@@ -763,6 +797,10 @@ class QzoneStablePlugin(Star):
             yield self._command_result(event, self._error_text(exc))
             return
         self._schedule_daemon_warmup("manual bind")
+        try:
+            payload = await self._status_with_recovery()
+        except QzoneBridgeError:
+            pass
         yield self._command_result(event, format_status(payload))
 
     @qzone.command("autobind")
@@ -777,6 +815,10 @@ class QzoneStablePlugin(Star):
             yield self._command_result(event, self._error_text(exc))
             return
         self._schedule_daemon_warmup("autobind")
+        try:
+            payload = await self._status_with_recovery()
+        except QzoneBridgeError:
+            pass
         yield self._command_result(event, format_status(payload))
 
     @qzone.command("unbind")
@@ -886,7 +928,7 @@ class QzoneStablePlugin(Star):
             yield event.plain_result("???????????")
             return
         try:
-            payload = await self.controller.get_status()
+            payload = await self._status_with_recovery()
         except QzoneBridgeError as exc:
             yield event.plain_result(self._error_text(exc))
             return
