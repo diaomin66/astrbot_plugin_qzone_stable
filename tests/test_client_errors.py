@@ -88,6 +88,7 @@ class ClientErrorMappingTests(unittest.IsolatedAsyncioTestCase):
         await self._use_response(
             lambda request: httpx.Response(200, json={"code": -10000, "message": "????"}, request=request)
         )
+        self.assertFalse(self.client._payload_needs_rebind(-10000, "????"))
         with self.assertRaises(QzoneRequestError) as caught:
             await self.client._request_json("GET", "https://mobile.qzone.qq.com/feeds/mfeeds_get_count")
         self.assertNotIsInstance(caught.exception, QzoneNeedsRebind)

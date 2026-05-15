@@ -1,4 +1,4 @@
-"""Standalone QQ?? daemon."""
+"""Standalone Qzone daemon."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import asyncio
 import contextlib
 import logging
 import os
-import re
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -38,12 +37,14 @@ LATEST_FEED_REFERENCES = {
     "newest",
     "recent",
     "last",
-    "??",
-    "????",
-    "????",
-    "????",
+    "\u6700\u65b0",
+    "\u6700\u65b0\u4e00\u6761",
+    "\u6700\u8fd1\u4e00\u6761",
+    "\u6700\u540e\u4e00\u6761",
 }
-FEED_REFERENCE_PATTERN = re.compile(r"^??\s*(\d+)\s*??$")
+FEED_REFERENCE_PREFIXES = ("\u7b2c",)
+FEED_REFERENCE_SUFFIXES = ("\u6761",)
+LOSSY_LATEST_FEED_REFERENCES = {"??", "????"}
 
 
 class QzoneDaemonService:
@@ -441,9 +442,35 @@ class QzoneDaemonService:
             return int(fid_text)
         if fid_text.lower() in LATEST_FEED_REFERENCES or fid_text in LATEST_FEED_REFERENCES:
             return 1
-        match = FEED_REFERENCE_PATTERN.fullmatch(fid_text)
-        if match and fid_text != match.group(1):
-            return int(match.group(1))
+        if fid_text in LOSSY_LATEST_FEED_REFERENCES:
+            return 1
+        return QzoneDaemonService._localized_feed_reference_index(fid_text)
+
+    @staticmethod
+    def _localized_feed_reference_index(fid_text: str) -> int:
+        text = str(fid_text or "").strip()
+        if not text:
+            return 0
+
+        matched_marker = False
+        for prefix in FEED_REFERENCE_PREFIXES:
+            if text.startswith(prefix):
+                text = text[len(prefix) :].strip()
+                matched_marker = True
+                break
+        for suffix in FEED_REFERENCE_SUFFIXES:
+            if text.endswith(suffix):
+                text = text[: -len(suffix)].strip()
+                matched_marker = True
+                break
+
+        if matched_marker and text.isdigit():
+            return int(text)
+        lossy_text = str(fid_text or "").strip()
+        if lossy_text.startswith("?") and lossy_text.endswith("?"):
+            lossy_inner = lossy_text.strip("?").strip()
+            if lossy_inner.isdigit():
+                return int(lossy_inner)
         return 0
 
     def _recent_feed_reference(self, reference_index: int, *, hostuin: int) -> FeedEntry | None:
