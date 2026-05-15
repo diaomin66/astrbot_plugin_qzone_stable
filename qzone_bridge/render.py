@@ -10,7 +10,7 @@ from .utils import to_local_time_text, truncate
 
 def cookie_summary(cookies: dict[str, str]) -> str:
     if not cookies:
-        return "未绑定"
+        return "???"
     keys = [
         "uin",
         "p_uin",
@@ -28,12 +28,12 @@ def cookie_summary(cookies: dict[str, str]) -> str:
     ]
     found = [key for key in keys if key in cookies]
     extras = len(cookies) - len(found)
-    return f"{len(cookies)}个字段: " + ", ".join(found + ([f"其他{extras}项"] if extras > 0 else []))
+    return f"{len(cookies)}???: " + ", ".join(found + ([f"??{extras}?"] if extras > 0 else []))
 
 
 def format_status(status: dict) -> str:
     lines = [
-        "QQ空间状态",
+        "QQ????",
         f"- daemon: {status.get('daemon_state', 'unknown')}",
         f"- login: {status.get('login_uin') or '-'}",
         f"- source: {status.get('session_source') or '-'}",
@@ -44,6 +44,20 @@ def format_status(status: dict) -> str:
     ]
     if status.get("daemon_port"):
         lines.append(f"- endpoint: 127.0.0.1:{status['daemon_port']}")
+    if status.get("daemon_pid"):
+        lines.append(f"- pid: {status['daemon_pid']}")
+    start_error = status.get("daemon_start_error")
+    if isinstance(start_error, dict):
+        message = start_error.get("message") or "daemon ????"
+        lines.append(f"- daemon_error: {message}")
+        detail = start_error.get("detail")
+        if isinstance(detail, dict):
+            if detail.get("returncode") is not None:
+                lines.append(f"- daemon_returncode: {detail['returncode']}")
+            if detail.get("log_path"):
+                lines.append(f"- daemon_log: {detail['log_path']}")
+            if detail.get("log_tail"):
+                lines.append(f"- daemon_log_tail: {truncate(str(detail['log_tail']), 300)}")
     return "\n".join(lines)
 
 
@@ -57,8 +71,8 @@ def format_feed_entry(entry: FeedEntry, index: int | None = None, *, include_int
             f"like={entry.like_count} comment={entry.comment_count} liked={entry.liked}"
         )
     else:
-        liked_text = "已点赞" if entry.liked else "未点赞"
-        lines.append(f"   {liked_text}，{entry.like_count} 赞，{entry.comment_count} 评论")
+        liked_text = "???" if entry.liked else "???"
+        lines.append(f"   {liked_text}?{entry.like_count} ??{entry.comment_count} ??")
     lines.append(f"   {headline}")
     return "\n".join(lines)
 
@@ -87,14 +101,14 @@ def format_feed_list(
 def format_llm_feed_list(entries: Iterable[FeedEntry]) -> str:
     entries = list(entries)
     if not entries:
-        return "没有找到可操作的说说。"
+        return "???????????"
     body = format_feed_list(entries, include_internal=False, include_pagination=False)
-    return f"{body}\n可直接让我点赞或取消点赞对应编号。"
+    return f"{body}\n?????????????????"
 
 
 def format_feed_detail(entry: FeedEntry) -> str:
     lines = [
-        "说说详情",
+        "????",
         f"- hostuin: {entry.hostuin}",
         f"- fid: {entry.fid}",
         f"- appid: {entry.appid}",
@@ -119,14 +133,14 @@ def format_action_result(title: str, payload: dict) -> str:
 
 
 def format_like_result(payload: dict) -> str:
-    action = "取消点赞" if payload.get("action") == "unlike" else "点赞"
+    action = "????" if payload.get("action") == "unlike" else "??"
     summary = truncate(str(payload.get("summary") or ""), 80)
-    suffix = f"：{summary}" if summary else ""
+    suffix = f"?{summary}" if summary else ""
     if payload.get("verified"):
         if payload.get("already"):
-            state = "已是目标状态"
+            state = "??????"
         else:
-            state = "成功"
-        liked = "当前已点赞" if payload.get("liked") else "当前未点赞"
-        return f"{action}{state}{suffix}（{liked}）。"
-    return f"{action}请求已提交，但暂未能确认 QQ 空间状态{suffix}。"
+            state = "??"
+        liked = "?????" if payload.get("liked") else "?????"
+        return f"{action}{state}{suffix}?{liked}??"
+    return f"{action}???????????? QQ ????{suffix}?"

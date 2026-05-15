@@ -187,6 +187,91 @@ class MainPublishTests(unittest.TestCase):
         self.assertEqual(plugin.controller.publish_post.await_args.kwargs["content"], "qzone post literal")
         self.assertTrue(plugin.controller.publish_post.await_args.kwargs["content_sanitized"])
 
+    def test_qzone_status_auto_recovers_degraded_daemon(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        degraded = {
+            "daemon_state": "degraded",
+            "login_uin": 3112333596,
+            "session_source": "aiocqhttp",
+            "cookie_count": 14,
+            "cookie_summary": "14???: uin, p_uin, skey, p_skey",
+            "needs_rebind": False,
+            "daemon_port": 18999,
+        }
+        ready = dict(degraded, daemon_state="ready", daemon_pid=1234)
+        plugin.controller = types.SimpleNamespace(
+            get_status=AsyncMock(return_value=degraded),
+            ensure_running=AsyncMock(return_value=ready),
+        )
+        event = Event([])
+
+        results = asyncio.run(collect_async_generator(plugin.qzone_status(event)))
+
+        plugin.controller.ensure_running.assert_awaited_once()
+        self.assertIn("- daemon: ready", results[0])
+        self.assertIn("- source: aiocqhttp", results[0])
+        self.assertIn("- pid: 1234", results[0])
+
+    def test_qzone_status_reports_daemon_start_failure_detail(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        degraded = {
+            "daemon_state": "degraded",
+            "login_uin": 3112333596,
+            "session_source": "aiocqhttp",
+            "cookie_count": 14,
+            "cookie_summary": "14???: uin, p_uin, skey, p_skey",
+            "needs_rebind": False,
+            "daemon_port": 18999,
+        }
+        plugin.controller = types.SimpleNamespace(
+            get_status=AsyncMock(return_value=degraded),
+            ensure_running=AsyncMock(
+                side_effect=module.DaemonUnavailableError(
+                    "QQ?? daemon ????",
+                    detail={"returncode": 7, "log_path": "D:/qzone/daemon.log", "log_tail": "daemon boom"},
+                )
+            ),
+        )
+        event = Event([])
+
+        results = asyncio.run(collect_async_generator(plugin.qzone_status(event)))
+
+        self.assertIn("- daemon: degraded", results[0])
+        self.assertIn("- daemon_error: QQ?? daemon ????", results[0])
+        self.assertIn("- daemon_returncode: 7", results[0])
+        self.assertIn("- daemon_log: D:/qzone/daemon.log", results[0])
+        self.assertIn("daemon boom", results[0])
+
+    def test_qzone_bind_returns_recovered_ready_status(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        degraded = {
+            "daemon_state": "degraded",
+            "login_uin": 3112333596,
+            "session_source": "manual",
+            "cookie_count": 4,
+            "cookie_summary": "4???: uin, p_uin, skey, p_skey",
+            "needs_rebind": False,
+            "daemon_port": 18999,
+        }
+        ready = dict(degraded, daemon_state="ready", daemon_pid=5678)
+        plugin.controller = types.SimpleNamespace(
+            bind_cookie_local=AsyncMock(return_value=degraded),
+            get_status=AsyncMock(return_value=degraded),
+            ensure_running=AsyncMock(return_value=ready),
+        )
+        plugin._schedule_daemon_warmup = lambda trigger: None
+        event = Event([])
+
+        results = asyncio.run(collect_async_generator(plugin.qzone_bind(event, "uin=o3112333596; p_skey=abc")))
+
+        plugin.controller.bind_cookie_local.assert_awaited_once()
+        plugin.controller.ensure_running.assert_awaited_once()
+        self.assertIn("- daemon: ready", results[0])
+        self.assertIn("- pid: 5678", results[0])
+
     def test_llm_publish_tool_strips_command_prefix_from_tool_content(self):
         module = self.load_main_module()
         plugin = self.make_plugin(module)
