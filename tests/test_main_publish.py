@@ -512,6 +512,44 @@ class MainPublishTests(unittest.TestCase):
         self.assertEqual(results[0], "???????????????????")
         prompt = plugin._context.llm_generate.await_args.kwargs["prompt"]
         self.assertIn('"verified":false', prompt)
+        self.assertIn("accepted_pending_verification", prompt)
+        self.assertIn("verified=false means QQ readback is stale", prompt)
+        self.assertNotIn("actual_liked", prompt)
+        self.assertFalse(results[0].lstrip().startswith("{"))
+
+    def test_llm_like_tool_rejects_false_failure_reply_when_verification_pending(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        bad_reply = (
+            "\u70b9\u8d5e\u5931\u8d25\uff0cQQ \u670d\u52a1\u5668\u672a\u786e\u8ba4\u3002\n"
+            "```json\n"
+            "{\"ok\": false, \"tool\": \"qzone_like_post\", \"status_code\": 403, \"raw\": {}}\n"
+            "```"
+        )
+        plugin._context = types.SimpleNamespace(
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text=bad_reply)),
+        )
+        plugin.controller.like_post = AsyncMock(
+            return_value={
+                "action": "like",
+                "liked": True,
+                "verified": False,
+                "already": False,
+                "summary": "hello",
+                "verification": {"expected_liked": True, "actual_liked": False},
+            }
+        )
+        event = Event([])
+
+        results = asyncio.run(
+            collect_async_generator(plugin.tool_like_post(event, hostuin=0, fid="1", confirm=False))
+        )
+
+        plugin._context.llm_generate.assert_awaited_once()
+        self.assertIn("\u8bf7\u6c42\u5df2\u53d1\u9001", results[0])
+        self.assertIn("\u4e0d\u6309\u5931\u8d25\u5904\u7406", results[0])
+        self.assertNotIn('"ok"', results[0])
+        self.assertNotIn("status_code", results[0])
         self.assertFalse(results[0].lstrip().startswith("{"))
 
     def test_llm_like_tool_asks_llm_for_natural_error_reply(self):
@@ -590,7 +628,8 @@ class MainPublishTests(unittest.TestCase):
             collect_async_generator(plugin.tool_like_post(event, hostuin=0, fid="1", confirm=False))
         )
 
-        self.assertIn("???????", results[0])
+        self.assertIn("\u8bf7\u6c42\u5df2\u53d1\u9001", results[0])
+        self.assertIn("\u4e0d\u6309\u5931\u8d25\u5904\u7406", results[0])
         self.assertFalse(results[0].lstrip().startswith("{"))
 
     def test_llm_like_tool_error_fallback_does_not_expose_detail(self):
