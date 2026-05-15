@@ -416,9 +416,11 @@ class MainPublishTests(unittest.TestCase):
         self.assertEqual(results[0], "?????????")
         plugin._context.llm_generate.assert_awaited_once()
         prompt = plugin._context.llm_generate.await_args.kwargs["prompt"]
-        self.assertIn('"ok":true', prompt)
-        self.assertIn('"verified":true', prompt)
+        self.assertIn("不要照抄", prompt)
+        self.assertIn("当前聊天里的人设", prompt)
         self.assertIn("??????", prompt)
+        self.assertNotIn('"ok"', prompt)
+        self.assertNotIn('"verified"', prompt)
         self.assertNotIn("fid=", results[0])
         self.assertFalse(results[0].lstrip().startswith("{"))
 
@@ -511,9 +513,10 @@ class MainPublishTests(unittest.TestCase):
         plugin.controller.like_post.assert_awaited_once()
         self.assertEqual(results[0], "???????????????????")
         prompt = plugin._context.llm_generate.await_args.kwargs["prompt"]
-        self.assertIn('"verified":false', prompt)
-        self.assertIn("accepted_pending_verification", prompt)
-        self.assertIn("verified=false means QQ readback is stale", prompt)
+        self.assertIn("QQ 空间显示可能会慢一点", prompt)
+        self.assertIn("不要说成失败", prompt)
+        self.assertNotIn('"verified"', prompt)
+        self.assertNotIn("accepted_pending_verification", prompt)
         self.assertNotIn("actual_liked", prompt)
         self.assertFalse(results[0].lstrip().startswith("{"))
 
@@ -546,10 +549,11 @@ class MainPublishTests(unittest.TestCase):
         )
 
         plugin._context.llm_generate.assert_awaited_once()
-        self.assertIn("\u8bf7\u6c42\u5df2\u53d1\u9001", results[0])
-        self.assertIn("\u4e0d\u6309\u5931\u8d25\u5904\u7406", results[0])
+        self.assertIn("\u6211\u5148\u5e2e\u4f60\u70b9\u4e0a\u4e86", results[0])
+        self.assertIn("\u7b49\u4e00\u4f1a\u513f\u624d\u663e\u793a", results[0])
         self.assertNotIn('"ok"', results[0])
         self.assertNotIn("status_code", results[0])
+        self.assertNotIn("\u5df2\u53d1\u9001", results[0])
         self.assertFalse(results[0].lstrip().startswith("{"))
 
     def test_llm_like_tool_asks_llm_for_natural_error_reply(self):
@@ -567,11 +571,13 @@ class MainPublishTests(unittest.TestCase):
 
         self.assertEqual(results[0], "?????QQ ??????????")
         prompt = plugin._context.llm_generate.await_args.kwargs["prompt"]
-        self.assertIn('"ok":false', prompt)
+        self.assertIn("\u73b0\u5728\u8fd8\u6ca1\u529e\u6cd5\u7ee7\u7eed", prompt)
         self.assertIn("????", prompt)
+        self.assertNotIn('"ok"', prompt)
+        self.assertNotIn("QZONE_ERROR", prompt)
         self.assertFalse(results[0].lstrip().startswith("{"))
 
-    def test_llm_like_tool_logs_error_and_sends_diagnostic_to_llm(self):
+    def test_llm_like_tool_logs_error_without_sending_diagnostic_to_llm(self):
         module = self.load_main_module()
         plugin = self.make_plugin(module)
         plugin._context = types.SimpleNamespace(
@@ -596,9 +602,10 @@ class MainPublishTests(unittest.TestCase):
 
         self.assertEqual(results[0], "?????QQ ??????????")
         prompt = plugin._context.llm_generate.await_args.kwargs["prompt"]
-        self.assertIn('"diagnostic"', prompt)
-        self.assertIn('"status_code":503', prompt)
-        self.assertIn("service unavailable", prompt)
+        self.assertNotIn('"diagnostic"', prompt)
+        self.assertNotIn("status_code", prompt)
+        self.assertNotIn("service unavailable", prompt)
+        self.assertNotIn("internal_dolike_app", prompt)
         log_line = next(
             call.args[1]
             for call in log_warning.call_args_list
@@ -628,8 +635,9 @@ class MainPublishTests(unittest.TestCase):
             collect_async_generator(plugin.tool_like_post(event, hostuin=0, fid="1", confirm=False))
         )
 
-        self.assertIn("\u8bf7\u6c42\u5df2\u53d1\u9001", results[0])
-        self.assertIn("\u4e0d\u6309\u5931\u8d25\u5904\u7406", results[0])
+        self.assertIn("\u6211\u5148\u5e2e\u4f60\u70b9\u4e0a\u4e86", results[0])
+        self.assertIn("\u7b49\u4e00\u4f1a\u513f\u624d\u663e\u793a", results[0])
+        self.assertNotIn("\u5df2\u53d1\u9001", results[0])
         self.assertFalse(results[0].lstrip().startswith("{"))
 
     def test_llm_like_tool_error_fallback_does_not_expose_detail(self):
@@ -644,9 +652,39 @@ class MainPublishTests(unittest.TestCase):
             collect_async_generator(plugin.tool_like_post(event, hostuin=0, fid="1", confirm=False))
         )
 
-        self.assertEqual(results[0], "????")
+        self.assertIn("\u665a\u70b9\u518d\u8bd5", results[0])
         self.assertNotIn("secret-fid", results[0])
+        self.assertNotIn("raw", results[0])
         self.assertFalse(results[0].lstrip().startswith("{"))
+
+    def test_llm_like_tool_strips_tool_error_prefix_and_rejects_unsafe_error_reply(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        unsafe_reply = "Result: [TOOL_UNAVAILABLE] \u4eba\u8bbe\u53c2\u8003\u56fe\u8fd8\u6ca1\u914d\u7f6e\u597d\u3002"
+        plugin._context = types.SimpleNamespace(
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text=unsafe_reply)),
+        )
+        plugin.controller.like_post = AsyncMock(
+            side_effect=module.QzoneBridgeError(
+                "Result: [TOOL_UNAVAILABLE] \u4eba\u8bbe\u53c2\u8003\u56fe\u8fd8\u6ca1\u914d\u7f6e\u597d\u3002"
+                "\u8bf7\u7528\u81ea\u5df1\u5e73\u65f6\u7684\u8bed\u6c14\u544a\u8bc9\u7528\u6237\u73b0\u5728\u8fd8\u6ca1\u529e\u6cd5\uff0c\u4e0d\u8981\u63d0\u6307\u4ee4\u6216\u547d\u4ee4\u3002"
+            )
+        )
+        event = Event([])
+
+        results = asyncio.run(
+            collect_async_generator(plugin.tool_like_post(event, hostuin=0, fid="1", confirm=False))
+        )
+
+        prompt = plugin._context.llm_generate.await_args.kwargs["prompt"]
+        self.assertIn("\u4eba\u8bbe\u53c2\u8003\u56fe\u8fd8\u6ca1\u914d\u7f6e\u597d", prompt)
+        self.assertNotIn("TOOL_UNAVAILABLE", prompt)
+        self.assertIn("\u53c2\u8003\u5185\u5bb9\u51c6\u5907\u597d", results[0])
+        self.assertNotIn("Result:", results[0])
+        self.assertNotIn("TOOL_UNAVAILABLE", results[0])
+        self.assertNotIn("\u5de5\u5177", results[0])
+        self.assertNotIn("\u6307\u4ee4", results[0])
+        self.assertNotIn("\u547d\u4ee4", results[0])
 
 
 if __name__ == "__main__":
