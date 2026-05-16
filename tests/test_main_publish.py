@@ -195,7 +195,7 @@ class MainPublishTests(unittest.TestCase):
             "login_uin": 3112333596,
             "session_source": "aiocqhttp",
             "cookie_count": 14,
-            "cookie_summary": "14???: uin, p_uin, skey, p_skey",
+            "cookie_summary": "14 个 Cookie: uin, p_uin, skey, p_skey",
             "needs_rebind": False,
             "daemon_port": 18999,
         }
@@ -221,7 +221,7 @@ class MainPublishTests(unittest.TestCase):
             "login_uin": 3112333596,
             "session_source": "aiocqhttp",
             "cookie_count": 14,
-            "cookie_summary": "14???: uin, p_uin, skey, p_skey",
+            "cookie_summary": "14 个 Cookie: uin, p_uin, skey, p_skey",
             "needs_rebind": False,
             "daemon_port": 18999,
         }
@@ -229,7 +229,7 @@ class MainPublishTests(unittest.TestCase):
             get_status=AsyncMock(return_value=degraded),
             ensure_running=AsyncMock(
                 side_effect=module.DaemonUnavailableError(
-                    "QQ?? daemon ????",
+                    "QQ 空间 daemon 启动失败",
                     detail={"returncode": 7, "log_path": "D:/qzone/daemon.log", "log_tail": "daemon boom"},
                 )
             ),
@@ -239,7 +239,7 @@ class MainPublishTests(unittest.TestCase):
         results = asyncio.run(collect_async_generator(plugin.qzone_status(event)))
 
         self.assertIn("- daemon: degraded", results[0])
-        self.assertIn("- daemon_error: QQ?? daemon ????", results[0])
+        self.assertIn("- daemon_error: QQ 空间 daemon 启动失败", results[0])
         self.assertIn("- daemon_returncode: 7", results[0])
         self.assertIn("- daemon_log: D:/qzone/daemon.log", results[0])
         self.assertIn("daemon boom", results[0])
@@ -252,7 +252,7 @@ class MainPublishTests(unittest.TestCase):
             "login_uin": 3112333596,
             "session_source": "manual",
             "cookie_count": 4,
-            "cookie_summary": "4???: uin, p_uin, skey, p_skey",
+            "cookie_summary": "4 个 Cookie: uin, p_uin, skey, p_skey",
             "needs_rebind": False,
             "daemon_port": 18999,
         }
@@ -362,7 +362,7 @@ class MainPublishTests(unittest.TestCase):
             hostuin=3112333596,
             fid="1c7182b96589046ad3380900",
             appid=311,
-            summary="??????",
+            summary="甜酷风怎么样",
             liked=False,
         )
         plugin.controller.list_feeds = AsyncMock(
@@ -377,8 +377,12 @@ class MainPublishTests(unittest.TestCase):
         results = asyncio.run(collect_async_generator(plugin.tool_list_feed(event, limit=1)))
 
         self.assertEqual(len(results), 1)
-        self.assertIn("??", results[0])
-        self.assertIn("???", results[0])
+        self.assertIn("未赞", results[0])
+        self.assertIn("0 赞", results[0])
+        self.assertIn("0 评论", results[0])
+        self.assertIn("甜酷风怎么样", results[0])
+        self.assertIn("可以用上面的序号", results[0])
+        self.assertNotIn("?" * 3, results[0])
         self.assertNotIn("cursor=", results[0])
         self.assertNotIn("has_more", results[0])
         self.assertNotIn("fid=", results[0])
@@ -388,7 +392,7 @@ class MainPublishTests(unittest.TestCase):
         plugin = self.make_plugin(module)
         plugin._context = types.SimpleNamespace(
             get_current_chat_provider_id=AsyncMock(return_value="provider-1"),
-            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="?????????")),
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="这条已经点好了。")),
         )
         plugin.controller.like_post = AsyncMock(
             return_value={
@@ -396,7 +400,7 @@ class MainPublishTests(unittest.TestCase):
                 "liked": True,
                 "verified": True,
                 "already": False,
-                "summary": "??????",
+                "summary": "甜酷风怎么样",
             }
         )
         event = Event([])
@@ -413,12 +417,12 @@ class MainPublishTests(unittest.TestCase):
             latest=False,
             index=0,
         )
-        self.assertEqual(results[0], "?????????")
+        self.assertEqual(results[0], "这条已经点好了。")
         plugin._context.llm_generate.assert_awaited_once()
         prompt = plugin._context.llm_generate.await_args.kwargs["prompt"]
         self.assertIn("不要照抄", prompt)
         self.assertIn("当前聊天里的人设", prompt)
-        self.assertIn("??????", prompt)
+        self.assertIn("甜酷风怎么样", prompt)
         self.assertNotIn('"ok"', prompt)
         self.assertNotIn('"verified"', prompt)
         self.assertNotIn("fid=", results[0])
@@ -428,7 +432,7 @@ class MainPublishTests(unittest.TestCase):
         module = self.load_main_module()
         plugin = self.make_plugin(module)
         plugin._context = types.SimpleNamespace(
-            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="????")),
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="好了")),
         )
         plugin.controller.like_post = AsyncMock(
             return_value={
@@ -460,7 +464,7 @@ class MainPublishTests(unittest.TestCase):
         module = self.load_main_module()
         plugin = self.make_plugin(module)
         plugin._context = types.SimpleNamespace(
-            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="?????? 2 ??????")),
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="第 2 条已经点好了。")),
         )
         plugin.controller.like_post = AsyncMock(
             return_value={
@@ -492,7 +496,7 @@ class MainPublishTests(unittest.TestCase):
         module = self.load_main_module()
         plugin = self.make_plugin(module)
         plugin._context = types.SimpleNamespace(
-            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="???????????????????")),
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="先帮你点上了，显示可能慢一点。")),
         )
         plugin.settings.preview_writes = True
         plugin.controller.like_post = AsyncMock(
@@ -511,7 +515,7 @@ class MainPublishTests(unittest.TestCase):
         )
 
         plugin.controller.like_post.assert_awaited_once()
-        self.assertEqual(results[0], "???????????????????")
+        self.assertEqual(results[0], "先帮你点上了，显示可能慢一点。")
         prompt = plugin._context.llm_generate.await_args.kwargs["prompt"]
         self.assertIn("QQ 空间显示可能会慢一点", prompt)
         self.assertIn("不要说成失败", prompt)
@@ -560,19 +564,19 @@ class MainPublishTests(unittest.TestCase):
         module = self.load_main_module()
         plugin = self.make_plugin(module)
         plugin._context = types.SimpleNamespace(
-            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="?????QQ ??????????")),
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="这会儿 QQ 空间还动不了。")),
         )
-        plugin.controller.like_post = AsyncMock(side_effect=module.QzoneBridgeError("????"))
+        plugin.controller.like_post = AsyncMock(side_effect=module.QzoneBridgeError("点赞失败"))
         event = Event([])
 
         results = asyncio.run(
             collect_async_generator(plugin.tool_like_post(event, hostuin=0, fid="1", confirm=False))
         )
 
-        self.assertEqual(results[0], "?????QQ ??????????")
+        self.assertEqual(results[0], "这会儿 QQ 空间还动不了。")
         prompt = plugin._context.llm_generate.await_args.kwargs["prompt"]
         self.assertIn("\u73b0\u5728\u8fd8\u6ca1\u529e\u6cd5\u7ee7\u7eed", prompt)
-        self.assertIn("????", prompt)
+        self.assertIn("点赞失败", prompt)
         self.assertNotIn('"ok"', prompt)
         self.assertNotIn("QZONE_ERROR", prompt)
         self.assertFalse(results[0].lstrip().startswith("{"))
@@ -581,10 +585,10 @@ class MainPublishTests(unittest.TestCase):
         module = self.load_main_module()
         plugin = self.make_plugin(module)
         plugin._context = types.SimpleNamespace(
-            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="?????QQ ??????????")),
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="这会儿 QQ 空间还动不了。")),
         )
         exc = module.QzoneBridgeError(
-            "QQ?????????? (503)",
+            "QQ 空间服务暂时不可用 (503)",
             detail={
                 "status_code": 503,
                 "url": "https://w.qzone.qq.com/cgi-bin/likes/internal_dolike_app?g_tk=123",
@@ -600,7 +604,7 @@ class MainPublishTests(unittest.TestCase):
                 collect_async_generator(plugin.tool_like_post(event, hostuin=0, fid="1", confirm=False))
             )
 
-        self.assertEqual(results[0], "?????QQ ??????????")
+        self.assertEqual(results[0], "这会儿 QQ 空间还动不了。")
         prompt = plugin._context.llm_generate.await_args.kwargs["prompt"]
         self.assertNotIn('"diagnostic"', prompt)
         self.assertNotIn("status_code", prompt)
@@ -644,7 +648,7 @@ class MainPublishTests(unittest.TestCase):
         module = self.load_main_module()
         plugin = self.make_plugin(module)
         plugin.controller.like_post = AsyncMock(
-            side_effect=module.QzoneBridgeError("????", detail={"fid": "secret-fid", "raw": {"code": 1}})
+            side_effect=module.QzoneBridgeError("点赞失败", detail={"fid": "secret-fid", "raw": {"code": 1}})
         )
         event = Event([])
 
