@@ -211,6 +211,89 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await service.close()
 
+    async def test_detail_feed_continues_when_h5_token_probe_redirects(self):
+        with TemporaryDirectory() as tmp:
+            service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
+            service.state.session = SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+            service.client.update_session(service.state.session)
+            try:
+                with patch.object(
+                    service.client,
+                    "index",
+                    new=AsyncMock(side_effect=QzoneRequestError("h5 redirect", status_code=302)),
+                ) as index, patch.object(
+                    service.client,
+                    "detail",
+                    new=AsyncMock(
+                        return_value={
+                            "tid": "fid-1",
+                            "uin": 123456,
+                            "content": "hello",
+                            "commentlist": [{"commentid": "c1", "uin": 9988, "content": "nice"}],
+                        }
+                    ),
+                ) as detail:
+                    payload = await service.detail_feed(hostuin=123456, fid="fid-1")
+                index.assert_awaited_once()
+                detail.assert_awaited_once_with(123456, "fid-1", appid=311, busi_param="")
+                self.assertEqual(payload["entry"]["fid"], "fid-1")
+                self.assertEqual(payload["comments"][0]["commentid"], "c1")
+            finally:
+                await service.close()
+
+    async def test_detail_feed_uses_cached_feed_when_h5_detail_redirects(self):
+        with TemporaryDirectory() as tmp:
+            service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
+            service.state.session = SessionState(
+                uin=123456,
+                cookies={"uin": "o123456", "p_uin": "o123456", "p_skey": "abc"},
+            )
+            service.client.update_session(service.state.session)
+            legacy_page = {
+                "main": {
+                    "hasMoreFeeds": False,
+                    "data": [
+                        {
+                            "tid": "fid-1",
+                            "uin": 123456,
+                            "content": "hello",
+                            "commentlist": [{"commentid": "c1", "uin": 9988, "content": "nice"}],
+                        }
+                    ],
+                }
+            }
+            try:
+                with patch.object(
+                    service.client,
+                    "index",
+                    new=AsyncMock(
+                        side_effect=[
+                            QzoneRequestError("index redirect", status_code=302),
+                            QzoneRequestError("index redirect", status_code=302),
+                        ]
+                    ),
+                ) as index, patch.object(
+                    service.client,
+                    "legacy_recent_feeds",
+                    new=AsyncMock(return_value=legacy_page),
+                ), patch.object(
+                    service.client,
+                    "detail",
+                    new=AsyncMock(side_effect=QzoneRequestError("detail redirect", status_code=302)),
+                ) as detail:
+                    list_payload = await service.list_feeds(limit=1)
+                    detail_payload = await service.detail_feed(hostuin=123456, fid="fid-1")
+                self.assertEqual(index.await_count, 2)
+                detail.assert_awaited_once_with(123456, "fid-1", appid=311, busi_param="")
+                self.assertEqual(list_payload["items"][0]["fid"], "fid-1")
+                self.assertEqual(detail_payload["entry"]["fid"], "fid-1")
+                self.assertEqual(detail_payload["comments"][0]["content"], "nice")
+            finally:
+                await service.close()
+
     async def test_publish_post_does_not_probe_h5_index_for_token(self):
         with TemporaryDirectory() as tmp:
             service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
