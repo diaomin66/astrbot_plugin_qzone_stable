@@ -110,6 +110,44 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(service.client.feed_cache, {})
             await service.close()
 
+    async def test_visitor_reply_and_delete_backend_methods(self):
+        with TemporaryDirectory() as tmp:
+            service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
+            service.state.session = SessionState(uin=123456, cookies={"uin": "o123456", "p_skey": "abc"})
+            service.client.update_session(service.state.session)
+            try:
+                with patch.object(
+                    service.client,
+                    "get_visitors",
+                    new=AsyncMock(return_value={"items": [{"uin": 9988, "nickname": "Alice"}]}),
+                ) as visitors, patch.object(
+                    service.client,
+                    "reply_comment",
+                    new=AsyncMock(return_value={"commentid": "r1", "message": "ok"}),
+                ) as reply, patch.object(
+                    service.client,
+                    "delete_post",
+                    new=AsyncMock(return_value={"message": "deleted"}),
+                ) as delete:
+                    visitor_payload = await service.view_visitors()
+                    reply_payload = await service.reply_comment(
+                        hostuin=9988,
+                        fid="fid-1",
+                        commentid="c1",
+                        comment_uin=9988,
+                        content="hi",
+                    )
+                    delete_payload = await service.delete_post(fid="fid-1")
+
+                visitors.assert_awaited_once()
+                reply.assert_awaited_once()
+                delete.assert_awaited_once_with("fid-1", appid=311)
+                self.assertEqual(visitor_payload["items"][0]["nickname"], "Alice")
+                self.assertEqual(reply_payload["commentid"], "r1")
+                self.assertEqual(delete_payload["fid"], "fid-1")
+            finally:
+                await service.close()
+
     async def test_list_feeds_falls_back_when_h5_home_redirects(self):
         with TemporaryDirectory() as tmp:
             service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())

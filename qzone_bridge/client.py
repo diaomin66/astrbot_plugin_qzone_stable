@@ -54,6 +54,9 @@ QZONE_LIKE_PROXY_URL = "https://user.qzone.qq.com/proxy/domain/w.qzone.qq.com/cg
 QZONE_UNLIKE_PROXY_URL = "https://user.qzone.qq.com/proxy/domain/w.qzone.qq.com/cgi-bin/likes/internal_unlike_app"
 QZONE_LIKE_URL = QZONE_LIKE_DIRECT_URL
 QZONE_UNLIKE_URL = QZONE_UNLIKE_DIRECT_URL
+QZONE_VISITOR_URL = "https://h5.qzone.qq.com/proxy/domain/g.qzone.qq.com/cgi-bin/friendshow/cgi_get_visitor_more"
+QZONE_REPLY_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds"
+QZONE_DELETE_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_delete_v6"
 MAX_UPLOAD_IMAGE_BYTES = 32 * 1024 * 1024
 IMAGE_SOURCE_CACHE_TTL_SECONDS = 10 * 60
 IMAGE_SOURCE_CACHE_MAX_ITEMS = 16
@@ -926,6 +929,89 @@ class QzoneClient:
             referer=f"https://user.qzone.qq.com/{hostuin}/mood/{fid}",
             origin="https://user.qzone.qq.com",
             hostuin=hostuin,
+            attach_token=False,
+        )
+        return payload
+
+    async def get_visitors(self, *, page: int = 1, count: int = 20) -> dict[str, Any]:
+        payload = await self._request_json(
+            "GET",
+            QZONE_VISITOR_URL,
+            params={
+                "uin": self.login_uin,
+                "mask": 7,
+                "mod": 2,
+                "fupdate": 1,
+                "page": max(1, int(page or 1)),
+                "count": max(1, min(int(count or 20), 50)),
+                "format": "json",
+            },
+            referer=f"https://user.qzone.qq.com/{self.login_uin}",
+            hostuin=self.login_uin,
+            attach_token=False,
+        )
+        return payload
+
+    async def reply_comment(
+        self,
+        hostuin: int,
+        fid: str,
+        commentid: str,
+        comment_uin: int,
+        content: str,
+        *,
+        appid: int = 311,
+    ) -> dict[str, Any]:
+        payload = await self._request_json(
+            "POST",
+            QZONE_REPLY_URL,
+            data={
+                "topicId": f"{hostuin}_{fid}__1",
+                "uin": self.login_uin,
+                "hostUin": hostuin,
+                "feedsType": 100,
+                "inCharset": "utf-8",
+                "outCharset": "utf-8",
+                "plat": "qzone",
+                "source": "ic",
+                "platformid": 52,
+                "format": "fs",
+                "ref": "feeds",
+                "content": content,
+                "commentId": commentid,
+                "commentUin": comment_uin,
+                "private": 0,
+                "appid": appid,
+                "richval": "",
+                "richtype": "",
+            },
+            referer=f"https://user.qzone.qq.com/{hostuin}/mood/{fid}",
+            origin="https://user.qzone.qq.com",
+            hostuin=hostuin,
+            attach_token=False,
+        )
+        return payload
+
+    async def delete_post(self, fid: str, *, appid: int = 311) -> dict[str, Any]:
+        payload = await self._request_json(
+            "POST",
+            QZONE_DELETE_URL,
+            data={
+                "uin": self.login_uin,
+                "topicId": f"{self.login_uin}_{fid}__1",
+                "feedsType": 0,
+                "feedsFlag": 0,
+                "feedsKey": fid,
+                "feedsAppid": appid,
+                "feedsTime": int(time.time()),
+                "fupdate": 1,
+                "ref": "feeds",
+                "format": "json",
+                "qzreferrer": f"https://user.qzone.qq.com/{self.login_uin}",
+            },
+            referer=f"https://user.qzone.qq.com/{self.login_uin}/mood/{fid}",
+            origin="https://user.qzone.qq.com",
+            hostuin=self.login_uin,
             attach_token=False,
         )
         return payload

@@ -1,15 +1,177 @@
 {
+  "manage_group": {
+    "description": "管理群",
+    "type": "string",
+    "default": "",
+    "hint": "投稿审核通知群；不填则尝试私发管理员。"
+  },
+  "pillowmd_style_dir": {
+    "description": "Pillowmd 样式目录路径",
+    "type": "string",
+    "default": "",
+    "hint": "例如 C:\\styles\\my-style；留空则使用普通文本/内置发布结果渲染。"
+  },
+  "llm": {
+    "description": "LLM 模块配置",
+    "type": "object",
+    "items": {
+      "post_provider_id": {
+        "description": "写说说用的 LLM 提供商",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "留空时使用当前会话默认提供商。"
+      },
+      "post_prompt": {
+        "description": "写说说提示词",
+        "type": "text",
+        "default": "找出一个你感兴趣的主题来写一段适合 QQ 空间的说说，简短、有个性、不要解释。",
+        "hint": "用于 写说说/写稿 和定时自动发说说。"
+      },
+      "comment_provider_id": {
+        "description": "评论说说用的 LLM 提供商",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "留空时使用当前会话默认提供商。"
+      },
+      "comment_prompt": {
+        "description": "评论说说提示词",
+        "type": "text",
+        "default": "生成一句简短、直接、贴题的评论，不要解释。",
+        "hint": "用于 评说说/评论说说/读说说 和自动评论。"
+      },
+      "reply_provider_id": {
+        "description": "回复评论用的 LLM 提供商",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "留空时使用当前会话默认提供商。"
+      },
+      "reply_prompt": {
+        "description": "回复评论提示词",
+        "type": "text",
+        "default": "这条帖子收到了一条评论，请自然回复此条评论，不要解释。",
+        "hint": "用于 回评/回复评论。"
+      }
+    }
+  },
+  "source": {
+    "description": "数据来源配置",
+    "type": "object",
+    "items": {
+      "ignore_groups": {
+        "description": "忽略的群聊列表",
+        "type": "list",
+        "default": [],
+        "hint": "概率触发读说说/评论时会跳过这些群。"
+      },
+      "ignore_users": {
+        "description": "忽略的用户列表",
+        "type": "list",
+        "default": [],
+        "hint": "概率触发读说说/评论时会跳过这些用户。"
+      },
+      "post_max_msg": {
+        "description": "用于写说说的聊天记录最大条数",
+        "type": "int",
+        "default": 500,
+        "slider": {
+          "min": 100,
+          "max": 1000,
+          "step": 10
+        },
+        "hint": "预留给后续聊天记录上下文聚合。"
+      }
+    }
+  },
+  "trigger": {
+    "description": "触发配置",
+    "type": "object",
+    "items": {
+      "publish_cron": {
+        "description": "自动发说说的基准触发时间",
+        "type": "string",
+        "default": "",
+        "hint": "Cron 表达式：分 时 日 月 周。留空表示禁用。"
+      },
+      "publish_offset": {
+        "description": "自动发说说的随机偏移秒数",
+        "type": "int",
+        "default": 0,
+        "slider": {
+          "min": 0,
+          "max": 3600,
+          "step": 1
+        },
+        "hint": "围绕基准时间随机前后浮动；0 表示严格按基准时间。"
+      },
+      "comment_cron": {
+        "description": "自动评论的基准触发时间",
+        "type": "string",
+        "default": "",
+        "hint": "Cron 表达式：分 时 日 月 周。留空表示禁用。"
+      },
+      "comment_offset": {
+        "description": "自动评论的随机偏移秒数",
+        "type": "int",
+        "default": 0,
+        "slider": {
+          "min": 0,
+          "max": 3600,
+          "step": 1
+        },
+        "hint": "围绕基准时间随机前后浮动；0 表示严格按基准时间。"
+      },
+      "read_prob": {
+        "description": "消息触发读说说概率",
+        "type": "float",
+        "default": 0.0,
+        "hint": "收到 OneBot 消息时，按概率查看发送者空间并自动评论；0 表示关闭。"
+      },
+      "send_admin": {
+        "description": "自动评论后反馈管理员",
+        "type": "bool",
+        "default": false,
+        "hint": "预留兼容项。"
+      },
+      "like_when_comment": {
+        "description": "评论时同时点赞",
+        "type": "bool",
+        "default": false,
+        "hint": "评说说和自动评论成功后是否顺手点赞。"
+      }
+    }
+  },
+  "cookies_str": {
+    "description": "Cookie 字符串",
+    "type": "text",
+    "default": "",
+    "hint": "可选；填写后插件初始化时会尝试直接绑定 Cookie。也可以继续使用 /qzone bind。"
+  },
+  "timeout": {
+    "description": "QQ 空间请求超时",
+    "type": "float",
+    "default": 15.0,
+    "hint": "兼容目标插件 timeout 配置；会映射到 request_timeout。"
+  },
+  "show_name": {
+    "description": "展示投稿者昵称",
+    "type": "bool",
+    "default": true,
+    "hint": "匿名投稿仍会隐藏投稿者。"
+  },
   "daemon_port": {
     "description": "Local daemon port",
     "type": "int",
     "default": 18999,
-    "hint": "守护进程监听的本地端口，默认 18999。"
+    "hint": "本地 daemon 监听端口。"
   },
   "keepalive_interval": {
     "description": "Keepalive interval",
     "type": "int",
     "default": 120,
-    "hint": "守护进程的保活间隔，单位秒。"
+    "hint": "daemon 保活间隔，单位秒。"
   },
   "request_timeout": {
     "description": "Request timeout",
@@ -27,7 +189,7 @@
     "description": "Default feed limit",
     "type": "int",
     "default": 5,
-    "hint": "未指定条数时，默认返回的说说数量。"
+    "hint": "未指定条数时默认拉取的说说数量。"
   },
   "max_feed_limit": {
     "description": "Max feed limit",
@@ -39,54 +201,54 @@
     "description": "Auto start daemon",
     "type": "bool",
     "default": true,
-    "hint": "是否在第一次使用时自动启动本地 daemon。"
+    "hint": "第一次使用时自动启动本地 daemon。"
   },
   "auto_bind_cookie": {
     "description": "Auto bind cookie",
     "type": "bool",
     "default": true,
-    "hint": "是否在检测到登录态失效时自动从 OneBot 适配器获取 Cookie。"
+    "hint": "检测到登录态缺失时，尝试从 OneBot 自动获取 Cookie。"
   },
   "cookie_domain": {
     "description": "OneBot cookie domain",
     "type": "text",
     "default": "user.qzone.qq.com",
-    "hint": "向 OneBot 请求 Cookie 时使用的域名，默认 user.qzone.qq.com。"
+    "hint": "向 OneBot 请求 Cookie 时使用的域名。"
   },
   "admin_uins": {
     "description": "Admin QQ numbers",
     "type": "text",
     "default": "",
-    "hint": "可选，多个 QQ 号用英文逗号分隔；这些账号将被当作管理员。"
+    "hint": "多个 QQ 号用英文逗号分隔。"
   },
   "user_agent": {
     "description": "Custom user-agent",
     "type": "text",
     "default": "",
-    "hint": "可选，自定义 QQ 空间请求头里的 User-Agent。"
+    "hint": "自定义 QQ 空间请求头里的 User-Agent。"
   },
   "preview_writes": {
     "description": "Preview write tools",
     "type": "bool",
     "default": true,
-    "hint": "LLM 工具写操作是否默认先输出草稿预览。"
+    "hint": "兼容 LLM 写操作预览开关。"
   },
   "render_publish_result": {
     "description": "Render publish result image",
     "type": "bool",
     "default": true,
-    "hint": "发布说说成功后是否返回 QQ 空间样式的实时渲染图。"
+    "hint": "发布说说成功后返回 QQ 空间风格渲染图。"
   },
   "render_result_width": {
     "description": "Publish result image width",
     "type": "int",
     "default": 900,
-    "hint": "发布结果渲染图宽度，默认 900。"
+    "hint": "发布结果渲染图宽度。"
   },
   "render_remote_timeout": {
     "description": "Publish result remote image timeout",
     "type": "float",
     "default": 0.35,
-    "hint": "发布结果图渲染远程头像或图片预览的单个资源超时，越小越快。"
+    "hint": "发布结果图远程头像或图片预览的单资源超时。"
   }
 }
