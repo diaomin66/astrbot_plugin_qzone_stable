@@ -1431,7 +1431,13 @@ class QzoneStablePlugin(Star):
             text = await self._generate_comment_text(None, post)  # type: ignore[arg-type]
             if not text.strip():
                 continue
-            await self.controller.comment_post(hostuin=entry.hostuin, fid=entry.fid, content=text.strip(), appid=entry.appid)
+            await self.controller.comment_post(
+                hostuin=entry.hostuin,
+                fid=entry.fid,
+                content=text.strip(),
+                appid=entry.appid,
+                busi_param=entry.busi_param,
+            )
             if self.settings.like_when_comment:
                 await self.controller.like_post(hostuin=entry.hostuin, fid=entry.fid, appid=entry.appid)
             commented_keys.add(key)
@@ -1611,7 +1617,13 @@ class QzoneStablePlugin(Star):
             content = await self._generate_comment_text(event, post)
             if not content.strip():
                 return
-            await self.controller.comment_post(hostuin=post.hostuin, fid=post.fid, content=content.strip(), appid=post.appid)
+            await self.controller.comment_post(
+                hostuin=post.hostuin,
+                fid=post.fid,
+                content=content.strip(),
+                appid=post.appid,
+                busi_param=post.busi_param,
+            )
             if self.settings.like_when_comment:
                 await self.controller.like_post(hostuin=post.hostuin, fid=post.fid, appid=post.appid)
         except Exception as exc:
@@ -1665,6 +1677,7 @@ class QzoneStablePlugin(Star):
                     fid=post.fid,
                     content=content.strip(),
                     appid=post.appid,
+                    busi_param=post.busi_param,
                 )
                 if self.settings.like_when_comment:
                     await self.controller.like_post(hostuin=post.hostuin, fid=post.fid, appid=post.appid)
@@ -2149,7 +2162,13 @@ class QzoneStablePlugin(Star):
                 content = await self._generate_comment_text(event, post)
                 if not content.strip():
                     content = "挺有意思的。"
-                await self.controller.comment_post(hostuin=post.hostuin, fid=post.fid, content=content.strip(), appid=post.appid)
+                await self.controller.comment_post(
+                    hostuin=post.hostuin,
+                    fid=post.fid,
+                    content=content.strip(),
+                    appid=post.appid,
+                    busi_param=post.busi_param,
+                )
                 actions.append("已评论")
             if like:
                 await self.controller.like_post(hostuin=post.hostuin, fid=post.fid, appid=post.appid)

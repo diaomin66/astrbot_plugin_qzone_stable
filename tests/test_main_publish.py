@@ -734,6 +734,27 @@ class MainPublishTests(unittest.TestCase):
         self.assertIn("one", results[0])
         self.assertIn("Alice", results[0])
 
+    def test_comment_feed_passes_busi_param_from_detail_entry(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        entry = module.FeedEntry(
+            hostuin=123456,
+            fid="fid-1",
+            appid=311,
+            summary="hello",
+            busi_param={"ugc": 1},
+        )
+        plugin.controller.list_feeds = AsyncMock(return_value={"items": [asdict(entry)]})
+        plugin.controller.detail_feed = AsyncMock(return_value={"entry": asdict(entry), "comments": [], "raw": {}})
+        plugin.controller.comment_post = AsyncMock(return_value={"commentid": "c1"})
+        plugin._generate_comment_text = AsyncMock(return_value="hello")
+        event = Event([], message_str="评说说")
+
+        asyncio.run(collect_async_generator(plugin.comment_feed(event)))
+
+        plugin.controller.comment_post.assert_awaited_once()
+        self.assertEqual(plugin.controller.comment_post.await_args.kwargs["busi_param"], {"ugc": 1})
+
     def test_contribution_approve_publishes_draft(self):
         module = self.load_main_module()
         plugin = self.make_plugin(module)

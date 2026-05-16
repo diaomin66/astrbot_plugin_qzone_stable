@@ -453,10 +453,16 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
                     "like_post",
                     new=AsyncMock(return_value={"message": "ok"}),
                 ) as like:
-                    comment_payload = await service.comment_post(hostuin=123456, fid="fid-1", content="hello")
+                    comment_payload = await service.comment_post(
+                        hostuin=123456,
+                        fid="fid-1",
+                        content="hello",
+                        busi_param={"ugc": 1},
+                    )
                     like_payload = await service.like_post(hostuin=123456, fid="fid-1")
                 index.assert_not_awaited()
                 comment.assert_awaited_once()
+                self.assertEqual(comment.await_args.kwargs["busi_param"], {"ugc": 1})
                 like.assert_awaited_once()
                 self.assertEqual(comment_payload["commentid"], 7)
                 self.assertEqual(like_payload["action"], "like")
