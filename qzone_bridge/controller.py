@@ -630,6 +630,13 @@ class QzoneDaemonController:
             params={"hostuin": hostuin, "fid": fid, "appid": appid, "busi_param": busi_param},
         )
 
+    async def view_visitors(self, *, page: int = 1, count: int = 20) -> dict[str, Any]:
+        return await self._request(
+            "GET",
+            "/visitors",
+            params={"page": page, "count": count},
+        )
+
     async def publish_post(
         self,
         *,
@@ -671,6 +678,36 @@ class QzoneDaemonController:
                 "appid": appid,
                 "private": private,
             },
+        )
+
+    async def reply_comment(
+        self,
+        *,
+        hostuin: int,
+        fid: str,
+        commentid: str,
+        comment_uin: int,
+        content: str,
+        appid: int = 311,
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            "/reply",
+            json_body={
+                "hostuin": hostuin,
+                "fid": fid,
+                "commentid": commentid,
+                "comment_uin": comment_uin,
+                "content": content,
+                "appid": appid,
+            },
+        )
+
+    async def delete_post(self, *, fid: str, appid: int = 311) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            "/delete",
+            json_body={"fid": fid, "appid": appid},
         )
 
     async def like_post(

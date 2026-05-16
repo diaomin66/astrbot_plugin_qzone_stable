@@ -27,6 +27,7 @@ from .parser import (
     unwrap_payload,
 )
 from .protocol import SECRET_HEADER, fail, ok
+from .social import extract_comments
 from .storage import StateStore, ensure_state_secret
 from .utils import now_iso, from_iso
 
@@ -347,25 +348,33 @@ class QzoneDaemonService:
             raise QzoneParseError("说说详情返回格式异常")
         entry = self.client.feed_entry_from_payload(payload, default_hostuin=hostuin)
         self.client.cache_feed_page(hostuin, [entry])
-        comments = []
-        comment_block = payload.get("comment")
-        if isinstance(comment_block, dict):
-            raw_comments = comment_block.get("comments") or []
-            if isinstance(raw_comments, list):
-                for item in raw_comments:
-                    if not isinstance(item, dict):
-                        continue
-                    comments.append(
-                        {
-                            "commentid": item.get("commentid"),
-                            "content": item.get("content") or "",
-                            "date": item.get("date") or 0,
-                            "nickname": (item.get("user") or {}).get("nickname") if isinstance(item.get("user"), dict) else "",
-                            "uin": (item.get("user") or {}).get("uin") if isinstance(item.get("user"), dict) else 0,
-                            "is_private": bool(item.get("isPrivate") or False),
-                        }
-                    )
+        comments = [item.to_dict() for item in extract_comments(payload)]
         return {"entry": asdict(entry), "comments": comments, "raw": payload}
+
+    async def view_visitors(self, *, page: int = 1, count: int = 20) -> dict[str, Any]:
+        self._ensure_session_ready()
+        payload = unwrap_payload(await self.client.get_visitors(page=page, count=count))
+        if not isinstance(payload, dict):
+            raise QzoneParseError("访客列表返回格式异常")
+        raw_items = payload.get("items") or payload.get("visitors") or payload.get("data") or payload.get("list") or []
+        if isinstance(raw_items, dict):
+            raw_items = raw_items.get("items") or raw_items.get("list") or raw_items.get("visitors") or []
+        visitors: list[dict[str, Any]] = []
+        if isinstance(raw_items, list):
+            for item in raw_items:
+                if not isinstance(item, dict):
+                    continue
+                user = item.get("user") if isinstance(item.get("user"), dict) else {}
+                visitors.append(
+                    {
+                        "uin": int(item.get("uin") or user.get("uin") or item.get("user_id") or 0),
+                        "nickname": item.get("nickname") or user.get("nickname") or item.get("name") or "",
+                        "time": item.get("time") or item.get("visitTime") or item.get("timestamp") or 0,
+                        "raw": item,
+                    }
+                )
+        self._set_success(defer_save=True)
+        return {"items": visitors, "count": len(visitors), "raw": payload}
 
     async def publish_post(
         self,
@@ -425,6 +434,52 @@ class QzoneDaemonService:
         return {
             "commentid": payload.get("commentid") or payload.get("commentId") or 0,
             "commentLikekey": payload.get("commentLikekey") or "",
+            "message": payload.get("msg") or payload.get("message") or "",
+            "raw": payload,
+        }
+
+    async def reply_comment(
+        self,
+        *,
+        hostuin: int,
+        fid: str,
+        commentid: str,
+        comment_uin: int,
+        content: str,
+        appid: int = 311,
+    ) -> dict[str, Any]:
+        if not content.strip():
+            raise QzoneParseError("回复内容不能为空")
+        self._ensure_session_ready()
+        payload = unwrap_payload(
+            await self.client.reply_comment(
+                hostuin,
+                fid,
+                commentid,
+                comment_uin,
+                content,
+                appid=appid,
+            )
+        )
+        if not isinstance(payload, dict):
+            raise QzoneParseError("回复评论返回格式异常")
+        self._set_success(defer_save=True)
+        return {
+            "commentid": payload.get("commentid") or payload.get("commentId") or 0,
+            "message": payload.get("msg") or payload.get("message") or "",
+            "raw": payload,
+        }
+
+    async def delete_post(self, *, fid: str, appid: int = 311) -> dict[str, Any]:
+        if not str(fid or "").strip():
+            raise QzoneParseError("说说 fid 不能为空")
+        self._ensure_session_ready()
+        payload = unwrap_payload(await self.client.delete_post(str(fid), appid=appid))
+        if not isinstance(payload, dict):
+            raise QzoneParseError("删除说说返回格式异常")
+        self._set_success(defer_save=True)
+        return {
+            "fid": fid,
             "message": payload.get("msg") or payload.get("message") or "",
             "raw": payload,
         }
@@ -794,6 +849,16 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
             return fail(exc.code, exc.message, detail=_error_detail(exc))
         return ok(payload)
 
+    async def visitors(request: web.Request) -> web.Response:
+        page = int(request.query.get("page") or 1)
+        count = int(request.query.get("count") or 20)
+        try:
+            payload = await service.view_visitors(page=page, count=count)
+        except QzoneBridgeError as exc:
+            service._set_error(exc)
+            return fail(exc.code, exc.message, detail=_error_detail(exc))
+        return ok(payload)
+
     async def post(request: web.Request) -> web.Response:
         body = await _json_body(request)
         content = str(body.get("content") or "")
@@ -821,6 +886,34 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
                 content=str(body.get("content") or ""),
                 appid=int(body.get("appid") or 311),
                 private=bool(body.get("private") or False),
+            )
+        except QzoneBridgeError as exc:
+            service._set_error(exc)
+            return fail(exc.code, exc.message, detail=_error_detail(exc))
+        return ok(payload)
+
+    async def reply(request: web.Request) -> web.Response:
+        body = await _json_body(request)
+        try:
+            payload = await service.reply_comment(
+                hostuin=int(body.get("hostuin") or 0),
+                fid=str(body.get("fid") or ""),
+                commentid=str(body.get("commentid") or body.get("commentId") or ""),
+                comment_uin=int(body.get("comment_uin") or body.get("commentUin") or 0),
+                content=str(body.get("content") or ""),
+                appid=int(body.get("appid") or 311),
+            )
+        except QzoneBridgeError as exc:
+            service._set_error(exc)
+            return fail(exc.code, exc.message, detail=_error_detail(exc))
+        return ok(payload)
+
+    async def delete(request: web.Request) -> web.Response:
+        body = await _json_body(request)
+        try:
+            payload = await service.delete_post(
+                fid=str(body.get("fid") or ""),
+                appid=int(body.get("appid") or 311),
             )
         except QzoneBridgeError as exc:
             service._set_error(exc)
@@ -858,8 +951,11 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
     app.router.add_post("/unbind", unbind)
     app.router.add_get("/feeds", feeds)
     app.router.add_get("/detail", detail)
+    app.router.add_get("/visitors", visitors)
     app.router.add_post("/post", post)
     app.router.add_post("/comment", comment)
+    app.router.add_post("/reply", reply)
+    app.router.add_post("/delete", delete)
     app.router.add_post("/like", like)
     app.router.add_post("/shutdown", shutdown)
     return app

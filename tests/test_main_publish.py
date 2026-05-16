@@ -44,24 +44,43 @@ class File:
 
 
 def install_astrbot_stubs():
+    def marker_decorator(marker_name, *args, **kwargs):
+        def decorator(func):
+            setattr(func, f"_{marker_name}_args", args)
+            setattr(func, f"_{marker_name}_kwargs", kwargs)
+            return func
+
+        return decorator
+
     def identity_decorator(*args, **kwargs):
         def decorator(func):
             return func
 
         return decorator
 
+    def command_decorator(*args, **kwargs):
+        return marker_decorator("filter_command", *args, **kwargs)
+
+    def group_command_decorator(*args, **kwargs):
+        return marker_decorator("qzone_command", *args, **kwargs)
+
     def command_group(*args, **kwargs):
         def decorator(func):
-            func.command = identity_decorator
+            setattr(func, "_command_group_args", args)
+            setattr(func, "_command_group_kwargs", kwargs)
+            func.command = group_command_decorator
             return func
 
         return decorator
 
     filter_stub = types.SimpleNamespace(
+        command=command_decorator,
         command_group=command_group,
         on_platform_loaded=identity_decorator,
         platform_adapter_type=identity_decorator,
         llm_tool=identity_decorator,
+        permission_type=identity_decorator,
+        PermissionType=types.SimpleNamespace(ADMIN="admin"),
         PlatformAdapterType=types.SimpleNamespace(AIOCQHTTP="aiocqhttp"),
     )
     logger_stub = types.SimpleNamespace(
@@ -149,6 +168,26 @@ class MainPublishTests(unittest.TestCase):
             publish_post=AsyncMock(return_value={"fid": "fid-1", "message": "ok"}),
         )
         return plugin
+
+    def test_legacy_qzone_group_subcommands_stay_registered(self):
+        module = self.load_main_module()
+
+        expected = {
+            "qzone_help": "help",
+            "qzone_status": "status",
+            "qzone_bind": "bind",
+            "qzone_autobind": "autobind",
+            "qzone_unbind": "unbind",
+            "qzone_feed": "feed",
+            "qzone_detail": "detail",
+            "qzone_post": "post",
+            "qzone_comment": "comment",
+            "qzone_like": "like",
+        }
+        for method_name, command_name in expected.items():
+            with self.subTest(method=method_name):
+                method = getattr(module.QzoneStablePlugin, method_name)
+                self.assertEqual(getattr(method, "_qzone_command_args", (None,))[0], command_name)
 
     def test_qzone_post_stops_event_and_strips_split_command_tokens(self):
         module = self.load_main_module()
@@ -660,6 +699,202 @@ class MainPublishTests(unittest.TestCase):
         self.assertNotIn("secret-fid", results[0])
         self.assertNotIn("raw", results[0])
         self.assertFalse(results[0].lstrip().startswith("{"))
+
+    def test_target_range_parser_supports_at_and_zero_based_range(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        event = Event([], message_str="看说说 @123456 2~4")
+
+        target, start, end = plugin._parse_target_range(event, ("看说说", "查看说说"))
+
+        self.assertEqual(target, 123456)
+        self.assertEqual((start, end), (2, 4))
+
+    def test_view_feed_uses_target_command_detail_shape(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        entries = [
+            module.FeedEntry(hostuin=123456, fid="fid-0", appid=311, summary="zero"),
+            module.FeedEntry(hostuin=123456, fid="fid-1", appid=311, summary="one"),
+        ]
+        plugin.controller.list_feeds = AsyncMock(return_value={"items": [asdict(item) for item in entries]})
+        plugin.controller.detail_feed = AsyncMock(
+            return_value={
+                "entry": asdict(entries[1]),
+                "comments": [{"commentid": "c1", "uin": 9988, "nickname": "Alice", "content": "nice"}],
+                "raw": {},
+            }
+        )
+        event = Event([], message_str="看说说 1")
+
+        results = asyncio.run(collect_async_generator(plugin.view_feed(event)))
+
+        plugin.controller.list_feeds.assert_awaited_once()
+        plugin.controller.detail_feed.assert_awaited_once_with(hostuin=123456, fid="fid-1", appid=311)
+        self.assertIn("one", results[0])
+        self.assertIn("Alice", results[0])
+
+    def test_contribution_approve_publishes_draft(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        plugin.settings.render_publish_result = False
+        plugin.drafts = module.DraftStore(plugin.data_dir / "drafts.json")
+        event = Event([Plain("投稿 hello")], message_str="投稿 hello")
+
+        contribute_results = asyncio.run(collect_async_generator(plugin.contribute_post(event)))
+        draft = plugin.drafts.get(1)
+        self.assertIsNotNone(draft)
+        self.assertIn("#1", contribute_results[0])
+
+        approve_event = Event([], message_str="过稿 1")
+        approve_results = asyncio.run(collect_async_generator(plugin.approve_post(approve_event)))
+
+        plugin.controller.publish_post.assert_awaited()
+        self.assertEqual(plugin.drafts.get(1).status, "published")
+        self.assertIn("发布结果", approve_results[0])
+
+    def test_approve_post_adds_submitter_name_when_configured(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        plugin.settings.render_publish_result = False
+        plugin.settings.show_name = True
+        plugin.drafts = module.DraftStore(plugin.data_dir / "drafts.json")
+        event = Event([Plain("投稿 hello")], message_str="投稿 hello")
+        plugin._sender_id = lambda event: 123456
+        plugin._sender_name = lambda event: "Alice"
+
+        asyncio.run(collect_async_generator(plugin.contribute_post(event)))
+        approve_event = Event([], message_str="过稿 1")
+        asyncio.run(collect_async_generator(plugin.approve_post(approve_event)))
+
+        content = plugin.controller.publish_post.await_args.kwargs["content"]
+        self.assertTrue(content.startswith("【来自 Alice 的投稿】"))
+        self.assertIn("hello", content)
+
+    def test_reply_comment_accepts_cached_viewed_post_id(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        entry = module.FeedEntry(hostuin=123456, fid="fid-1", appid=311, summary="hello")
+        post = module.post_from_entry(entry, local_id=0)
+        plugin._post_store().upsert(post)
+        plugin.controller.detail_feed = AsyncMock(
+            return_value={
+                "entry": asdict(entry),
+                "comments": [{"commentid": "c1", "uin": 9988, "nickname": "Bob", "content": "nice"}],
+                "raw": {},
+            }
+        )
+        plugin.controller.reply_comment = AsyncMock(return_value={"commentid": "r1", "message": "ok"})
+        plugin.controller.get_status = AsyncMock(return_value={"login_uin": 123456})
+        plugin._generate_reply_text = AsyncMock(return_value="收到")
+        event = Event([], message_str="回评 1")
+
+        results = asyncio.run(collect_async_generator(plugin.reply_comment(event)))
+
+        plugin.controller.reply_comment.assert_awaited_once_with(
+            hostuin=123456,
+            fid="fid-1",
+            commentid="c1",
+            comment_uin=9988,
+            content="收到",
+            appid=311,
+        )
+        self.assertIn("回复结果", results[0])
+
+    def test_auto_comment_persists_dedupe_between_runs(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        entries = [
+            module.FeedEntry(hostuin=111, fid="fid-1", appid=311, summary="one"),
+            module.FeedEntry(hostuin=222, fid="fid-2", appid=311, summary="two"),
+        ]
+        plugin.controller.list_feeds = AsyncMock(return_value={"items": [asdict(item) for item in entries]})
+        plugin.controller.detail_feed = AsyncMock(
+            side_effect=[
+                {"entry": asdict(entries[0]), "comments": [], "raw": {}},
+                {"entry": asdict(entries[0]), "comments": [], "raw": {}},
+                {"entry": asdict(entries[1]), "comments": [], "raw": {}},
+            ]
+        )
+        plugin.controller.comment_post = AsyncMock(return_value={"commentid": "c1"})
+        plugin._generate_comment_text = AsyncMock(return_value="好")
+
+        asyncio.run(plugin._auto_comment_once())
+        asyncio.run(plugin._auto_comment_once())
+
+        self.assertEqual(plugin.controller.comment_post.await_count, 2)
+        first = plugin.controller.comment_post.await_args_list[0].kwargs
+        second = plugin.controller.comment_post.await_args_list[1].kwargs
+        self.assertEqual(first["fid"], "fid-1")
+        self.assertEqual(second["fid"], "fid-2")
+
+    def test_markdown_result_uses_pillowmd_when_configured(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        plugin.settings.pillowmd_style_dir = "style-dir"
+        saved_pillowmd = sys.modules.get("pillowmd")
+
+        class FakeImage:
+            def Save(self, output_dir):
+                path = Path(output_dir) / "render.png"
+                path.write_bytes(b"png")
+                return path
+
+        class FakeStyle:
+            async def AioRender(self, **kwargs):
+                return FakeImage()
+
+        fake_pillowmd = types.SimpleNamespace(LoadMarkdownStyles=lambda style_dir: FakeStyle())
+        sys.modules["pillowmd"] = fake_pillowmd
+        if saved_pillowmd is None:
+            self.addCleanup(lambda: sys.modules.pop("pillowmd", None))
+        else:
+            self.addCleanup(lambda: sys.modules.__setitem__("pillowmd", saved_pillowmd))
+        event = Event([])
+
+        result = asyncio.run(plugin._markdown_result(event, "hello", subdir="test"))
+
+        self.assertIn("image", result)
+        self.assertTrue(Path(result["image"]).exists())
+
+    def test_generate_post_text_appends_filtered_group_history(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        plugin.settings.post_max_msg = 10
+        plugin.settings.ignore_users = ["999"]
+        plugin._context = types.SimpleNamespace(
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="draft"))
+        )
+        event = Event([], message_str="写说说")
+        event.message_obj.group_id = 100
+        event.bot = types.SimpleNamespace(
+            api=types.SimpleNamespace(
+                call_action=AsyncMock(
+                    return_value={
+                        "messages": [
+                            {
+                                "message_id": 1,
+                                "sender": {"user_id": 123, "nickname": "Alice"},
+                                "message": [{"type": "text", "data": {"text": "今天真热"}}],
+                            },
+                            {
+                                "message_id": 2,
+                                "sender": {"user_id": 999, "nickname": "Ignored"},
+                                "message": [{"type": "text", "data": {"text": "跳过我"}}],
+                            },
+                        ]
+                    }
+                )
+            )
+        )
+
+        result = asyncio.run(plugin._generate_post_text(event, "天气"))
+
+        self.assertEqual(result, "draft")
+        prompt = plugin._context.llm_generate.await_args.kwargs["prompt"]
+        self.assertIn("聊天记录参考", prompt)
+        self.assertIn("Alice: 今天真热", prompt)
+        self.assertNotIn("跳过我", prompt)
 
     def test_llm_like_tool_strips_tool_error_prefix_and_rejects_unsafe_error_reply(self):
         module = self.load_main_module()
