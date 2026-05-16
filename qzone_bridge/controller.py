@@ -416,7 +416,7 @@ class QzoneDaemonController:
                         break
                 if not found_port:
                     exc = DaemonUnavailableError(
-                        "QQ?? daemon ????????????????",
+                        "QQ 空间 daemon 端口被占用，未找到可用备用端口",
                         detail={"daemon_port": port, "checked_ports": f"{port + 1}-{port + 32}"},
                     )
                     self._record_daemon_start_error(exc, port=port)
@@ -428,7 +428,7 @@ class QzoneDaemonController:
 
             if not self._daemon_script().exists():
                 exc = DaemonUnavailableError(
-                    "??? daemon_main.py",
+                    "找不到 daemon_main.py",
                     detail={"path": str(self._daemon_script())},
                 )
                 self._record_daemon_start_error(exc, port=port)
@@ -438,7 +438,7 @@ class QzoneDaemonController:
                 self._process = self._spawn_daemon(port)
             except OSError as exc:
                 error = DaemonUnavailableError(
-                    "QQ?? daemon ????",
+                    "QQ 空间 daemon 启动失败",
                     detail=self._daemon_start_detail(port, error=str(exc)),
                 )
                 self._record_daemon_start_error(error, port=port)
@@ -469,7 +469,7 @@ class QzoneDaemonController:
 
             returncode = self._process.poll() if self._process else None
             error = DaemonUnavailableError(
-                "QQ?? daemon ????",
+                "QQ 空间 daemon 启动超时",
                 detail=self._daemon_start_detail(port, returncode=returncode),
             )
             self._record_daemon_start_error(error, port=port)
@@ -491,7 +491,7 @@ class QzoneDaemonController:
                 await self.ensure_running()
                 runtime = self._runtime()
             elif not await self._probe_health(runtime.daemon_port):
-                raise DaemonUnavailableError("daemon ???")
+                raise DaemonUnavailableError("daemon 未运行")
             try:
                 response = await self._client.request(
                     method,
@@ -506,18 +506,18 @@ class QzoneDaemonController:
                 last_exc = exc
                 if not self.auto_start_daemon or attempt > 0:
                     raise DaemonUnavailableError(
-                        "daemon ????",
+                        "daemon 请求失败",
                         detail={"error": str(exc), "path": path},
                     ) from exc
         if response is None:
             raise DaemonUnavailableError(
-                "daemon ????",
+                "daemon 请求失败",
                 detail={"error": str(last_exc), "path": path},
             )
         try:
             payload = response.json()
         except Exception as exc:
-            raise DaemonUnavailableError("daemon ???? JSON ??", detail={"text": response.text[:500]}) from exc
+            raise DaemonUnavailableError("daemon 返回的 JSON 无法解析", detail={"text": response.text[:500]}) from exc
         if not payload.get("ok", False):
             error = payload.get("error") or {}
             code = str(error.get("code") or "DAEMON_ERROR")
@@ -552,10 +552,10 @@ class QzoneDaemonController:
     @staticmethod
     def cookie_summary(cookies: dict[str, str]) -> str:
         if not cookies:
-            return "???"
+            return "无 Cookie"
         keys = ["uin", "p_uin", "skey", "p_skey", "pt4_token", "pt_key"]
         found = [key for key in keys if key in cookies]
-        return f"{len(cookies)}???: " + ", ".join(found or ["????"])
+        return f"{len(cookies)} 个 Cookie: " + ", ".join(found or ["未识别关键字段"])
 
     async def bind_cookie(self, cookie_text: str, *, uin: int = 0, source: str = "manual") -> dict[str, Any]:
         return await self._request("POST", "/bind", json_body={"cookie_text": cookie_text, "uin": uin, "source": source})
@@ -568,10 +568,10 @@ class QzoneDaemonController:
         except DaemonUnavailableError:
             cookies = parse_cookie_text(cookie_text)
             if not cookies:
-                raise QzoneParseError("Cookie ???????")
+                raise QzoneParseError("Cookie 内容为空或无法解析")
             resolved_uin = normalize_uin(cookies, override=uin)
             if not resolved_uin:
-                raise QzoneParseError("Cookie ???? uin / p_uin???????")
+                raise QzoneParseError("Cookie 缺少 uin / p_uin，无法识别登录 QQ")
 
             state = self.store.read()
             runtime = self._runtime()
@@ -630,6 +630,13 @@ class QzoneDaemonController:
             params={"hostuin": hostuin, "fid": fid, "appid": appid, "busi_param": busi_param},
         )
 
+    async def view_visitors(self, *, page: int = 1, count: int = 20) -> dict[str, Any]:
+        return await self._request(
+            "GET",
+            "/visitors",
+            params={"page": page, "count": count},
+        )
+
     async def publish_post(
         self,
         *,
@@ -671,6 +678,36 @@ class QzoneDaemonController:
                 "appid": appid,
                 "private": private,
             },
+        )
+
+    async def reply_comment(
+        self,
+        *,
+        hostuin: int,
+        fid: str,
+        commentid: str,
+        comment_uin: int,
+        content: str,
+        appid: int = 311,
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            "/reply",
+            json_body={
+                "hostuin": hostuin,
+                "fid": fid,
+                "commentid": commentid,
+                "comment_uin": comment_uin,
+                "content": content,
+                "appid": appid,
+            },
+        )
+
+    async def delete_post(self, *, fid: str, appid: int = 311) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            "/delete",
+            json_body={"fid": fid, "appid": appid},
         )
 
     async def like_post(

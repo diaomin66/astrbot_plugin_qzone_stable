@@ -48,9 +48,8 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
             QzoneDaemonService._feed_reference_index("\u7b2c\uff12\u6761", hostuin=123456),
             2,
         )
-        self.assertEqual(QzoneDaemonService._feed_reference_index("?2?", hostuin=123456), 2)
-        self.assertEqual(QzoneDaemonService._feed_reference_index("??2??", hostuin=123456), 2)
-        self.assertEqual(QzoneDaemonService._feed_reference_index("????", hostuin=123456), 1)
+        self.assertEqual(QzoneDaemonService._feed_reference_index("第2条", hostuin=123456), 2)
+        self.assertEqual(QzoneDaemonService._feed_reference_index("最新", hostuin=123456), 1)
         self.assertEqual(QzoneDaemonService._feed_reference_index("2", hostuin=123456), 0)
 
     async def test_warmup_uses_json_health_check_instead_of_h5_index(self):
@@ -81,7 +80,7 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
             service.client.update_session(service.state.session)
             service.health_state = "ready"
 
-            service._set_error(QzoneRequestError("?????", status_code=403))
+            service._set_error(QzoneRequestError("禁止访问", status_code=403))
 
             self.assertEqual(service.health_state, "ready")
             self.assertFalse(service.state.session.needs_rebind)
@@ -110,6 +109,44 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(service.state.session.qzonetokens, {})
             self.assertEqual(service.client.feed_cache, {})
             await service.close()
+
+    async def test_visitor_reply_and_delete_backend_methods(self):
+        with TemporaryDirectory() as tmp:
+            service = QzoneDaemonService(StateStore(Path(tmp)), secret="secret", port=free_port())
+            service.state.session = SessionState(uin=123456, cookies={"uin": "o123456", "p_skey": "abc"})
+            service.client.update_session(service.state.session)
+            try:
+                with patch.object(
+                    service.client,
+                    "get_visitors",
+                    new=AsyncMock(return_value={"items": [{"uin": 9988, "nickname": "Alice"}]}),
+                ) as visitors, patch.object(
+                    service.client,
+                    "reply_comment",
+                    new=AsyncMock(return_value={"commentid": "r1", "message": "ok"}),
+                ) as reply, patch.object(
+                    service.client,
+                    "delete_post",
+                    new=AsyncMock(return_value={"message": "deleted"}),
+                ) as delete:
+                    visitor_payload = await service.view_visitors()
+                    reply_payload = await service.reply_comment(
+                        hostuin=9988,
+                        fid="fid-1",
+                        commentid="c1",
+                        comment_uin=9988,
+                        content="hi",
+                    )
+                    delete_payload = await service.delete_post(fid="fid-1")
+
+                visitors.assert_awaited_once()
+                reply.assert_awaited_once()
+                delete.assert_awaited_once_with("fid-1", appid=311)
+                self.assertEqual(visitor_payload["items"][0]["nickname"], "Alice")
+                self.assertEqual(reply_payload["commentid"], "r1")
+                self.assertEqual(delete_payload["fid"], "fid-1")
+            finally:
+                await service.close()
 
     async def test_list_feeds_falls_back_when_h5_home_redirects(self):
         with TemporaryDirectory() as tmp:
@@ -595,7 +632,7 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
                     hostuin=3112333596,
                     fid="1c7182b96589046ad3380900",
                     appid=311,
-                    summary="??????",
+                    summary="甜酷风怎么样",
                     liked=False,
                     curkey="cached-curkey",
                 )
@@ -603,13 +640,13 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
             before = {
                 "tid": "1c7182b96589046ad3380900",
                 "uin": 3112333596,
-                "content": "??????",
+                "content": "甜酷风怎么样",
                 "like": {"isliked": "0"},
             }
             after = {
                 "tid": "1c7182b96589046ad3380900",
                 "uin": 3112333596,
-                "content": "??????",
+                "content": "甜酷风怎么样",
                 "like": {"isliked": "1"},
             }
             try:
@@ -623,7 +660,7 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(args[:2], (3112333596, "1c7182b96589046ad3380900"))
                 self.assertEqual(kwargs["curkey"], "cached-curkey")
                 self.assertTrue(payload["verified"])
-                self.assertEqual(payload["summary"], "??????")
+                self.assertEqual(payload["summary"], "甜酷风怎么样")
             finally:
                 await service.close()
 
