@@ -68,27 +68,27 @@ class ClientErrorMappingTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(QzoneRequestError) as caught:
             await self.client._request_text("GET", "https://h5.qzone.qq.com/mqzone/profile")
         self.assertEqual(caught.exception.status_code, 403)
-        self.assertIn("??", caught.exception.message)
+        self.assertIn("权限", caught.exception.message)
 
     async def test_payload_login_code_requires_rebind(self):
         await self._use_response(
-            lambda request: httpx.Response(200, json={"code": -3000, "message": "?????"}, request=request)
+            lambda request: httpx.Response(200, json={"code": -3000, "message": "登录态失效"}, request=request)
         )
         with self.assertRaises(QzoneNeedsRebind):
             await self.client._request_json("GET", "https://mobile.qzone.qq.com/feeds/mfeeds_get_count")
 
     async def test_payload_login_code_inside_data_requires_rebind(self):
         await self._use_response(
-            lambda request: httpx.Response(200, json={"data": {"code": -3000, "message": "?????"}}, request=request)
+            lambda request: httpx.Response(200, json={"data": {"code": -3000, "message": "登录态失效"}}, request=request)
         )
         with self.assertRaises(QzoneNeedsRebind):
             await self.client._request_json("GET", "https://mobile.qzone.qq.com/feeds/mfeeds_get_count")
 
     async def test_generic_negative_code_is_not_forced_to_rebind(self):
         await self._use_response(
-            lambda request: httpx.Response(200, json={"code": -10000, "message": "????"}, request=request)
+            lambda request: httpx.Response(200, json={"code": -10000, "message": "普通错误"}, request=request)
         )
-        self.assertFalse(self.client._payload_needs_rebind(-10000, "????"))
+        self.assertFalse(self.client._payload_needs_rebind(-10000, "普通错误"))
         with self.assertRaises(QzoneRequestError) as caught:
             await self.client._request_json("GET", "https://mobile.qzone.qq.com/feeds/mfeeds_get_count")
         self.assertNotIsInstance(caught.exception, QzoneNeedsRebind)
@@ -199,7 +199,7 @@ class ClientErrorMappingTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(QzoneRequestError) as caught:
             await self.client.like_post(123456, "fid-1")
 
-        self.assertIn("?????????", caught.exception.message)
+        self.assertIn("所有点赞入口", caught.exception.message)
         self.assertEqual(caught.exception.status_code, 503)
         attempts = caught.exception.detail["attempts"]
         self.assertEqual(len(attempts), 2)

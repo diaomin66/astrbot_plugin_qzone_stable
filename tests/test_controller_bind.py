@@ -197,7 +197,7 @@ class ControllerBindTests(unittest.IsolatedAsyncioTestCase):
                         "ok": False,
                         "error": {
                             "code": "QZONE_REQUEST",
-                            "message": "QQ?????????? (503)",
+                            "message": "QQ 空间服务暂时不可用 (503)",
                             "detail": {
                                 "status_code": 503,
                                 "url": "https://w.qzone.qq.com/cgi-bin/likes/internal_dolike_app",

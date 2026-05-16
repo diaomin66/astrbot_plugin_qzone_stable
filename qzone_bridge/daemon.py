@@ -44,7 +44,7 @@ LATEST_FEED_REFERENCES = {
 }
 FEED_REFERENCE_PREFIXES = ("\u7b2c",)
 FEED_REFERENCE_SUFFIXES = ("\u6761",)
-LOSSY_LATEST_FEED_REFERENCES = {"??", "????"}
+LOSSY_LATEST_FEED_REFERENCES = {"最新", "最近"}
 
 
 class QzoneDaemonService:
@@ -222,10 +222,10 @@ class QzoneDaemonService:
     async def bind_cookie(self, cookie_text: str, *, uin: int = 0, source: str = "manual") -> dict[str, Any]:
         cookies = parse_cookie_text(cookie_text)
         if not cookies:
-            raise QzoneParseError("Cookie ???????")
+            raise QzoneParseError("Cookie 内容为空或无法解析")
         resolved_uin = normalize_uin(cookies, override=uin)
         if not resolved_uin:
-            raise QzoneParseError("Cookie ???? uin / p_uin???????")
+            raise QzoneParseError("Cookie 缺少 uin / p_uin，无法识别登录 QQ")
         self.state.session = SessionState(
             uin=resolved_uin,
             cookies=cookies,
@@ -344,7 +344,7 @@ class QzoneDaemonService:
         await self.ensure_token(hostuin)
         payload = unwrap_payload(await self.client.detail(hostuin, fid, appid=appid, busi_param=busi_param))
         if not isinstance(payload, dict):
-            raise QzoneParseError("??????????")
+            raise QzoneParseError("说说详情返回格式异常")
         entry = self.client.feed_entry_from_payload(payload, default_hostuin=hostuin)
         self.client.cache_feed_page(hostuin, [entry])
         comments = []
@@ -381,12 +381,12 @@ class QzoneDaemonService:
         normalized_media = normalize_media_list(media)
         photos, fallback_media = split_publishable_images(normalized_media)
         if len(photos) > QZONE_MAX_IMAGES:
-            raise QzoneParseError(f"QQ???????? {QZONE_MAX_IMAGES} ???")
+            raise QzoneParseError(f"QQ 空间一次最多只能上传 {QZONE_MAX_IMAGES} 张图片")
         if fallback_media:
             refs = "\n".join(media_reference_text(item) for item in fallback_media)
             content = "\n".join(part for part in (content.strip(), refs) if part)
         if not content.strip() and not photos:
-            raise QzoneParseError("????????")
+            raise QzoneParseError("说说内容或图片不能为空")
         self._ensure_session_ready()
         payload = unwrap_payload(
             await self.client.publish_mood(
@@ -396,7 +396,7 @@ class QzoneDaemonService:
             )
         )
         if not isinstance(payload, dict):
-            raise QzoneParseError("??????????")
+            raise QzoneParseError("说说发布返回格式异常")
         self._set_success(defer_save=True)
         return {
             "fid": payload.get("fid") or payload.get("tid") or "",
@@ -416,11 +416,11 @@ class QzoneDaemonService:
         private: bool = False,
     ) -> dict[str, Any]:
         if not content.strip():
-            raise QzoneParseError("????????")
+            raise QzoneParseError("评论内容不能为空")
         self._ensure_session_ready()
         payload = unwrap_payload(await self.client.add_comment(hostuin, fid, content, appid=appid, private=private))
         if not isinstance(payload, dict):
-            raise QzoneParseError("????????")
+            raise QzoneParseError("评论发布返回格式异常")
         self._set_success(defer_save=True)
         return {
             "commentid": payload.get("commentid") or payload.get("commentId") or 0,
@@ -513,7 +513,7 @@ class QzoneDaemonService:
             feed_payload = await self.list_feeds(hostuin=target_hostuin, limit=reference_index, scope="profile")
             items = feed_payload.get("items") or []
             if reference_index > len(items):
-                raise QzoneParseError(f"???? {reference_index} ???????")
+                raise QzoneParseError(f"第 {reference_index} 条说说不存在")
             entry = FeedEntry(**items[reference_index - 1])
             return entry.hostuin, entry.fid, entry.appid or appid, curkey or entry.curkey
         return target_hostuin, fid_text, int(appid or 311), curkey
@@ -599,7 +599,7 @@ class QzoneDaemonService:
             index=index,
         )
         if not hostuin or not fid:
-            raise QzoneParseError("????????????????")
+            raise QzoneParseError("没有指定要点赞的说说")
 
         target_liked = not unlike
         before_entry = await self._refresh_like_entry(hostuin, fid, appid)
@@ -740,7 +740,7 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
     async def auth_middleware(request: web.Request, handler):
         secret = request.headers.get(SECRET_HEADER) or request.query.get("secret") or ""
         if secret != service.state.runtime.secret:
-            return fail("UNAUTHORIZED", "secret ???", status=401)
+            return fail("UNAUTHORIZED", "secret 不正确", status=401)
         return await handler(request)
 
     app.middlewares.append(auth_middleware)

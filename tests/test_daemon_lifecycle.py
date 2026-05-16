@@ -48,9 +48,8 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
             QzoneDaemonService._feed_reference_index("\u7b2c\uff12\u6761", hostuin=123456),
             2,
         )
-        self.assertEqual(QzoneDaemonService._feed_reference_index("?2?", hostuin=123456), 2)
-        self.assertEqual(QzoneDaemonService._feed_reference_index("??2??", hostuin=123456), 2)
-        self.assertEqual(QzoneDaemonService._feed_reference_index("????", hostuin=123456), 1)
+        self.assertEqual(QzoneDaemonService._feed_reference_index("第2条", hostuin=123456), 2)
+        self.assertEqual(QzoneDaemonService._feed_reference_index("最新", hostuin=123456), 1)
         self.assertEqual(QzoneDaemonService._feed_reference_index("2", hostuin=123456), 0)
 
     async def test_warmup_uses_json_health_check_instead_of_h5_index(self):
@@ -81,7 +80,7 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
             service.client.update_session(service.state.session)
             service.health_state = "ready"
 
-            service._set_error(QzoneRequestError("?????", status_code=403))
+            service._set_error(QzoneRequestError("禁止访问", status_code=403))
 
             self.assertEqual(service.health_state, "ready")
             self.assertFalse(service.state.session.needs_rebind)
@@ -595,7 +594,7 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
                     hostuin=3112333596,
                     fid="1c7182b96589046ad3380900",
                     appid=311,
-                    summary="??????",
+                    summary="甜酷风怎么样",
                     liked=False,
                     curkey="cached-curkey",
                 )
@@ -603,13 +602,13 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
             before = {
                 "tid": "1c7182b96589046ad3380900",
                 "uin": 3112333596,
-                "content": "??????",
+                "content": "甜酷风怎么样",
                 "like": {"isliked": "0"},
             }
             after = {
                 "tid": "1c7182b96589046ad3380900",
                 "uin": 3112333596,
-                "content": "??????",
+                "content": "甜酷风怎么样",
                 "like": {"isliked": "1"},
             }
             try:
@@ -623,7 +622,7 @@ class DaemonStateTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(args[:2], (3112333596, "1c7182b96589046ad3380900"))
                 self.assertEqual(kwargs["curkey"], "cached-curkey")
                 self.assertTrue(payload["verified"])
-                self.assertEqual(payload["summary"], "??????")
+                self.assertEqual(payload["summary"], "甜酷风怎么样")
             finally:
                 await service.close()
 
