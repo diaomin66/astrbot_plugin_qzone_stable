@@ -102,6 +102,7 @@ class PluginSettings:
     post_prompt: str = "找出一个你感兴趣的主题来写一段适合 QQ 空间的说说，简短、有个性、不要解释。"
     comment_provider_id: str = ""
     comment_prompt: str = "生成一句简短、直接、贴题的评论，不要解释。"
+    comment_max_length: int = 60
     reply_provider_id: str = ""
     reply_prompt: str = "这条帖子收到了一条评论，请自然回复此条评论，不要解释。"
     ignore_groups: list[str] = field(default_factory=list)
@@ -151,6 +152,7 @@ class PluginSettings:
             post_prompt=str(_nested(mapping, "llm", "post_prompt", cls.post_prompt) or cls.post_prompt),
             comment_provider_id=str(_nested(mapping, "llm", "comment_provider_id", "") or ""),
             comment_prompt=str(_nested(mapping, "llm", "comment_prompt", cls.comment_prompt) or cls.comment_prompt),
+            comment_max_length=int(_nested(mapping, "llm", "comment_max_length", 60) or 60),
             reply_provider_id=str(_nested(mapping, "llm", "reply_provider_id", "") or ""),
             reply_prompt=str(_nested(mapping, "llm", "reply_prompt", cls.reply_prompt) or cls.reply_prompt),
             ignore_groups=[str(item) for item in _as_list(_nested(mapping, "source", "ignore_groups", []))],

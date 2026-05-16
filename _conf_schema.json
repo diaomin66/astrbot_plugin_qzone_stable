@@ -41,6 +41,17 @@
         "default": "生成一句简短、直接、贴题的评论，不要解释。",
         "hint": "用于 评说说/评论说说/读说说 和自动评论。"
       },
+      "comment_max_length": {
+        "description": "评论最大长度",
+        "type": "int",
+        "default": 60,
+        "slider": {
+          "min": 10,
+          "max": 200,
+          "step": 1
+        },
+        "hint": "AI 生成评论和回评时会截断到这个长度。"
+      },
       "reply_provider_id": {
         "description": "回复评论用的 LLM 提供商",
         "type": "string",
