@@ -338,18 +338,64 @@ class QzoneDaemonService:
             "count": min(len(items), limit),
         }
 
+    def _detail_payload_from_entry(self, entry: FeedEntry) -> dict[str, Any]:
+        self.client.cache_feed_page(entry.hostuin, [entry])
+        raw = entry.raw if isinstance(entry.raw, dict) else {}
+        comments = [item.to_dict() for item in extract_comments(raw)]
+        return {"entry": asdict(entry), "comments": comments, "raw": raw}
+
+    async def _detail_from_cached_or_legacy_feed(self, *, hostuin: int, fid: str) -> dict[str, Any] | None:
+        cached = self.client.feed_cache.get((hostuin, fid))
+        if cached is not None:
+            return self._detail_payload_from_entry(cached)
+
+        fetchers: list[Any] = []
+        if hostuin == self.state.session.uin:
+            fetchers.append(self.client.legacy_recent_feeds)
+        fetchers.append(lambda: self.client.legacy_feeds(hostuin, page=1, num=20))
+
+        for fetch in fetchers:
+            try:
+                payload = unwrap_payload(await fetch())
+            except Exception as exc:
+                log.debug("qzone detail feed fallback failed: %s", exc)
+                continue
+            feedpage, entries = extract_feed_page(payload, default_hostuin=hostuin)
+            if not feedpage:
+                continue
+            self.client.cache_feed_page(hostuin, entries)
+            for entry in entries:
+                if entry.fid == fid:
+                    return self._detail_payload_from_entry(entry)
+        return None
+
     async def detail_feed(self, *, hostuin: int, fid: str, appid: int = 311, busi_param: str = "") -> dict[str, Any]:
         hostuin = int(hostuin or self.state.session.uin or 0)
         if not hostuin:
             raise QzoneNeedsRebind()
-        await self.ensure_token(hostuin)
-        payload = unwrap_payload(await self.client.detail(hostuin, fid, appid=appid, busi_param=busi_param))
-        if not isinstance(payload, dict):
-            raise QzoneParseError("说说详情返回格式异常")
-        entry = self.client.feed_entry_from_payload(payload, default_hostuin=hostuin)
-        self.client.cache_feed_page(hostuin, [entry])
-        comments = [item.to_dict() for item in extract_comments(payload)]
-        return {"entry": asdict(entry), "comments": comments, "raw": payload}
+        token_error: Exception | None = None
+        try:
+            await self.ensure_token(hostuin)
+        except (QzoneRequestError, QzoneParseError) as exc:
+            if not self._should_fallback_feed_fetch(exc):
+                raise
+            token_error = exc
+            log.warning("qzone detail token probe failed, trying detail without fresh token: %s", exc)
+
+        try:
+            payload = unwrap_payload(await self.client.detail(hostuin, fid, appid=appid, busi_param=busi_param))
+            if not isinstance(payload, dict):
+                raise QzoneParseError("说说详情返回格式异常")
+            entry = self.client.feed_entry_from_payload(payload, default_hostuin=hostuin)
+            return self._detail_payload_from_entry(entry)
+        except (QzoneRequestError, QzoneParseError) as exc:
+            if token_error is None and not self._should_fallback_feed_fetch(exc):
+                raise
+            log.warning("qzone detail primary fetch failed, using feed fallback: %s", exc)
+            fallback = await self._detail_from_cached_or_legacy_feed(hostuin=hostuin, fid=fid)
+            if fallback is not None:
+                return fallback
+            raise
 
     async def view_visitors(self, *, page: int = 1, count: int = 20) -> dict[str, Any]:
         self._ensure_session_ready()
