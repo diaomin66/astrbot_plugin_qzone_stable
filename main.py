@@ -164,10 +164,12 @@ _prepare_local_qzone_bridge_imports()
 from qzone_bridge.controller import QzoneDaemonController
 from qzone_bridge.drafts import DraftPost, DraftStore
 from qzone_bridge.errors import DaemonUnavailableError, QzoneBridgeError, QzoneCookieAcquireError, QzoneNeedsRebind
+from qzone_bridge.llm import QzoneLLM
 from qzone_bridge.media import PostPayload, collect_post_payload, normalize_media_list
 from qzone_bridge.models import FeedEntry
 from qzone_bridge.onebot_cookie import fetch_cookie_text
 from qzone_bridge.parser import normalize_uin, parse_cookie_text
+from qzone_bridge.post_service import QzonePostService
 from qzone_bridge.posts import PostStore
 from qzone_bridge.publish_renderer import RenderProfile, profile_from_event, render_publish_result_image
 from qzone_bridge.render import (
@@ -178,6 +180,7 @@ from qzone_bridge.render import (
     format_llm_feed_list,
     format_status,
 )
+from qzone_bridge.selection import PostSelection, parse_post_selection, selection_from_tool_args
 from qzone_bridge.settings import PluginSettings
 from qzone_bridge.social import QzoneComment, QzonePost, post_from_entry
 from qzone_bridge.utils import truncate
@@ -224,6 +227,7 @@ class QzoneStablePlugin(Star):
         self._publisher_profile_cache: tuple[int, float, Any] | None = None
         self.drafts = DraftStore(self.data_dir / "drafts.json")
         self.posts = PostStore(self.data_dir / "posts.json")
+        self.llm = QzoneLLM(self._context, self.settings)
         self._pillowmd_style: Any | None = None
         self._pillowmd_style_dir = ""
 
@@ -256,6 +260,18 @@ class QzoneStablePlugin(Star):
         if getattr(self.posts, "path", None) != expected:
             self.posts = PostStore(expected)
         return self.posts
+
+    def _post_service(self) -> QzonePostService:
+        return QzonePostService(
+            self.controller,
+            self._post_store(),
+            max_feed_limit=self.settings.max_feed_limit,
+        )
+
+    def _llm_adapter(self) -> QzoneLLM:
+        self.llm.context = getattr(self, "_context", None) or getattr(self, "context", None)
+        self.llm.settings = self.settings
+        return self.llm
 
     @staticmethod
     def _onebot_file_uri(path: Path) -> str:
@@ -689,77 +705,20 @@ class QzoneStablePlugin(Star):
         system_prompt = (
             "沿用当前聊天角色和语气。你只负责把结果变成自然口语回复，不能暴露任何内部实现信息。"
         )
-        context = getattr(self, "_context", None) or getattr(self, "context", None)
-
-        generator = getattr(context, "llm_generate", None)
-        if callable(generator):
-            kwargs: dict[str, Any] = {"prompt": prompt, "system_prompt": system_prompt}
-            provider_id = await self._current_provider_id(event)
-            if provider_id:
-                kwargs["chat_provider_id"] = provider_id
-            try:
-                response = await self._maybe_await(generator(**kwargs))
-            except TypeError:
-                kwargs.pop("chat_provider_id", None)
-                try:
-                    response = await self._maybe_await(generator(**kwargs))
-                except Exception as exc:
-                    logger.debug("qzone llm_generate reply failed: %s", exc)
-                else:
-                    text = self._text_from_llm_response(response)
-                    if self._llm_tool_reply_is_safe(text, payload):
-                        return text
-                    if text:
-                        logger.warning("discarded unsafe qzone llm tool reply: %s", truncate(text, 300))
-            except Exception as exc:
-                logger.debug("qzone llm_generate reply failed: %s", exc)
-            else:
-                text = self._text_from_llm_response(response)
-                if self._llm_tool_reply_is_safe(text, payload):
-                    return text
-                if text:
-                    logger.warning("discarded unsafe qzone llm tool reply: %s", truncate(text, 300))
-
-        provider_getter = getattr(context, "get_using_provider", None)
-        provider = None
-        if callable(provider_getter):
-            umo = getattr(event, "unified_msg_origin", None)
-            attempts: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
-            if umo is not None:
-                attempts.append(((), {"umo": umo}))
-                attempts.append(((umo,), {}))
-            attempts.append(((), {}))
-            for args, kwargs in attempts:
-                try:
-                    provider = await self._maybe_await(provider_getter(*args, **kwargs))
-                except TypeError:
-                    continue
-                except Exception as exc:
-                    logger.debug("qzone provider lookup failed: %s", exc)
-                    provider = None
-                    break
-                if provider is not None:
-                    break
-
-        text_chat = getattr(provider, "text_chat", None)
-        if callable(text_chat):
-            for kwargs in (
-                {"prompt": prompt, "contexts": [], "system_prompt": system_prompt},
-                {"prompt": prompt, "context": [], "system_prompt": system_prompt},
-                {"prompt": prompt},
-            ):
-                try:
-                    response = await self._maybe_await(text_chat(**kwargs))
-                except TypeError:
-                    continue
-                except Exception as exc:
-                    logger.debug("qzone provider text_chat reply failed: %s", exc)
-                    break
-                text = self._text_from_llm_response(response)
-                if self._llm_tool_reply_is_safe(text, payload):
-                    return text
-                if text:
-                    logger.warning("discarded unsafe qzone provider reply: %s", truncate(text, 300))
+        try:
+            text = await self._llm_adapter().generate_text(
+                event,
+                prompt,
+                system_prompt=system_prompt,
+                prefer_current_provider=True,
+            )
+        except Exception as exc:
+            logger.debug("qzone llm tool reply failed: %s", exc)
+        else:
+            if self._llm_tool_reply_is_safe(text, payload):
+                return text
+            if text:
+                logger.warning("discarded unsafe qzone llm tool reply: %s", truncate(text, 300))
 
         return fallback
 
@@ -954,25 +913,35 @@ class QzoneStablePlugin(Star):
         return deduped
 
     def _parse_target_range(self, event: AstrMessageEvent, names: tuple[str, ...]) -> tuple[int, int, int]:
-        raw = self._message_after_command(self._event_text(event), names)
-        target = 0
-        at_uins = self._at_uins(event, raw)
-        if at_uins:
-            target = at_uins[0]
-            raw = re.sub(r"\[CQ:at,qq=\d+[^\]]*\]|@\d{5,}", " ", raw, count=1).strip()
-        tokens = raw.split()
-        if not target and tokens and re.fullmatch(r"\d{5,}", tokens[0]):
-            target = int(tokens.pop(0))
-        start = end = 0
-        if tokens:
-            token = tokens[0].strip()
-            match = re.fullmatch(r"(-?\d+)(?:\s*~\s*(-?\d+))?", token)
-            if match:
-                start = int(match.group(1))
-                end = int(match.group(2) if match.group(2) is not None else start)
-                if start >= 0 and end >= 0 and end < start:
-                    start, end = end, start
-        return target, start, end
+        selection = parse_post_selection(self._event_text(event), names)
+        return selection.target_uin, selection.start, selection.end
+
+    def _selection_for_event(self, event: AstrMessageEvent, names: tuple[str, ...]) -> PostSelection:
+        return parse_post_selection(self._event_text(event), names)
+
+    async def _posts_for_selection(
+        self,
+        selection: PostSelection,
+        *,
+        target_id: int | None = None,
+        with_detail: bool = False,
+        no_commented: bool = False,
+        no_self: bool = False,
+        login_uin: int | None = None,
+    ) -> list[QzonePost]:
+        if target_id is not None:
+            selection.target_uin = int(target_id)
+        return await self._post_service().resolve_posts(
+            selection,
+            with_detail=with_detail,
+            no_commented=no_commented,
+            no_self=no_self,
+            login_uin=self._self_id_placeholder(login_uin),
+        )
+
+    @staticmethod
+    def _self_id_placeholder(login_uin: int | None) -> int:
+        return int(login_uin or 0)
 
     async def _posts_for_event(
         self,
@@ -984,64 +953,14 @@ class QzoneStablePlugin(Star):
         no_commented: bool = False,
         no_self: bool = False,
     ) -> list[QzonePost]:
-        parsed_target, start, end = self._parse_target_range(event, names)
-        hostuin = int(target_id if target_id is not None else parsed_target)
-        if start < 0 or end < 0:
-            limit = self.settings.max_feed_limit
-        else:
-            limit = min(max(end + 1, 1), self.settings.max_feed_limit)
-        payload = await self.controller.list_feeds(
-            hostuin=hostuin,
-            limit=limit,
-            scope="profile" if hostuin else "",
+        return await self._posts_for_selection(
+            self._selection_for_event(event, names),
+            target_id=target_id,
+            with_detail=with_detail,
+            no_commented=no_commented,
+            no_self=no_self,
+            login_uin=self._self_id(event),
         )
-        entries = self._to_feed_entries(payload)
-        if start < 0 or end < 0:
-            selected = entries[-1:] if entries else []
-        else:
-            selected = entries[start : end + 1]
-        login_uin = self._self_id(event)
-        posts: list[QzonePost] = []
-        for offset, entry in enumerate(selected, start=max(start, 0)):
-            detail_payload: dict[str, Any] | None = None
-            if with_detail or no_commented:
-                try:
-                    detail_payload = await self.controller.detail_feed(
-                        hostuin=entry.hostuin,
-                        fid=entry.fid,
-                        appid=entry.appid,
-                    )
-                    entry_data = detail_payload.get("entry")
-                    if isinstance(entry_data, dict):
-                        detail_entry = FeedEntry(**entry_data)
-                        if detail_entry.fid == entry.fid and detail_entry.hostuin == entry.hostuin:
-                            entry = detail_entry
-                except Exception as exc:
-                    if with_detail:
-                        raise
-                    logger.debug("qzone detail fetch for filtering failed: %s", exc)
-            post = post_from_entry(entry, detail=(detail_payload or {}).get("raw"), local_id=offset)
-            if detail_payload and detail_payload.get("comments"):
-                post.comments = [
-                    QzoneComment(
-                        commentid=str(item.get("commentid") or ""),
-                        uin=int(item.get("uin") or 0),
-                        nickname=str(item.get("nickname") or ""),
-                        content=str(item.get("content") or ""),
-                        created_at=int(item.get("created_at") or item.get("date") or 0),
-                        parent_id=str(item.get("parent_id") or ""),
-                    )
-                    for item in detail_payload.get("comments") or []
-                    if isinstance(item, dict)
-                ]
-                post.comment_count = max(post.comment_count, len(post.comments))
-            if no_self and login_uin and post.hostuin == login_uin:
-                continue
-            if no_commented and login_uin and any(comment.uin == login_uin for comment in post.comments):
-                continue
-            self._post_store().upsert(post)
-            posts.append(post)
-        return posts
 
     @staticmethod
     def _format_posts(posts: list[QzonePost], *, detail: bool = False) -> str:
@@ -1269,60 +1188,22 @@ class QzoneStablePlugin(Star):
         provider_id: str = "",
         system_prompt: str = "",
     ) -> str:
-        context = getattr(self, "_context", None) or getattr(self, "context", None)
-        provider = None
-        if context is not None:
-            try:
-                getter = getattr(context, "get_provider_by_id", None)
-                provider = getter(provider_id) if provider_id and callable(getter) else None
-            except Exception:
-                provider = None
-            if provider is None:
-                try:
-                    getter = getattr(context, "get_using_provider", None)
-                    provider = getter() if callable(getter) else None
-                except Exception:
-                    provider = None
-        text_chat = getattr(provider, "text_chat", None)
-        if callable(text_chat):
-            kwargs: dict[str, Any] = {"prompt": prompt}
-            if system_prompt:
-                kwargs["system_prompt"] = system_prompt
-            response = await self._maybe_await(text_chat(**kwargs))
-            return self._text_from_llm_response(response)
-        generator = getattr(context, "llm_generate", None)
-        if callable(generator):
-            kwargs: dict[str, Any] = {"prompt": prompt}
-            if system_prompt:
-                kwargs["system_prompt"] = system_prompt
-            if provider_id:
-                kwargs["chat_provider_id"] = provider_id
-            try:
-                response = await self._maybe_await(generator(**kwargs))
-            except TypeError:
-                kwargs.pop("chat_provider_id", None)
-                response = await self._maybe_await(generator(**kwargs))
-            return self._text_from_llm_response(response)
-        return ""
+        return await self._llm_adapter().generate_text(
+            event,
+            prompt,
+            provider_id=provider_id,
+            system_prompt=system_prompt,
+        )
 
     async def _generate_post_text(self, event: AstrMessageEvent, topic: str = "") -> str:
-        prompt = self.settings.post_prompt
-        if topic.strip():
-            prompt = f"{prompt}\n\n主题：{topic.strip()}"
         history = await self._chat_history_context(event)
-        if history:
-            prompt = f"{prompt}\n\n聊天记录参考：\n{truncate(history, 8000)}"
-        return await self._generate_text(event, prompt, provider_id=self.settings.post_provider_id)
+        return await self._llm_adapter().generate_post_text(event, topic, history=history)
 
     async def _generate_comment_text(self, event: AstrMessageEvent, post: QzonePost) -> str:
-        prompt = f"{self.settings.comment_prompt}\n\n说说内容：{post.summary}"
-        text = await self._generate_text(event, prompt, provider_id=self.settings.comment_provider_id)
-        return re.sub(r"[\s\u3000]+", "", text).rstrip("。")
+        return await self._llm_adapter().generate_comment_text(event, post)
 
     async def _generate_reply_text(self, event: AstrMessageEvent, post: QzonePost, comment: QzoneComment) -> str:
-        prompt = f"{self.settings.reply_prompt}\n\n说说内容：{post.summary}\n评论：{comment.content}"
-        text = await self._generate_text(event, prompt, provider_id=self.settings.reply_provider_id)
-        return re.sub(r"[\s\u3000]+", "", text).rstrip("。")
+        return await self._llm_adapter().generate_reply_text(event, post, comment)
 
     @staticmethod
     def _cron_delay_seconds(cron: str, offset_seconds: int) -> float:
@@ -1431,15 +1312,9 @@ class QzoneStablePlugin(Star):
             text = await self._generate_comment_text(None, post)  # type: ignore[arg-type]
             if not text.strip():
                 continue
-            await self.controller.comment_post(
-                hostuin=entry.hostuin,
-                fid=entry.fid,
-                content=text.strip(),
-                appid=entry.appid,
-                busi_param=entry.busi_param,
-            )
+            await self._post_service().comment_post(post, text.strip())
             if self.settings.like_when_comment:
-                await self.controller.like_post(hostuin=entry.hostuin, fid=entry.fid, appid=entry.appid)
+                await self._post_service().like_post(post)
             commented_keys.add(key)
             self._save_auto_comment_keys(commented_keys)
             break
@@ -1617,15 +1492,9 @@ class QzoneStablePlugin(Star):
             content = await self._generate_comment_text(event, post)
             if not content.strip():
                 return
-            await self.controller.comment_post(
-                hostuin=post.hostuin,
-                fid=post.fid,
-                content=content.strip(),
-                appid=post.appid,
-                busi_param=post.busi_param,
-            )
+            await self._post_service().comment_post(post, content.strip())
             if self.settings.like_when_comment:
-                await self.controller.like_post(hostuin=post.hostuin, fid=post.fid, appid=post.appid)
+                await self._post_service().like_post(post)
         except Exception as exc:
             logger.debug("qzone probabilistic read/comment failed: %s", exc)
 
@@ -1657,30 +1526,25 @@ class QzoneStablePlugin(Star):
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
-            posts = await self._posts_for_event(
-                event,
-                ("评说说", "评论说说", "读说说"),
+            selection = self._selection_for_event(event, ("评说说", "评论说说", "读说说"))
+            posts = await self._posts_for_selection(
+                selection,
                 with_detail=True,
                 no_commented=True,
                 no_self=True,
+                login_uin=self._self_id(event),
             )
             if not posts:
                 yield self._command_result(event, "没有找到适合评论的说说。")
                 return
             lines: list[str] = []
             for post in posts:
-                content = await self._generate_comment_text(event, post)
+                content = selection.comment_text or await self._generate_comment_text(event, post)
                 if not content.strip():
                     content = "挺有意思的。"
-                await self.controller.comment_post(
-                    hostuin=post.hostuin,
-                    fid=post.fid,
-                    content=content.strip(),
-                    appid=post.appid,
-                    busi_param=post.busi_param,
-                )
+                await self._post_service().comment_post(post, content)
                 if self.settings.like_when_comment:
-                    await self.controller.like_post(hostuin=post.hostuin, fid=post.fid, appid=post.appid)
+                    await self._post_service().like_post(post)
                 lines.append(f"已评论第 {post.local_id} 条：{truncate(content, 60)}")
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
@@ -1698,7 +1562,7 @@ class QzoneStablePlugin(Star):
                 return
             lines: list[str] = []
             for post in posts:
-                payload = await self.controller.like_post(hostuin=post.hostuin, fid=post.fid, appid=post.appid)
+                payload = await self._post_service().like_post(post)
                 lines.append(format_like_result(payload))
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
@@ -1955,9 +1819,10 @@ class QzoneStablePlugin(Star):
         text = "\n".join(
             [
                 "QQ 空间命令",
+                "序号从 1 开始；最新/0 表示最新一条，支持 1~3、@用户 2。",
                 "查看访客",
                 "看说说/查看说说 [@用户] [序号/范围]",
-                "评说说/评论说说/读说说 [@用户] [序号/范围]",
+                "评说说/评论说说/读说说 [@用户] [序号/范围] [评论内容]",
                 "赞说说 [@用户] [序号/范围]",
                 "发说说 <内容> [图片]",
                 "写说说/写稿 <主题> [图片]",
@@ -1981,6 +1846,7 @@ class QzoneStablePlugin(Star):
                 "llm_publish_feed",
                 "qzone_get_status",
                 "qzone_list_feed",
+                "qzone_view_post",
                 "qzone_detail_feed",
                 "qzone_publish_post",
                 "qzone_comment_post",
@@ -2147,34 +2013,28 @@ class QzoneStablePlugin(Star):
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
             hostuin = int(user_id or self._sender_id(event) or 0)
-            limit = self.settings.max_feed_limit if pos < 0 else min(max(pos + 1, 1), self.settings.max_feed_limit)
-            payload = await self.controller.list_feeds(hostuin=hostuin, limit=limit, scope="profile")
-            entries = self._to_feed_entries(payload)
-            if not entries:
+            selection = PostSelection(
+                target_uin=hostuin,
+                start=(pos + 1 if pos >= 0 else -1),
+                end=(pos + 1 if pos >= 0 else -1),
+                selector="index" if pos >= 0 else "last",
+            )
+            posts = await self._posts_for_selection(selection, with_detail=True, login_uin=self._self_id(event))
+            if not posts:
                 return "查询结果为空。"
-            entry = entries[pos] if 0 <= pos < len(entries) else entries[-1]
-            detail = await self.controller.detail_feed(hostuin=entry.hostuin, fid=entry.fid, appid=entry.appid)
-            entry_data = detail.get("entry")
-            detail_entry = FeedEntry(**entry_data) if isinstance(entry_data, dict) else entry
-            post = post_from_entry(detail_entry, detail=detail.get("raw"), local_id=pos)
+            post = posts[0]
             actions: list[str] = []
             if reply:
                 content = await self._generate_comment_text(event, post)
                 if not content.strip():
                     content = "挺有意思的。"
-                await self.controller.comment_post(
-                    hostuin=post.hostuin,
-                    fid=post.fid,
-                    content=content.strip(),
-                    appid=post.appid,
-                    busi_param=post.busi_param,
-                )
+                await self._post_service().comment_post(post, content.strip())
                 actions.append("已评论")
             if like:
-                await self.controller.like_post(hostuin=post.hostuin, fid=post.fid, appid=post.appid)
+                await self._post_service().like_post(post)
                 actions.append("已点赞")
             prefix = "，".join(actions)
-            return "\n".join(part for part in (prefix, post.detail_text(pos)) if part)
+            return "\n".join(part for part in (prefix, post.detail_text(post.local_id)) if part)
         except Exception as exc:
             logger.warning("llm_view_feed failed: %s", exc)
             return str(getattr(exc, "message", str(exc)))
@@ -2227,23 +2087,34 @@ class QzoneStablePlugin(Star):
         yield event.plain_result(format_status(payload))
 
     @filter.llm_tool(name="qzone_list_feed")
-    async def tool_list_feed(self, event: AstrMessageEvent, hostuin: int = 0, limit: int = 5, cursor: str = "", scope: str = ""):
+    async def tool_list_feed(
+        self,
+        event: AstrMessageEvent,
+        target_uin: int = 0,
+        limit: int = 5,
+        cursor: str = "",
+        scope: str = "auto",
+        hostuin: int = 0,
+    ):
         """获取 QQ 空间说说列表。
 
         Args:
-            hostuin (number): 目标 QQ 号，0 表示当前登录账号。
+            target_uin (number): 目标 QQ 号，0 表示当前登录账号或好友动态流。
             limit (number): 返回数量。
             cursor (string): 翻页游标。
-            scope (string): self ? profile?
+            scope (string): auto/self/profile。
+            hostuin (number): 兼容旧参数，优先级低于 target_uin。
         """
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
+            effective_hostuin = int(target_uin or hostuin or 0)
+            effective_scope = "" if scope == "auto" else scope
             payload = await self.controller.list_feeds(
-                hostuin=hostuin,
+                hostuin=effective_hostuin,
                 limit=self._limit(limit),
                 cursor=cursor,
-                scope=scope,
+                scope=effective_scope,
             )
         except QzoneBridgeError as exc:
             yield event.plain_result(self._error_text(exc))
@@ -2268,6 +2139,43 @@ class QzoneStablePlugin(Star):
             yield event.plain_result(self._error_text(exc))
             return
         yield event.plain_result(self._render_detail(payload))
+
+    @filter.llm_tool(name="qzone_view_post")
+    async def tool_view_post(
+        self,
+        event: AstrMessageEvent,
+        target_uin: int = 0,
+        selector: str = "latest",
+        detail: bool = True,
+        hostuin: int = 0,
+        fid: str = "",
+        appid: int = 311,
+    ):
+        """按自然选择器查看一条或多条 QQ 空间说说。
+
+        Args:
+            target_uin (number): 目标 QQ 号，0 表示当前登录账号或好友动态流。
+            selector (string): latest、最新、第2条、2、1~3 或 fid。
+            detail (boolean): 是否获取评论等详情。
+            hostuin (number): 兼容旧参数。
+            fid (string): 兼容旧参数。
+            appid (number): 兼容旧参数。
+        """
+        try:
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            selection = selection_from_tool_args(
+                target_uin=target_uin,
+                selector=selector,
+                hostuin=hostuin,
+                fid=fid,
+                appid=appid,
+            )
+            posts = await self._posts_for_selection(selection, with_detail=detail, login_uin=self._self_id(event))
+        except QzoneBridgeError as exc:
+            yield event.plain_result(self._error_text(exc))
+            return
+        yield event.plain_result(self._format_posts(posts, detail=detail))
 
     @filter.llm_tool(name="qzone_publish_post")
     async def tool_publish_post(
@@ -2321,50 +2229,109 @@ class QzoneStablePlugin(Star):
     async def tool_comment_post(
         self,
         event: AstrMessageEvent,
-        hostuin: int,
-        fid: str,
-        content: str,
+        target_uin: int = 0,
+        selector: str = "latest",
+        content: str = "",
+        auto_generate: bool = True,
+        private: bool = False,
+        like_after_comment: bool = False,
+        hostuin: int = 0,
+        fid: str = "",
         confirm: bool = False,
         appid: int = 311,
-        private: bool = False,
+        latest: bool = False,
+        index: int = 0,
     ):
-        """评论一条说说。
+        """按自然选择器评论一条说说。
 
         Args:
-            hostuin (number): 目标 QQ 号。
-            fid (string): 说说 fid。
-            content (string): 评论内容。
-            confirm (boolean): 是否确认评论。
-            appid (number): 应用 id。
+            target_uin (number): 目标 QQ 号，0 表示当前登录账号或好友动态流。
+            selector (string): latest、最新、第2条、2、1~3 或 fid。
+            content (string): 评论内容，留空时可由 LLM 生成。
+            auto_generate (boolean): content 为空时是否自动生成评论。
             private (boolean): 是否私密评论。
+            like_after_comment (boolean): 评论后是否顺手点赞。
+            hostuin/fid/confirm/appid/latest/index: 兼容旧参数。
         """
+        arguments = {
+            "target_uin": target_uin,
+            "selector": selector,
+            "content": content,
+            "auto_generate": auto_generate,
+            "private": private,
+            "like_after_comment": like_after_comment,
+            "hostuin": hostuin,
+            "fid": fid,
+            "confirm": confirm,
+            "appid": appid,
+            "latest": latest,
+            "index": index,
+        }
         if not self._is_admin(event):
-            yield event.plain_result("只有管理员可以评论。")
-            return
-        if self.settings.preview_writes and not confirm:
-            yield event.plain_result(
-                f"评论预览: hostuin={hostuin}, fid={fid}, content={truncate(content, 120)}。确认后再发布。"
+            payload = {"ok": False, "tool": "qzone_comment_post", "public_reason": "没有权限"}
+            self._log_tool_call_result({**payload, "arguments": arguments})
+            text = await self._ask_llm_tool_reply(
+                event,
+                payload,
+                self._llm_error_fallback_text("没有权限"),
             )
+            yield event.plain_result(text)
             return
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
-            payload = await self.controller.comment_post(
+            selection = selection_from_tool_args(
+                target_uin=target_uin,
+                selector=selector,
                 hostuin=hostuin,
                 fid=fid,
-                content=content,
                 appid=appid,
-                private=private,
+                latest=latest,
+                index=index,
             )
+            posts = await self._posts_for_selection(
+                selection,
+                with_detail=auto_generate and not content.strip(),
+                login_uin=self._self_id(event),
+            )
+            if not posts:
+                raise QzoneBridgeError("没有找到可评论的说说")
+            results: list[dict[str, Any]] = []
+            for post in posts:
+                comment_text = content.strip()
+                if not comment_text and auto_generate:
+                    comment_text = await self._generate_comment_text(event, post)
+                if not comment_text:
+                    raise QzoneBridgeError("评论内容为空")
+                payload = await self._post_service().comment_post(post, comment_text, private=private)
+                results.append({"post": QzonePostService.post_payload(post), "comment": comment_text, "result": payload})
+                if like_after_comment:
+                    await self._post_service().like_post(post)
         except QzoneBridgeError as exc:
-            yield event.plain_result(self._error_text(exc))
+            log_payload = self._bridge_error_log_payload("qzone_comment_post", exc, arguments)
+            self._log_tool_call_result(log_payload)
+            text = await self._ask_llm_tool_reply(
+                event,
+                self._llm_error_payload("qzone_comment_post", exc),
+                self._llm_error_fallback_text(exc.message),
+            )
+            yield event.plain_result(text)
             return
-        yield event.plain_result(format_action_result("评论结果", payload))
+        log_payload = {"ok": True, "tool": "qzone_comment_post", "arguments": arguments, "result": results}
+        self._log_tool_call_result(log_payload)
+        text = await self._ask_llm_tool_reply(
+            event,
+            {"ok": True, "tool": "qzone_comment_post", "result": {"message": "评论发好了。", "count": len(results)}},
+            "评论发好了。",
+        )
+        yield event.plain_result(text)
 
     @filter.llm_tool(name="qzone_like_post")
     async def tool_like_post(
         self,
         event: AstrMessageEvent,
+        target_uin: int = 0,
+        selector: str = "latest",
         hostuin: int = 0,
         fid: str = "",
         confirm: bool = False,
@@ -2376,8 +2343,10 @@ class QzoneStablePlugin(Star):
         """点赞或取消点赞一条说说。
 
         Args:
-            hostuin (number): 目标 QQ 号，`0` 表示当前登录账号。
-            fid (string): 说说 fid，也可以用最近列表的序号。
+            target_uin (number): 目标 QQ 号，`0` 表示当前登录账号或好友动态流。
+            selector (string): latest、最新、第2条、2、1~3 或 fid。
+            hostuin (number): 兼容旧参数，目标 QQ 号。
+            fid (string): 兼容旧参数，说说 fid，也可以用最近列表的序号。
             confirm (boolean): 兼容旧参数，目前不会拦截执行。
             appid (number): 说说 appid，默认 `311`。
             unlike (boolean): 为 `true` 时取消点赞。
@@ -2385,6 +2354,8 @@ class QzoneStablePlugin(Star):
             index (number): 操作最近列表第 N 条，`1` 表示第一条。
         """
         arguments = {
+            "target_uin": target_uin,
+            "selector": selector,
             "hostuin": hostuin,
             "fid": fid,
             "confirm": confirm,
@@ -2419,14 +2390,35 @@ class QzoneStablePlugin(Star):
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
-            payload = await self.controller.like_post(
-                hostuin=hostuin,
-                fid=fid,
-                appid=appid,
-                unlike=unlike,
-                latest=latest,
-                index=index,
-            )
+            legacy_direct = bool(fid or latest or index)
+            if legacy_direct:
+                effective_hostuin = int(hostuin or target_uin or 0)
+                payload = await self.controller.like_post(
+                    hostuin=effective_hostuin,
+                    fid=fid,
+                    appid=appid,
+                    unlike=unlike,
+                    latest=latest,
+                    index=index,
+                )
+            else:
+                selection = selection_from_tool_args(
+                    target_uin=target_uin,
+                    selector=selector,
+                    hostuin=hostuin,
+                    appid=appid,
+                )
+                posts = await self._posts_for_selection(selection, login_uin=self._self_id(event))
+                if not posts:
+                    raise QzoneBridgeError("没有找到可点赞的说说")
+                payloads = [await self._post_service().like_post(post, unlike=unlike) for post in posts]
+                payload = payloads[0] if len(payloads) == 1 else {
+                    "action": "unlike" if unlike else "like",
+                    "liked": not unlike,
+                    "verified": all(item.get("verified", True) is not False for item in payloads),
+                    "summary": f"{len(payloads)} 条说说",
+                    "items": payloads,
+                }
         except QzoneBridgeError as exc:
             log_payload = self._bridge_error_log_payload("qzone_like_post", exc, arguments)
             self._log_tool_call_result(log_payload)

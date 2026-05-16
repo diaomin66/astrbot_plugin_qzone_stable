@@ -14,13 +14,13 @@
 
 ## 中文命令
 
-序号从 `0` 开始，`0` 表示最新一条，`-1` 表示当前页最后一条，支持范围语法如 `2~5`。`@用户` 或 QQ 号表示查看指定用户空间；不指定时默认查看好友动态流。
+序号按日常说法从 `1` 开始，`1`/`最新` 表示最新一条，`-1` 表示当前页最后一条，支持范围语法如 `1~3`。旧习惯里的 `0` 仍兼容为最新一条。`@用户` 或 QQ 号表示查看指定用户空间；不指定时默认查看好友动态流。
 
 | 命令 | 别名 | 权限 | 参数 | 功能 |
 | --- | --- | --- | --- | --- |
 | 查看访客 | - | ADMIN | - | 查看最近访客 |
 | 看说说 | 查看说说 | ALL | `[@用户/QQ] [序号/范围]` | 查看说说详情 |
-| 评说说 | 评论说说、读说说 | ALL | `[@用户/QQ] [序号/范围]` | AI 评论说说，可配置评论后点赞 |
+| 评说说 | 评论说说、读说说 | ALL | `[@用户/QQ] [序号/范围] [评论内容]` | 评论说说，内容为空时由 AI 生成，可配置评论后点赞 |
 | 赞说说 | - | ALL | `[@用户/QQ] [序号/范围]` | 点赞说说 |
 | 发说说 | - | ADMIN | `<文本> [图片]` | 立即发布说说 |
 | 写说说 | 写稿 | ADMIN | `<主题> [图片]` | AI 生成待审核稿件 |
@@ -52,10 +52,13 @@
 
 - `qzone_get_status`
 - `qzone_list_feed`
+- `qzone_view_post`
 - `qzone_detail_feed`
 - `qzone_publish_post`
 - `qzone_comment_post`
 - `qzone_like_post`
+
+`qzone_view_post`、`qzone_comment_post`、`qzone_like_post` 优先使用 `target_uin` + `selector`，其中 `selector` 可写 `latest`、`最新`、`第2条`、`2`、`1~3` 或真实 `fid`。旧的 `hostuin/fid/appid/latest/index` 仍保留兼容。
 
 `qzone_like_post` 会继续区分“请求已被 QQ 空间接受”和“读回校验暂未同步”，不会因为 QQ 空间显示滞后把成功操作误报成失败；用户可见回复会交给 LLM 组织成自然语言，避免泄露 raw JSON、fid、cursor、status_code 等内部字段。
 
@@ -67,6 +70,7 @@
 - `pillowmd_style_dir`：可选的 pillowmd 样式目录；配置后会优先把说说/稿件展示渲染成图片。
 - `llm.post_provider_id` / `llm.comment_provider_id` / `llm.reply_provider_id`：分别指定写稿、评论、回评的 LLM provider。
 - `llm.post_prompt` / `llm.comment_prompt` / `llm.reply_prompt`：提示词。
+- `llm.comment_max_length`：AI 评论和回评最大长度。
 - `source.ignore_groups` / `source.ignore_users` / `source.post_max_msg`：自动写稿/读说说来源控制，AI 写稿会尽量抽取群聊文本作为参考上下文。
 - `trigger.publish_cron` / `trigger.publish_offset`：自动发说说基准时间和随机偏移秒数。
 - `trigger.comment_cron` / `trigger.comment_offset`：自动评论基准时间和随机偏移秒数。
