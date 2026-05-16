@@ -667,6 +667,7 @@ class QzoneDaemonController:
         content: str,
         appid: int = 311,
         private: bool = False,
+        busi_param: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return await self._request(
             "POST",
@@ -677,6 +678,7 @@ class QzoneDaemonController:
                 "content": content,
                 "appid": appid,
                 "private": private,
+                "busi_param": busi_param or {},
             },
         )
 

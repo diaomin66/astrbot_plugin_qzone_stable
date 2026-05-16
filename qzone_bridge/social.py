@@ -87,6 +87,7 @@ class QzonePost:
     liked: bool = False
     images: list[str] = field(default_factory=list)
     comments: list[QzoneComment] = field(default_factory=list)
+    busi_param: dict[str, Any] = field(default_factory=dict)
     local_id: int = 0
     saved_id: int = 0
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
@@ -222,6 +223,7 @@ def post_from_entry(entry: FeedEntry, *, detail: dict[str, Any] | None = None, l
         liked=entry.liked,
         images=extract_images(raw or {}),
         comments=comments,
+        busi_param=dict(entry.busi_param or {}),
         local_id=local_id,
         raw=dict(raw or {}),
     )

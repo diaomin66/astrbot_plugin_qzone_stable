@@ -1,3 +1,4 @@
+import json
 import unittest
 from urllib.parse import parse_qs
 
@@ -92,6 +93,62 @@ class ClientErrorMappingTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(QzoneRequestError) as caught:
             await self.client._request_json("GET", "https://mobile.qzone.qq.com/feeds/mfeeds_get_count")
         self.assertNotIsInstance(caught.exception, QzoneNeedsRebind)
+
+    async def test_add_comment_sends_browser_compatible_form(self):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["url"] = request.url
+            seen["headers"] = request.headers
+            seen["form"] = parse_qs(request.content.decode(), keep_blank_values=True)
+            return httpx.Response(200, json={"code": 0, "commentid": "c1", "message": "ok"}, request=request)
+
+        await self._use_response(handler)
+
+        payload = await self.client.add_comment(
+            654321,
+            "fid-1",
+            "hello",
+            appid=311,
+            busi_param={"ugc": 1},
+        )
+
+        form = seen["form"]
+        self.assertEqual(payload["commentid"], "c1")
+        self.assertEqual(seen["url"].params.get("g_tk"), str(self.client.gtk))
+        self.assertEqual(seen["headers"]["referer"], "https://user.qzone.qq.com/654321/mood/fid-1")
+        self.assertEqual(form["topicId"][0], "654321_fid-1__1")
+        self.assertEqual(form["uin"][0], "123456")
+        self.assertEqual(form["hostUin"][0], "654321")
+        self.assertEqual(form["content"][0], "hello")
+        self.assertEqual(form["platformid"][0], "50")
+        self.assertEqual(form["paramstr"][0], "1")
+        self.assertEqual(form["isSignIn"][0], "0")
+        self.assertEqual(form["richval"][0], "")
+        self.assertEqual(form["richtype"][0], "")
+        self.assertEqual(form["appid"][0], "311")
+        self.assertEqual(form["qzreferrer"][0], "https://user.qzone.qq.com/654321/mood/fid-1")
+        self.assertEqual(json.loads(form["busi_param"][0]), {"ugc": 1})
+
+    async def test_reply_comment_uses_same_browser_comment_fields(self):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["form"] = parse_qs(request.content.decode(), keep_blank_values=True)
+            return httpx.Response(200, json={"code": 0, "commentid": "r1", "message": "ok"}, request=request)
+
+        await self._use_response(handler)
+
+        payload = await self.client.reply_comment(654321, "fid-1", "c1", 9988, "reply")
+
+        form = seen["form"]
+        self.assertEqual(payload["commentid"], "r1")
+        self.assertEqual(form["platformid"][0], "50")
+        self.assertEqual(form["paramstr"][0], "1")
+        self.assertEqual(form["isSignIn"][0], "0")
+        self.assertEqual(form["commentId"][0], "c1")
+        self.assertEqual(form["commentUin"][0], "9988")
+        self.assertEqual(form["qzreferrer"][0], "https://user.qzone.qq.com/654321/mood/fid-1")
 
     async def test_jsonish_qzone_payload_falls_back_to_js_literal_parser(self):
         text = """

@@ -469,11 +469,21 @@ class QzoneDaemonService:
         content: str,
         appid: int = 311,
         private: bool = False,
+        busi_param: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not content.strip():
             raise QzoneParseError("评论内容不能为空")
         self._ensure_session_ready()
-        payload = unwrap_payload(await self.client.add_comment(hostuin, fid, content, appid=appid, private=private))
+        payload = unwrap_payload(
+            await self.client.add_comment(
+                hostuin,
+                fid,
+                content,
+                appid=appid,
+                private=private,
+                busi_param=busi_param or {},
+            )
+        )
         if not isinstance(payload, dict):
             raise QzoneParseError("评论发布返回格式异常")
         self._set_success(defer_save=True)
@@ -925,6 +935,9 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
 
     async def comment(request: web.Request) -> web.Response:
         body = await _json_body(request)
+        busi_param = body.get("busi_param")
+        if not isinstance(busi_param, dict):
+            busi_param = {}
         try:
             payload = await service.comment_post(
                 hostuin=int(body.get("hostuin") or 0),
@@ -932,6 +945,7 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
                 content=str(body.get("content") or ""),
                 appid=int(body.get("appid") or 311),
                 private=bool(body.get("private") or False),
+                busi_param=busi_param,
             )
         except QzoneBridgeError as exc:
             service._set_error(exc)
