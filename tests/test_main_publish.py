@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import inspect
 import json
 import sys
 import tempfile
@@ -871,6 +872,15 @@ class MainPublishTests(unittest.TestCase):
         self.assertIn("Alice: nice", first_prompt)
         self.assertNotIn("fid-2", first_prompt)
         self.assertEqual(results[0], "评论好了。")
+
+    def test_llm_comment_tool_docstring_keeps_compat_args_separately_typed(self):
+        module = self.load_main_module()
+
+        doc = inspect.getdoc(module.QzoneStablePlugin.tool_comment_post) or ""
+
+        self.assertNotIn("hostuin/fid/confirm/appid/latest/index", doc)
+        for name in ("hostuin", "fid", "confirm", "appid", "latest", "index"):
+            self.assertRegex(doc, rf"(?m)^\s*{name}\s+\([^)]+\):")
 
     def test_comment_feed_uses_explicit_comment_text_without_llm(self):
         module = self.load_main_module()

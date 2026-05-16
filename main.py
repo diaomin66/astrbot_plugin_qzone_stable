@@ -2251,7 +2251,12 @@ class QzoneStablePlugin(Star):
             auto_generate (boolean): content 为空时是否自动生成评论。
             private (boolean): 是否私密评论。
             like_after_comment (boolean): 评论后是否顺手点赞。
-            hostuin/fid/confirm/appid/latest/index: 兼容旧参数。
+            hostuin (number): 兼容旧参数，目标 QQ 号。
+            fid (string): 兼容旧参数，说说 fid。
+            confirm (boolean): 兼容旧参数，目前不会拦截执行。
+            appid (number): 兼容旧参数，说说 appid，默认 311。
+            latest (boolean): 兼容旧参数，为 true 时操作最新一条说说。
+            index (number): 兼容旧参数，操作最近列表第 N 条。
         """
         arguments = {
             "target_uin": target_uin,
