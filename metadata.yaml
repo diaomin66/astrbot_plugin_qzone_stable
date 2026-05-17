@@ -1,7 +1,6 @@
 name: astrbot_plugin_qzone_ultra
 version: 0.2.0
 author: 雪碧bir
-description: QQ空间Ultra，对标 QQ 空间中文命令体系，支持看/评/赞/发/写/删说说、回评、投稿审核、自动发评和 LLM tools。
 desc: QQ空间Ultra，对标 QQ 空间中文命令体系，支持看/评/赞/发/写/删说说、回评、投稿审核、自动发评和 LLM tools。
 short_desc: QQ空间Ultra 中文命令与 LLM 工具插件
 display_name: QQ空间Ultra
