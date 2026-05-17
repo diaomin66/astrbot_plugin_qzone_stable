@@ -7,5 +7,6 @@ short_desc: QQ空间Ultra 中文命令与 LLM 工具插件
 display_name: QQ空间Ultra
 repo: https://github.com/diaomin66/astrbot_plugin_qzone_ultra
 entry: main.py
-support_platforms: []
+support_platforms:
+  - aiocqhttp
 astrbot_version: ">=4.0.0"
