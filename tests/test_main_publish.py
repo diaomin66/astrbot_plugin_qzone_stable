@@ -168,6 +168,7 @@ class MainPublishTests(unittest.TestCase):
             get_status=AsyncMock(return_value={"login_uin": 0}),
             publish_post=AsyncMock(return_value={"fid": "fid-1", "message": "ok"}),
         )
+        plugin._schedule_publish_render_asset_preload = lambda *args, **kwargs: None
         return plugin
 
     def test_legacy_qzone_group_subcommands_stay_registered(self):
@@ -368,20 +369,23 @@ class MainPublishTests(unittest.TestCase):
         )
         self.assertTrue(Path(results[0]["image"]).exists())
 
-    def test_qzone_post_renders_logged_in_qzone_publisher(self):
+    def test_qzone_post_uses_preloaded_qzone_publisher_profile(self):
         module = self.load_main_module()
         plugin = self.make_plugin(module)
         plugin.controller.get_status = AsyncMock(return_value={"login_uin": 123456})
+        cached_avatar = plugin.data_dir / "render_assets" / "avatar_123456.png"
+        cached_avatar.parent.mkdir(parents=True, exist_ok=True)
+        cached_avatar.write_bytes(b"png")
+        plugin._publisher_profile_cache = (
+            123456,
+            module.RenderProfile(nickname="QzoneOwner", user_id="123456", avatar_source=str(cached_avatar)),
+        )
         fake_image = plugin.data_dir / "rendered.png"
         fake_image.write_bytes(b"png")
         captured = {}
 
-        async def get_stranger_info(**kwargs):
-            self.assertEqual(kwargs["user_id"], 123456)
-            return {"nickname": "QzoneOwner"}
-
         event = Event([Plain("/qzone post hello")])
-        event.bot = types.SimpleNamespace(get_stranger_info=get_stranger_info)
+        event.bot = types.SimpleNamespace(get_stranger_info=AsyncMock(return_value={"nickname": "NetworkName"}))
 
         def fake_render(post, output_dir, **kwargs):
             captured.update(kwargs)
@@ -393,7 +397,8 @@ class MainPublishTests(unittest.TestCase):
         self.assertEqual(results, [{"image": str(fake_image)}])
         self.assertEqual(captured["profile"].nickname, "QzoneOwner")
         self.assertEqual(captured["profile"].user_id, "123456")
-        self.assertIn("123456", captured["profile"].avatar_source)
+        self.assertEqual(captured["profile"].avatar_source, str(cached_avatar))
+        event.bot.get_stranger_info.assert_not_awaited()
 
     def test_llm_list_feed_hides_cursor_and_internal_ids(self):
         module = self.load_main_module()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import io
 import math
 import os
@@ -27,8 +28,9 @@ WHITE = (255, 255, 255)
 TEXT = (24, 24, 24)
 MUTED = (126, 132, 139)
 LINE = (226, 226, 226)
-ACTION = (142, 142, 142)
+ACTION = (24, 24, 24)
 CARD_BG = (250, 250, 250)
+COMMENT_BG = (247, 247, 247)
 FILE_COLORS = {
     ".pdf": (216, 74, 64),
     ".doc": (64, 112, 205),
@@ -48,7 +50,7 @@ FILE_COLORS = {
     ".md": (112, 121, 130),
 }
 FONT_CACHE: dict[tuple[int, bool], ImageFont.ImageFont] = {}
-FAST_RESAMPLE = Image.Resampling.BILINEAR
+QUALITY_RESAMPLE = Image.Resampling.LANCZOS
 PREVIEW_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="qzone-render")
 _THREAD_LOCAL = threading.local()
 _BYTES_CACHE: dict[str, tuple[float, bytes]] = {}
@@ -58,6 +60,7 @@ _BYTES_CACHE_MAX_ITEMS = 64
 _BYTES_CACHE_MAX_ITEM_SIZE = 4 * 1024 * 1024
 _LAST_PRUNE_AT = 0.0
 _PRUNE_INTERVAL_SECONDS = 60.0
+_ACTION_STRIP_CACHE: dict[tuple[int, int, tuple[int, int, int]], Image.Image] = {}
 
 
 @dataclass(slots=True)
@@ -73,6 +76,77 @@ class _ImagePreview:
     media: PostMedia
     image: Image.Image | None
     failed: bool = False
+
+
+def preload_static_render_assets() -> None:
+    """Warm fonts and cached action glyphs before the first publish render."""
+
+    for size, bold in ((28, True), (24, False), (20, False), (18, False), (17, False), (34, True)):
+        _font(size, bold=bold)
+    _action_strip()
+
+
+def preload_publish_render_assets(
+    profile: RenderProfile,
+    cache_dir: Path,
+    *,
+    avatar_sources: list[str] | tuple[str, ...] = (),
+    remote_timeout: float = 2.5,
+) -> RenderProfile:
+    """Resolve render assets to local cached files so publish rendering does no profile I/O."""
+
+    preload_static_render_assets()
+    resolved = RenderProfile(
+        nickname=profile.nickname,
+        user_id=profile.user_id,
+        avatar_source=profile.avatar_source,
+        time_text=profile.time_text,
+    )
+    cache_path = _avatar_cache_path(cache_dir, profile)
+    if cache_path.is_file():
+        resolved.avatar_source = str(cache_path)
+        return resolved
+
+    seen: set[str] = set()
+    sources = [profile.avatar_source, *avatar_sources]
+    for source in sources:
+        source = str(source or "").strip()
+        if not source or source in seen:
+            continue
+        seen.add(source)
+        preview = _load_image_preview(
+            PostMedia(kind="image", source=source, name="avatar"),
+            remote_timeout=remote_timeout,
+        )
+        if preview.image is None:
+            continue
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            avatar = preview.image.copy()
+            avatar.thumbnail((1024, 1024), QUALITY_RESAMPLE)
+            avatar.save(cache_path, "PNG", optimize=False, compress_level=1)
+        except OSError:
+            continue
+        resolved.avatar_source = str(cache_path)
+        return resolved
+
+    resolved.avatar_source = ""
+    return resolved
+
+
+def cached_avatar_source(cache_dir: Path, profile: RenderProfile) -> str:
+    cache_path = _avatar_cache_path(cache_dir, profile)
+    return str(cache_path) if cache_path.is_file() else ""
+
+
+def _avatar_cache_path(cache_dir: Path, profile: RenderProfile) -> Path:
+    user_id = re.sub(r"\D+", "", str(profile.user_id or ""))
+    if user_id:
+        stem = f"avatar_{user_id}"
+    else:
+        seed = f"{profile.nickname}|{profile.avatar_source}".encode("utf-8", "ignore")
+        stem = "avatar_" + hashlib.sha1(seed).hexdigest()[:16]
+    return cache_dir / f"{stem}.png"
 
 
 def profile_from_event(event: Any) -> RenderProfile:
@@ -192,7 +266,7 @@ def render_publish_result_image(
     if attachment_height:
         y += attachment_height + 18
     actions_y = y + 6
-    comment_y = actions_y + 54
+    comment_y = actions_y + 58
     height = max(240, comment_y + 56 + 22)
 
     image = Image.new("RGB", (width, height), WHITE)
@@ -213,8 +287,8 @@ def render_publish_result_image(
         y += attachment_height + 18
 
     actions_y = y + 6
-    _draw_actions(draw, width, actions_y)
-    comment_y = actions_y + 54
+    _draw_actions(draw, image, width, actions_y)
+    comment_y = actions_y + 58
     _draw_comment_box(draw, margin, comment_y, content_width, 52, meta_font)
 
     path = output_dir / f"publish_result_{int(time.time())}_{uuid.uuid4().hex[:10]}.png"
@@ -353,7 +427,7 @@ def _load_image_preview(media: PostMedia, *, remote_timeout: float) -> _ImagePre
                 preview = base
             else:
                 preview = preview.copy()
-            preview.thumbnail((900, 900), FAST_RESAMPLE)
+            preview.thumbnail((1200, 1200), QUALITY_RESAMPLE)
             return _ImagePreview(media=media, image=preview, failed=False)
     except (OSError, UnidentifiedImageError):
         return _ImagePreview(media=media, image=None, failed=True)
@@ -569,7 +643,7 @@ def _draw_avatar(
     mask_draw = ImageDraw.Draw(mask)
     mask_draw.ellipse((0, 0, size - 1, size - 1), fill=255)
     if preview and preview.image:
-        avatar = ImageOps.fit(preview.image, (size, size), method=FAST_RESAMPLE)
+        avatar = ImageOps.fit(preview.image, (size, size), method=QUALITY_RESAMPLE)
         image.paste(avatar, (x, y), mask)
         return
 
@@ -637,9 +711,9 @@ def _draw_preview_tile(
 ) -> None:
     if preview.image is not None:
         if crop:
-            rendered = ImageOps.fit(preview.image, (width, height), method=FAST_RESAMPLE)
+            rendered = ImageOps.fit(preview.image, (width, height), method=QUALITY_RESAMPLE)
         else:
-            rendered = ImageOps.contain(preview.image, (width, height), method=FAST_RESAMPLE)
+            rendered = ImageOps.contain(preview.image, (width, height), method=QUALITY_RESAMPLE)
             width, height = rendered.size
         image.paste(rendered, (x, y))
         return
@@ -738,39 +812,58 @@ def _format_size(size: int) -> str:
     return ""
 
 
-def _draw_actions(draw: ImageDraw.ImageDraw, width: int, y: int) -> None:
-    spacing = 120
-    start_x = width - 294
-    _draw_like_icon(draw, start_x, y + 4)
-    _draw_comment_icon(draw, start_x + spacing, y + 4)
-    _draw_share_icon(draw, start_x + spacing * 2, y + 4)
+def _draw_actions(draw: ImageDraw.ImageDraw, image: Image.Image, width: int, y: int) -> None:
+    strip = _action_strip()
+    start_x = max(22, width - strip.width - 22)
+    image.paste(strip, (start_x, y), strip)
+
+
+def _action_strip() -> Image.Image:
+    spacing = 118
+    icon_w = 54
+    height = 52
+    key = (spacing, icon_w, ACTION)
+    cached = _ACTION_STRIP_CACHE.get(key)
+    if cached is not None:
+        return cached
+    strip = Image.new("RGBA", (spacing * 2 + icon_w, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(strip)
+    _draw_like_icon(draw, 0, 4)
+    _draw_comment_icon(draw, spacing, 4)
+    _draw_share_icon(draw, spacing * 2, 4)
+    _ACTION_STRIP_CACHE[key] = strip
+    return strip
 
 
 def _draw_like_icon(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-    draw.rounded_rectangle((x + 4, y + 14, x + 12, y + 34), radius=2, fill=ACTION)
+    line = 4
+    draw.rounded_rectangle((x + 6, y + 21, x + 17, y + 43), radius=2, outline=ACTION, width=line)
     points = [
-        (x + 14, y + 34),
-        (x + 14, y + 15),
-        (x + 22, y + 4),
+        (x + 17, y + 42),
+        (x + 17, y + 22),
+        (x + 24, y + 15),
         (x + 27, y + 6),
-        (x + 25, y + 17),
-        (x + 36, y + 17),
-        (x + 39, y + 21),
-        (x + 34, y + 34),
+        (x + 32, y + 5),
+        (x + 35, y + 9),
+        (x + 34, y + 20),
+        (x + 45, y + 20),
+        (x + 48, y + 24),
+        (x + 43, y + 42),
+        (x + 17, y + 42),
     ]
-    draw.polygon(points, fill=ACTION)
+    draw.line(points, fill=ACTION, width=line, joint="curve")
 
 
 def _draw_comment_icon(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-    draw.rounded_rectangle((x + 4, y + 8, x + 34, y + 30), radius=4, fill=ACTION)
-    draw.polygon([(x + 14, y + 30), (x + 14, y + 38), (x + 23, y + 30)], fill=ACTION)
-    for offset in (11, 19, 27):
-        draw.ellipse((x + offset, y + 17, x + offset + 4, y + 21), fill=WHITE)
+    line = 4
+    draw.ellipse((x + 7, y + 6, x + 44, y + 39), outline=ACTION, width=line)
+    draw.line([(x + 34, y + 33), (x + 44, y + 43), (x + 28, y + 38)], fill=ACTION, width=line, joint="curve")
 
 
 def _draw_share_icon(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-    draw.line([(x + 6, y + 34), (x + 19, y + 22), (x + 29, y + 22)], fill=ACTION, width=5, joint="curve")
-    draw.polygon([(x + 27, y + 9), (x + 45, y + 22), (x + 27, y + 35)], fill=ACTION)
+    line = 4
+    draw.line([(x + 7, y + 40), (x + 20, y + 28), (x + 35, y + 25)], fill=ACTION, width=line, joint="curve")
+    draw.line([(x + 31, y + 10), (x + 49, y + 24), (x + 31, y + 38)], fill=ACTION, width=line, joint="curve")
 
 
 def _draw_comment_box(
@@ -781,14 +874,14 @@ def _draw_comment_box(
     height: int,
     font: ImageFont.ImageFont,
 ) -> None:
-    draw.rectangle((x, y, x + width, y + height), outline=LINE, width=1)
-    _safe_text(draw, (x + 16, y + 14), "\u8bc4\u8bba", font, MUTED)
-    camera_x = x + width - 48
+    radius = max(10, height // 2)
+    draw.rounded_rectangle((x, y, x + width, y + height), radius=radius, fill=COMMENT_BG, outline=LINE, width=1)
+    _safe_text(draw, (x + 20, y + 14), "\u8bc4\u8bba", font, MUTED)
+    camera_x = x + width - 52
     camera_y = y + 13
-    draw.rounded_rectangle((camera_x, camera_y + 8, camera_x + 28, camera_y + 26), radius=3, fill=ACTION)
-    draw.rectangle((camera_x + 8, camera_y + 4, camera_x + 20, camera_y + 10), fill=ACTION)
-    draw.ellipse((camera_x + 9, camera_y + 12, camera_x + 19, camera_y + 22), fill=WHITE)
-    draw.ellipse((camera_x + 12, camera_y + 15, camera_x + 16, camera_y + 19), fill=ACTION)
+    draw.rounded_rectangle((camera_x, camera_y + 8, camera_x + 30, camera_y + 26), radius=4, outline=ACTION, width=2)
+    draw.rectangle((camera_x + 9, camera_y + 4, camera_x + 21, camera_y + 10), outline=ACTION, width=2)
+    draw.ellipse((camera_x + 10, camera_y + 12, camera_x + 20, camera_y + 22), outline=ACTION, width=2)
 
 
 def _prune_output_dir(output_dir: Path, *, keep: int = 128, max_age_seconds: int = 3 * 24 * 3600) -> None:

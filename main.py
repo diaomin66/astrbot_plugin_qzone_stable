@@ -182,7 +182,14 @@ from qzone_bridge.onebot_cookie import fetch_cookie_text
 from qzone_bridge.parser import normalize_uin, parse_cookie_text
 from qzone_bridge.post_service import QzonePostService
 from qzone_bridge.posts import PostStore
-from qzone_bridge.publish_renderer import RenderProfile, profile_from_event, render_publish_result_image
+from qzone_bridge.publish_renderer import (
+    RenderProfile,
+    cached_avatar_source,
+    preload_publish_render_assets,
+    preload_static_render_assets,
+    profile_from_event,
+    render_publish_result_image,
+)
 from qzone_bridge.render import (
     format_action_result,
     format_feed_detail,
@@ -235,12 +242,14 @@ class QzoneStablePlugin(Star):
         self._capture_onebot_client_from_context()
         self._daemon_warmup_task: asyncio.Task | None = None
         self._scheduled_tasks: list[asyncio.Task] = []
-        self._publisher_profile_cache: tuple[int, float, Any] | None = None
+        self._publisher_profile_cache: tuple[int, RenderProfile] | None = None
+        self._publisher_profile_preload_task: asyncio.Task | None = None
         self.drafts = DraftStore(self.data_dir / "drafts.json")
         self.posts = PostStore(self.data_dir / "posts.json")
         self.llm = QzoneLLM(self._context, self.settings)
         self._pillowmd_style: Any | None = None
         self._pillowmd_style_dir = ""
+        preload_static_render_assets()
 
     def _sender_id(self, event: AstrMessageEvent) -> int:
         try:
@@ -314,64 +323,132 @@ class QzoneStablePlugin(Star):
             return image_result(str(image_path))
         return self._command_result(event, text)
 
-    async def _publisher_render_profile(self, event: AstrMessageEvent) -> Any:
-        profile = profile_from_event(event)
-        status: dict[str, Any] = {}
-        try:
-            status = await self.controller.get_status(probe_daemon=False)
-        except QzoneBridgeError:
-            status = {}
+    def _render_asset_dir(self) -> Path:
+        return self.data_dir / "render_assets"
 
-        login_uin = int(status.get("login_uin") or 0)
+    @staticmethod
+    def _clone_render_profile(profile: RenderProfile, *, time_text: str = "") -> RenderProfile:
+        return RenderProfile(
+            nickname=profile.nickname,
+            user_id=profile.user_id,
+            avatar_source=profile.avatar_source,
+            time_text=time_text or profile.time_text,
+        )
+
+    @staticmethod
+    def _qlogo_url(uin: int, size: int) -> str:
+        return f"https://q1.qlogo.cn/g?b=qq&nk={uin}&s={size}"
+
+    def _publisher_avatar_sources(
+        self,
+        login_uin: int,
+        *,
+        primary: str = "",
+        onebot_avatar: str = "",
+    ) -> tuple[str, ...]:
+        candidates = [
+            primary,
+            onebot_avatar,
+            self._qlogo_url(login_uin, 640),
+            self._qlogo_url(login_uin, 140),
+            self._qlogo_url(login_uin, 100),
+        ]
+        result: list[str] = []
+        for source in candidates:
+            source = str(source or "").strip()
+            if source and source not in result:
+                result.append(source)
+        return tuple(result)
+
+    def _cached_publisher_profile(self, login_uin: int, *, time_text: str) -> RenderProfile | None:
+        cached = self._publisher_profile_cache
+        if cached is None:
+            return None
+        cached_uin, cached_profile = cached
+        if cached_uin != login_uin:
+            return None
+        return self._clone_render_profile(cached_profile, time_text=time_text)
+
+    async def _publisher_render_profile(
+        self,
+        event: AstrMessageEvent | None = None,
+        *,
+        status: dict[str, Any] | None = None,
+        allow_network: bool = False,
+    ) -> RenderProfile:
+        profile = profile_from_event(event) if event is not None else RenderProfile(time_text=time.strftime("%H:%M"))
+        if status is None:
+            try:
+                status = await self.controller.get_status(probe_daemon=False)
+            except QzoneBridgeError:
+                status = {}
+
+        login_uin = int((status or {}).get("login_uin") or 0)
         if not login_uin:
             return profile
 
-        now = time.monotonic()
-        cached = self._publisher_profile_cache
+        cached = self._cached_publisher_profile(login_uin, time_text=profile.time_text)
         if cached is not None:
-            cached_uin, expires_at, cached_profile = cached
-            if cached_uin == login_uin and expires_at > now:
-                return RenderProfile(
-                    nickname=cached_profile.nickname,
-                    user_id=cached_profile.user_id,
-                    avatar_source=cached_profile.avatar_source,
-                    time_text=profile.time_text,
-                )
+            return cached
 
         nickname = str(
-            status.get("login_nickname")
-            or status.get("nickname")
-            or status.get("publisher_nickname")
+            (status or {}).get("login_nickname")
+            or (status or {}).get("nickname")
+            or (status or {}).get("publisher_nickname")
             or ""
         ).strip()
-        avatar_source = str(status.get("login_avatar") or status.get("avatar") or "").strip()
-        if not avatar_source:
-            avatar_source = f"https://q1.qlogo.cn/g?b=qq&nk={login_uin}&s=100"
+        avatar_source = str((status or {}).get("login_avatar") or (status or {}).get("avatar") or "").strip()
+        onebot_avatar = ""
+        if allow_network:
+            bot = self._capture_onebot_client(event)
+            if bot is not None:
+                try:
+                    fetched = await asyncio.wait_for(self._fetch_onebot_user_info(bot, login_uin), timeout=1.2)
+                except Exception:
+                    fetched = {}
+                if fetched:
+                    nickname = nickname or str(fetched.get("nickname") or fetched.get("name") or "").strip()
+                    onebot_avatar = str(fetched.get("avatar") or fetched.get("avatar_url") or "").strip()
+                    avatar_source = onebot_avatar or avatar_source
 
-        bot = self._capture_onebot_client(event)
-        if bot is not None:
-            try:
-                fetched = await asyncio.wait_for(self._fetch_onebot_user_info(bot, login_uin), timeout=0.35)
-            except Exception:
-                fetched = {}
-            if fetched:
-                nickname = nickname or str(fetched.get("nickname") or fetched.get("name") or "").strip()
-                avatar_source = str(fetched.get("avatar") or fetched.get("avatar_url") or avatar_source).strip()
-
-        profile.user_id = str(login_uin)
-        profile.nickname = nickname or str(login_uin)
-        profile.avatar_source = avatar_source
-        self._publisher_profile_cache = (
-            login_uin,
-            now + 10 * 60,
-            RenderProfile(
-                nickname=profile.nickname,
-                user_id=profile.user_id,
-                avatar_source=profile.avatar_source,
-                time_text="",
-            ),
+        fallback_name = "" if profile.nickname == "QQ Space" else profile.nickname
+        base_profile = RenderProfile(
+            nickname=nickname or fallback_name or str(login_uin),
+            user_id=str(login_uin),
+            avatar_source=avatar_source or self._qlogo_url(login_uin, 640),
+            time_text=profile.time_text,
         )
-        return profile
+        cached_avatar = cached_avatar_source(self._render_asset_dir(), base_profile)
+        if cached_avatar:
+            cached_profile = RenderProfile(
+                nickname=base_profile.nickname,
+                user_id=base_profile.user_id,
+                avatar_source=cached_avatar,
+                time_text="",
+            )
+            self._publisher_profile_cache = (login_uin, cached_profile)
+            return self._clone_render_profile(cached_profile, time_text=profile.time_text)
+
+        if not allow_network:
+            base_profile.avatar_source = ""
+            return base_profile
+
+        sources = self._publisher_avatar_sources(login_uin, primary=base_profile.avatar_source, onebot_avatar=onebot_avatar)
+        preloaded = await asyncio.to_thread(
+            preload_publish_render_assets,
+            base_profile,
+            self._render_asset_dir(),
+            avatar_sources=sources,
+            remote_timeout=max(float(self.settings.render_remote_timeout or 0), 2.5),
+        )
+        cached_profile = RenderProfile(
+            nickname=preloaded.nickname or str(login_uin),
+            user_id=preloaded.user_id or str(login_uin),
+            avatar_source=preloaded.avatar_source,
+            time_text="",
+        )
+        self._publisher_profile_cache = (login_uin, cached_profile)
+        return self._clone_render_profile(cached_profile, time_text=profile.time_text)
 
     async def _fetch_onebot_user_info(self, bot: Any, uin: int) -> dict[str, Any]:
         for method_name, kwargs in (
@@ -399,10 +476,34 @@ class QzoneStablePlugin(Star):
                 return result
         return {}
 
+    def _schedule_publish_render_asset_preload(
+        self,
+        trigger: str,
+        *,
+        event: AstrMessageEvent | None = None,
+        status: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.settings.render_publish_result:
+            return
+        login_uin = int((status or {}).get("login_uin") or 0)
+        if login_uin and self._cached_publisher_profile(login_uin, time_text="") is not None:
+            return
+        task = self._publisher_profile_preload_task
+        if task is not None and not task.done():
+            return
+
+        async def runner() -> None:
+            try:
+                await self._publisher_render_profile(event, status=status, allow_network=True)
+            except Exception:
+                logger.debug("qzone publish render asset preload on %s failed", trigger, exc_info=True)
+
+        self._publisher_profile_preload_task = asyncio.create_task(runner())
+
     def _schedule_publisher_profile(self, event: AstrMessageEvent) -> asyncio.Task | None:
         if not self.settings.render_publish_result:
             return None
-        return asyncio.create_task(self._publisher_render_profile(event))
+        return asyncio.create_task(self._publisher_render_profile(event, allow_network=False))
 
     async def _publish_result(
         self,
@@ -522,9 +623,12 @@ class QzoneStablePlugin(Star):
             and not bool(status.get("needs_rebind"))
         )
         if not should_start:
+            self._schedule_publish_render_asset_preload("status", status=status)
             return status
         try:
-            return await self.controller.ensure_running()
+            recovered = await self.controller.ensure_running()
+            self._schedule_publish_render_asset_preload("status recovery", status=recovered)
+            return recovered
         except QzoneBridgeError as exc:
             try:
                 detail_text = json.dumps(_redact_for_log(exc.detail), ensure_ascii=False, default=str)
@@ -533,6 +637,7 @@ class QzoneStablePlugin(Star):
             logger.warning("qzone daemon status recovery failed: %s detail=%s", exc.message, detail_text)
             fallback = await self.controller.get_status(probe_daemon=False)
             fallback["daemon_start_error"] = self._status_error_payload(exc)
+            self._schedule_publish_render_asset_preload("status fallback", status=fallback)
             return fallback
 
 
@@ -1516,8 +1621,11 @@ class QzoneStablePlugin(Star):
         except QzoneBridgeError:
             status = {}
         if not force and status and int(status.get("cookie_count") or 0) > 0 and not bool(status.get("needs_rebind")):
+            self._schedule_publish_render_asset_preload("cookie ready", event=event, status=status)
             return status
-        return await self._auto_bind_cookie(event, force=force, source=source)
+        payload = await self._auto_bind_cookie(event, force=force, source=source)
+        self._schedule_publish_render_asset_preload("cookie bind", event=event, status=payload)
+        return payload
 
     async def _bootstrap_auto_bind(self, trigger: str) -> None:
         client = self._capture_onebot_client_from_context()
@@ -1541,6 +1649,7 @@ class QzoneStablePlugin(Star):
             return
         if int(status.get("cookie_count") or 0) <= 0 or bool(status.get("needs_rebind")):
             return
+        self._schedule_publish_render_asset_preload("daemon prewarm", status=status)
         self._schedule_daemon_warmup(trigger)
 
     def _schedule_daemon_warmup(self, trigger: str) -> None:
@@ -1563,7 +1672,8 @@ class QzoneStablePlugin(Star):
     async def initialize(self):
         if self.settings.cookies_str:
             try:
-                await self.controller.bind_cookie_local(self.settings.cookies_str, source="config")
+                payload = await self.controller.bind_cookie_local(self.settings.cookies_str, source="config")
+                self._schedule_publish_render_asset_preload("config bind", status=payload)
             except QzoneBridgeError as exc:
                 logger.warning("qzone config cookie bind failed: %s", exc)
         self._start_scheduled_tasks()
@@ -1990,6 +2100,7 @@ class QzoneStablePlugin(Star):
             logger.warning("qzone bind failed: %s", exc)
             yield self._command_result(event, self._error_text(exc))
             return
+        self._schedule_publish_render_asset_preload("manual bind", event=event, status=payload)
         self._schedule_daemon_warmup("manual bind")
         try:
             payload = await self._status_with_recovery()
@@ -2008,6 +2119,7 @@ class QzoneStablePlugin(Star):
             logger.warning("qzone autobind failed: %s", exc)
             yield self._command_result(event, self._error_text(exc))
             return
+        self._schedule_publish_render_asset_preload("autobind", event=event, status=payload)
         self._schedule_daemon_warmup("autobind")
         try:
             payload = await self._status_with_recovery()
@@ -2707,6 +2819,10 @@ class QzoneStablePlugin(Star):
         if self._scheduled_tasks:
             await asyncio.gather(*self._scheduled_tasks, return_exceptions=True)
             self._scheduled_tasks.clear()
+        if self._publisher_profile_preload_task is not None:
+            self._publisher_profile_preload_task.cancel()
+            await asyncio.gather(self._publisher_profile_preload_task, return_exceptions=True)
+            self._publisher_profile_preload_task = None
         try:
             await self.controller.close()
         except Exception as exc:
