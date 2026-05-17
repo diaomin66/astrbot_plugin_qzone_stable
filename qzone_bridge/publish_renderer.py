@@ -60,7 +60,10 @@ _BYTES_CACHE_MAX_ITEMS = 64
 _BYTES_CACHE_MAX_ITEM_SIZE = 4 * 1024 * 1024
 _LAST_PRUNE_AT = 0.0
 _PRUNE_INTERVAL_SECONDS = 60.0
-_ACTION_STRIP_CACHE: dict[tuple[int, int, tuple[int, int, int]], Image.Image] = {}
+ASSET_DIR = Path(__file__).with_name("assets")
+ACTION_STRIP_ASSET = ASSET_DIR / "publish_actions.png"
+_ACTION_STRIP_CACHE: dict[tuple[str, int], Image.Image] = {}
+_AVATAR_MASK_CACHE: dict[tuple[int, int], Image.Image] = {}
 
 
 @dataclass(slots=True)
@@ -123,7 +126,7 @@ def preload_publish_render_assets(
         try:
             cache_dir.mkdir(parents=True, exist_ok=True)
             avatar = preview.image.copy()
-            avatar.thumbnail((1024, 1024), QUALITY_RESAMPLE)
+            avatar.thumbnail((1600, 1600), QUALITY_RESAMPLE)
             avatar.save(cache_path, "PNG", optimize=False, compress_level=1)
         except OSError:
             continue
@@ -265,8 +268,9 @@ def render_publish_result_image(
         y += image_height + 18
     if attachment_height:
         y += attachment_height + 18
+    action_strip = _action_strip()
     actions_y = y + 6
-    comment_y = actions_y + 58
+    comment_y = actions_y + action_strip.height + 8
     height = max(240, comment_y + 56 + 22)
 
     image = Image.new("RGB", (width, height), WHITE)
@@ -287,8 +291,8 @@ def render_publish_result_image(
         y += attachment_height + 18
 
     actions_y = y + 6
-    _draw_actions(draw, image, width, actions_y)
-    comment_y = actions_y + 58
+    _draw_actions(image, width, actions_y, strip=action_strip)
+    comment_y = actions_y + action_strip.height + 8
     _draw_comment_box(draw, margin, comment_y, content_width, 52, meta_font)
 
     path = output_dir / f"publish_result_{int(time.time())}_{uuid.uuid4().hex[:10]}.png"
@@ -427,7 +431,7 @@ def _load_image_preview(media: PostMedia, *, remote_timeout: float) -> _ImagePre
                 preview = base
             else:
                 preview = preview.copy()
-            preview.thumbnail((1200, 1200), QUALITY_RESAMPLE)
+            preview.thumbnail((1600, 1600), QUALITY_RESAMPLE)
             return _ImagePreview(media=media, image=preview, failed=False)
     except (OSError, UnidentifiedImageError):
         return _ImagePreview(media=media, image=None, failed=True)
@@ -639,26 +643,53 @@ def _draw_avatar(
     *,
     preview: _ImagePreview | None = None,
 ) -> None:
-    mask = Image.new("L", (size, size), 0)
-    mask_draw = ImageDraw.Draw(mask)
-    mask_draw.ellipse((0, 0, size - 1, size - 1), fill=255)
     if preview and preview.image:
-        avatar = ImageOps.fit(preview.image, (size, size), method=QUALITY_RESAMPLE)
-        image.paste(avatar, (x, y), mask)
+        avatar = _smooth_circle_image(preview.image, size)
+        image.paste(avatar.convert("RGB"), (x, y), avatar.getchannel("A"))
         return
 
-    color = _profile_color(profile.nickname or profile.user_id)
-    draw.ellipse((x, y, x + size, y + size), fill=color)
+    avatar = _fallback_avatar_image(profile, size)
+    image.paste(avatar.convert("RGB"), (x, y), avatar.getchannel("A"))
+
+
+def _smooth_circle_image(source: Image.Image, size: int, *, scale: int = 4) -> Image.Image:
+    large_size = max(size, int(size) * max(2, int(scale)))
+    avatar = ImageOps.fit(source.convert("RGB"), (large_size, large_size), method=QUALITY_RESAMPLE).convert("RGBA")
+    avatar.putalpha(_circle_mask(large_size))
+    return avatar.resize((size, size), QUALITY_RESAMPLE)
+
+
+def _fallback_avatar_image(profile: RenderProfile, size: int, *, scale: int = 4) -> Image.Image:
+    large_size = max(size, int(size) * max(2, int(scale)))
+    avatar = Image.new("RGBA", (large_size, large_size), (0, 0, 0, 0))
+    mask = _circle_mask(large_size)
+    color_layer = Image.new("RGBA", (large_size, large_size), (*_profile_color(profile.nickname or profile.user_id), 255))
+    avatar.paste(color_layer, (0, 0), mask)
+    draw = ImageDraw.Draw(avatar)
     initial = (profile.nickname or profile.user_id or "Q")[:1].upper()
-    font = _font(34, bold=True)
+    font = _font(max(12, 34 * max(2, int(scale))), bold=True)
     box = draw.textbbox((0, 0), initial, font=font)
     _safe_text(
         draw,
-        (x + (size - (box[2] - box[0])) // 2, y + (size - (box[3] - box[1])) // 2 - 2),
+        ((large_size - (box[2] - box[0])) // 2, (large_size - (box[3] - box[1])) // 2 - 2 * scale),
         initial,
         font,
         WHITE,
     )
+    return avatar.resize((size, size), QUALITY_RESAMPLE)
+
+
+def _circle_mask(size: int, *, scale_key: int = 1) -> Image.Image:
+    key = (int(size), int(scale_key))
+    cached = _AVATAR_MASK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    mask = Image.new("L", (size, size), 0)
+    mask_draw = ImageDraw.Draw(mask)
+    inset = max(1, size // 180)
+    mask_draw.ellipse((inset, inset, size - inset - 1, size - inset - 1), fill=255)
+    _AVATAR_MASK_CACHE[key] = mask
+    return mask
 
 
 def _profile_color(seed: str) -> tuple[int, int, int]:
@@ -812,58 +843,25 @@ def _format_size(size: int) -> str:
     return ""
 
 
-def _draw_actions(draw: ImageDraw.ImageDraw, image: Image.Image, width: int, y: int) -> None:
-    strip = _action_strip()
+def _draw_actions(image: Image.Image, width: int, y: int, *, strip: Image.Image | None = None) -> None:
+    strip = strip or _action_strip()
     start_x = max(22, width - strip.width - 22)
     image.paste(strip, (start_x, y), strip)
 
 
-def _action_strip() -> Image.Image:
-    spacing = 118
-    icon_w = 54
-    height = 52
-    key = (spacing, icon_w, ACTION)
+def _action_strip(target_width: int = 300) -> Image.Image:
+    stat = ACTION_STRIP_ASSET.stat()
+    key = (f"{ACTION_STRIP_ASSET.resolve()}:{stat.st_mtime_ns}:{stat.st_size}", int(target_width))
     cached = _ACTION_STRIP_CACHE.get(key)
     if cached is not None:
         return cached
-    strip = Image.new("RGBA", (spacing * 2 + icon_w, height), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(strip)
-    _draw_like_icon(draw, 0, 4)
-    _draw_comment_icon(draw, spacing, 4)
-    _draw_share_icon(draw, spacing * 2, 4)
+    with Image.open(ACTION_STRIP_ASSET) as opened:
+        strip = opened.convert("RGBA")
+    if target_width > 0 and strip.width != target_width:
+        target_height = max(1, round(strip.height * (target_width / strip.width)))
+        strip = strip.resize((target_width, target_height), QUALITY_RESAMPLE)
     _ACTION_STRIP_CACHE[key] = strip
     return strip
-
-
-def _draw_like_icon(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-    line = 4
-    draw.rounded_rectangle((x + 6, y + 21, x + 17, y + 43), radius=2, outline=ACTION, width=line)
-    points = [
-        (x + 17, y + 42),
-        (x + 17, y + 22),
-        (x + 24, y + 15),
-        (x + 27, y + 6),
-        (x + 32, y + 5),
-        (x + 35, y + 9),
-        (x + 34, y + 20),
-        (x + 45, y + 20),
-        (x + 48, y + 24),
-        (x + 43, y + 42),
-        (x + 17, y + 42),
-    ]
-    draw.line(points, fill=ACTION, width=line, joint="curve")
-
-
-def _draw_comment_icon(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-    line = 4
-    draw.ellipse((x + 7, y + 6, x + 44, y + 39), outline=ACTION, width=line)
-    draw.line([(x + 34, y + 33), (x + 44, y + 43), (x + 28, y + 38)], fill=ACTION, width=line, joint="curve")
-
-
-def _draw_share_icon(draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-    line = 4
-    draw.line([(x + 7, y + 40), (x + 20, y + 28), (x + 35, y + 25)], fill=ACTION, width=line, joint="curve")
-    draw.line([(x + 31, y + 10), (x + 49, y + 24), (x + 31, y + 38)], fill=ACTION, width=line, joint="curve")
 
 
 def _draw_comment_box(
