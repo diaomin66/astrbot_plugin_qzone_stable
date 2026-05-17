@@ -16,6 +16,19 @@ class Plain:
         self.text = text
 
 
+class Image:
+    def __init__(self, file="", url=""):
+        self.file = file
+        self.url = url
+
+
+class Reply:
+    type = "reply"
+
+    def __init__(self, message):
+        self.message = message
+
+
 class Event:
     def __init__(self, components, message_str=""):
         self.message_obj = types.SimpleNamespace(message=components)
@@ -341,6 +354,50 @@ class MainPublishTests(unittest.TestCase):
 
         plugin.controller.publish_post.assert_awaited_once()
         self.assertEqual(plugin.controller.publish_post.await_args.kwargs["content"], "1")
+        self.assertTrue(plugin.controller.publish_post.await_args.kwargs["content_sanitized"])
+
+    def test_llm_publish_tool_includes_quoted_image_media(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        event = Event(
+            [
+                Plain("帮我把引用图发空间"),
+                Reply([Plain("原图说明"), Image(url="https://example.com/quoted.png")]),
+            ],
+            message_str="帮我把引用图发空间",
+        )
+
+        asyncio.run(
+            collect_async_generator(
+                plugin.tool_publish_post(event, content="配文", confirm=True)
+            )
+        )
+
+        plugin.controller.publish_post.assert_awaited_once()
+        self.assertEqual(plugin.controller.publish_post.await_args.kwargs["content"], "配文")
+        media = plugin.controller.publish_post.await_args.kwargs["media"]
+        self.assertEqual(len(media), 1)
+        self.assertEqual(media[0]["source"], "https://example.com/quoted.png")
+        self.assertTrue(plugin.controller.publish_post.await_args.kwargs["content_sanitized"])
+
+    def test_legacy_llm_publish_feed_includes_quoted_image_media(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        event = Event(
+            [
+                Plain("发说说 这张"),
+                Reply([Plain("原图说明"), Image(url="https://example.com/legacy.png")]),
+            ],
+            message_str="发说说 这张",
+        )
+
+        asyncio.run(plugin.llm_publish_feed(event, text="这张", get_image=True))
+
+        plugin.controller.publish_post.assert_awaited_once()
+        self.assertEqual(plugin.controller.publish_post.await_args.kwargs["content"], "这张")
+        media = plugin.controller.publish_post.await_args.kwargs["media"]
+        self.assertEqual(len(media), 1)
+        self.assertEqual(media[0]["source"], "https://example.com/legacy.png")
         self.assertTrue(plugin.controller.publish_post.await_args.kwargs["content_sanitized"])
 
     def test_qzone_post_returns_rendered_image_result(self):
