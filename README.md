@@ -1,5 +1,7 @@
 # QQ空间Ultra（QzoneUltra）
 
+特别鸣谢 [Zhalslar/astrbot_plugin_qzone](https://github.com/Zhalslar/astrbot_plugin_qzone)。QQ空间Ultra 的中文命令体系、表白墙工作流和部分用户体验设计参考了该项目；本插件在此基础上整合了本地 daemon、Cookie 管理、LLM 工具、发布结果渲染和 AstrBot 兼容层，方便在当前 AstrBot 环境中继续扩展和维护。
+
 QQ空间Ultra 是一个面向 AstrBot 的 QQ 空间插件，提供中文命令、LLM 工具、Cookie 绑定、本地 daemon、图片发布、说说渲染、投稿审核和自动评论能力。插件优先适配 OneBot v11 / aiocqhttp，也支持手动 Cookie 绑定后使用核心 QQ 空间功能。
 
 ## 功能概览
