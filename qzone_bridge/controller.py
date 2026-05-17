@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
 import os
 import signal
 import socket
@@ -16,6 +15,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 
+from .astrbot_logging import get_logger
 from .errors import DaemonUnavailableError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
 from .media import sanitize_publish_content
 from .models import SessionState
@@ -24,8 +24,7 @@ from .protocol import SECRET_HEADER
 from .storage import StateStore, ensure_state_secret
 from .utils import now_iso
 
-
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 SENSITIVE_DETAIL_KEYS = {"cookie", "cookies", "p_skey", "skey", "pt4_token", "pt_key", "qzonetoken", "secret", "token"}
 SENSITIVE_URL_QUERY_KEYS = {"g_tk", "gtk", "p_skey", "skey", "pt4_token", "pt_key", "qzonetoken", "token", "secret"}
 
@@ -38,6 +37,10 @@ def _port_is_free(port: int) -> bool:
         except OSError:
             return False
     return True
+
+
+async def _port_is_free_async(port: int) -> bool:
+    return await asyncio.to_thread(_port_is_free, port)
 
 
 def _run_quiet(args: list[str], *, timeout: float = 5.0) -> subprocess.CompletedProcess:
@@ -394,30 +397,25 @@ class QzoneDaemonController:
             "session_revision": state.session.revision,
         }
 
+    async def _available_daemon_port(self, port: int) -> int:
+        if await _port_is_free_async(port):
+            return port
+        candidate = port
+        for _ in range(32):
+            candidate += 1
+            if await _port_is_free_async(candidate):
+                return candidate
+        raise DaemonUnavailableError(
+            "QQ 空间 daemon 端口被占用，未找到可用备用端口",
+            detail={"daemon_port": port, "checked_ports": f"{port + 1}-{port + 32}"},
+        )
+
     async def ensure_running(self) -> dict[str, Any]:
         async with self._lock:
             runtime = self._runtime()
             port = runtime.daemon_port or self.default_port
             if await self._probe_health(port):
                 return self._status_from_state(self.store.read(), daemon_state="ready")
-
-            if not _port_is_free(port):
-                candidate = port
-                found_port = 0
-                for _ in range(32):
-                    candidate += 1
-                    if _port_is_free(candidate):
-                        found_port = candidate
-                        break
-                if not found_port:
-                    exc = DaemonUnavailableError(
-                        "QQ 空间 daemon 端口被占用，未找到可用备用端口",
-                        detail={"daemon_port": port, "checked_ports": f"{port + 1}-{port + 32}"},
-                    )
-                    self._record_daemon_start_error(exc, port=port)
-                    raise exc
-                port = found_port
-                self.store.update(lambda state: setattr(state.runtime, "daemon_port", port))
 
             if not self._daemon_script().exists():
                 exc = DaemonUnavailableError(
@@ -427,44 +425,69 @@ class QzoneDaemonController:
                 self._record_daemon_start_error(exc, port=port)
                 raise exc
 
-            try:
-                self._process = self._spawn_daemon(port)
-            except OSError as exc:
-                error = DaemonUnavailableError(
-                    "QQ 空间 daemon 启动失败",
-                    detail=self._daemon_start_detail(port, error=str(exc)),
-                )
-                self._record_daemon_start_error(error, port=port)
-                raise error from exc
+            attempts: list[dict[str, Any]] = []
+            last_exc: Exception | None = None
+            for attempt in range(3):
+                try:
+                    port = await self._available_daemon_port(port)
+                except DaemonUnavailableError as exc:
+                    self._record_daemon_start_error(exc, port=port)
+                    raise
 
-            deadline = asyncio.get_running_loop().time() + self.start_timeout
-            while asyncio.get_running_loop().time() < deadline:
-                if await self._probe_health(port):
-                    runtime.daemon_port = port
-                    runtime.daemon_pid = self._process.pid if self._process else 0
-                    runtime.started_at = now_iso()
-                    runtime.last_seen_at = now_iso()
-                    def update(state):
-                        state.runtime = runtime
-                        if isinstance(state.session.last_error, dict) and state.session.last_error.get("type") == "DaemonUnavailableError":
-                            state.session.last_error = None
+                if port != runtime.daemon_port:
+                    self.store.update(lambda state: setattr(state.runtime, "daemon_port", port))
 
-                    state = self.store.update(update)
-                    self._health_cache = (
-                        port,
-                        runtime.secret,
-                        True,
-                        asyncio.get_running_loop().time() + self._health_cache_ttl,
+                try:
+                    self._process = self._spawn_daemon(port)
+                except OSError as exc:
+                    last_exc = exc
+                    attempts.append(self._daemon_start_detail(port, error=str(exc)))
+                    if attempt < 2:
+                        port += 1
+                        continue
+                    error = DaemonUnavailableError(
+                        "QQ 空间 daemon 启动失败",
+                        detail={"attempts": attempts},
                     )
-                    return self._status_from_state(state, daemon_state="ready")
-                if self._process and self._process.poll() is not None:
-                    break
-                await asyncio.sleep(0.5)
+                    self._record_daemon_start_error(error, port=port)
+                    raise error from exc
 
-            returncode = self._process.poll() if self._process else None
+                deadline = asyncio.get_running_loop().time() + self.start_timeout
+                while asyncio.get_running_loop().time() < deadline:
+                    if await self._probe_health(port):
+                        runtime.daemon_port = port
+                        runtime.daemon_pid = self._process.pid if self._process else 0
+                        runtime.started_at = now_iso()
+                        runtime.last_seen_at = now_iso()
+
+                        def update(state):
+                            state.runtime = runtime
+                            if isinstance(state.session.last_error, dict) and state.session.last_error.get("type") == "DaemonUnavailableError":
+                                state.session.last_error = None
+
+                        state = self.store.update(update)
+                        self._health_cache = (
+                            port,
+                            runtime.secret,
+                            True,
+                            asyncio.get_running_loop().time() + self._health_cache_ttl,
+                        )
+                        return self._status_from_state(state, daemon_state="ready")
+                    if self._process and self._process.poll() is not None:
+                        break
+                    await asyncio.sleep(0.5)
+
+                returncode = self._process.poll() if self._process else None
+                attempts.append(self._daemon_start_detail(port, returncode=returncode))
+                if returncode is not None and attempt < 2:
+                    self._invalidate_health_cache()
+                    port += 1
+                    continue
+                break
+
             error = DaemonUnavailableError(
                 "QQ 空间 daemon 启动超时",
-                detail=self._daemon_start_detail(port, returncode=returncode),
+                detail={"attempts": attempts, "error": str(last_exc) if last_exc else ""},
             )
             self._record_daemon_start_error(error, port=port)
             raise error
@@ -770,10 +793,10 @@ class QzoneDaemonController:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while loop.time() < deadline:
-            if _port_is_free(port):
+            if await _port_is_free_async(port):
                 return True
             await asyncio.sleep(0.2)
-        return _port_is_free(port)
+        return await _port_is_free_async(port)
 
     async def _terminate_tracked_process(self) -> None:
         process = self._process
@@ -823,6 +846,10 @@ class QzoneDaemonController:
         self.store.update(update)
 
     async def stop_daemon(self) -> None:
+        async with self._lock:
+            await self._stop_daemon_locked()
+
+    async def _stop_daemon_locked(self) -> None:
         state = self.store.read()
         runtime = state.runtime
         port = int(runtime.daemon_port or self.default_port or 0)

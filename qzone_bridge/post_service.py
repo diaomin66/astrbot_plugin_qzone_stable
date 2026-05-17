@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import asdict
 from typing import Any
 
+from .astrbot_logging import get_logger
 from .errors import QzoneParseError
 from .models import FeedEntry
 from .posts import PostStore
 from .selection import PostSelection
 from .social import QzoneComment, QzonePost, post_from_entry
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 class QzonePostService:
