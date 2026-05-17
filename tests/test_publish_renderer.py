@@ -5,14 +5,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from PIL import Image, ImageChops, ImageDraw
+from PIL import Image, ImageChops
 
 from qzone_bridge.media import PostMedia, PostPayload
 from qzone_bridge.publish_renderer import (
     ACTION_STRIP_ASSET,
+    BOLD_FONT_ASSET,
     RenderProfile,
+    REGULAR_FONT_ASSET,
+    RENDER_SCALE,
     _action_strip,
-    _draw_comment_box,
     _font,
     _smooth_circle_image,
     cached_avatar_source,
@@ -62,8 +64,8 @@ class PublishRendererTests(unittest.TestCase):
             self.assertTrue(rendered.exists())
             with Image.open(rendered) as image:
                 self.assertEqual(image.format, "PNG")
-                self.assertEqual(image.width, 760)
-                self.assertGreater(image.height, 400)
+                self.assertEqual(image.width, 760 * RENDER_SCALE)
+                self.assertGreater(image.height, 400 * RENDER_SCALE)
                 diff = ImageChops.difference(image.convert("RGB"), Image.new("RGB", image.size, "white"))
                 self.assertIsNotNone(diff.getbbox())
 
@@ -85,7 +87,7 @@ class PublishRendererTests(unittest.TestCase):
             self.assertTrue(rendered.exists())
             with Image.open(rendered) as image:
                 self.assertEqual(image.format, "PNG")
-                self.assertEqual(image.width, 700)
+                self.assertEqual(image.width, 700 * RENDER_SCALE)
 
     def test_preload_profile_avatar_writes_local_cache_once(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -148,18 +150,30 @@ class PublishRendererTests(unittest.TestCase):
     def test_action_strip_loads_static_png_asset(self):
         self.assertTrue(ACTION_STRIP_ASSET.exists())
         with Image.open(ACTION_STRIP_ASSET) as source:
+            alpha = source.convert("RGBA").getchannel("A")
             self.assertGreaterEqual(source.width, 1000)
             self.assertGreaterEqual(source.height, 250)
+            self.assertEqual(alpha.getextrema(), (0, 255))
 
         strip = _action_strip()
         cached = _action_strip()
 
         self.assertIs(strip, cached)
         self.assertEqual(strip.mode, "RGBA")
-        self.assertEqual(strip.width, 300)
+        self.assertEqual(strip.width, 260 * RENDER_SCALE)
         self.assertGreater(strip.height, 40)
         diff = ImageChops.difference(strip.convert("RGB"), Image.new("RGB", strip.size, "white"))
         self.assertIsNotNone(diff.getbbox())
+
+    def test_bundled_puhuiti_font_is_used_for_rendering(self):
+        self.assertTrue(REGULAR_FONT_ASSET.exists())
+        self.assertTrue(BOLD_FONT_ASSET.exists())
+
+        regular = _font(24)
+        bold = _font(24, bold=True)
+
+        self.assertIn("Alibaba PuHuiTi", regular.getname()[0])
+        self.assertIn("Alibaba PuHuiTi", bold.getname()[0])
 
     def test_avatar_circle_mask_has_smooth_antialiased_edge(self):
         source = Image.new("RGB", (512, 512), (120, 180, 210))
@@ -174,15 +188,52 @@ class PublishRendererTests(unittest.TestCase):
         self.assertEqual(alpha.getpixel((38, 38)), 255)
         self.assertTrue(any(0 < value < 255 for value in values))
 
-    def test_comment_box_has_no_camera_icon(self):
-        image = Image.new("RGB", (500, 80), "white")
-        draw = ImageDraw.Draw(image)
+    def test_render_omits_bottom_comment_bar(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            post = PostPayload(content="no footer", media=[])
 
-        _draw_comment_box(draw, 20, 14, 460, 52, _font(18))
+            rendered = render_publish_result_image(
+                post,
+                temp_path,
+                profile=RenderProfile(nickname="Coconut", time_text="06:34"),
+                width=700,
+            )
 
-        right_inside = image.crop((420, 24, 470, 56))
-        dark_pixels = sum(1 for pixel in right_inside.getdata() if max(pixel) < 80)
-        self.assertEqual(dark_pixels, 0)
+            with Image.open(rendered) as image:
+                bottom_left = image.crop(
+                    (
+                        20 * RENDER_SCALE,
+                        max(0, image.height - 72 * RENDER_SCALE),
+                        340 * RENDER_SCALE,
+                        image.height - 12 * RENDER_SCALE,
+                    )
+                ).convert("RGB")
+                non_white = sum(1 for pixel in bottom_left.getdata() if pixel != (255, 255, 255))
+                self.assertLess(non_white, 10 * RENDER_SCALE)
+
+    def test_render_height_adapts_to_content_amount(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            short_post = PostPayload(content="short", media=[])
+            long_post = PostPayload(content="这是一段比较长的说说内容。" * 28, media=[])
+
+            short_render = render_publish_result_image(
+                short_post,
+                temp_path,
+                profile=RenderProfile(nickname="Coconut", time_text="06:34"),
+                width=700,
+            )
+            long_render = render_publish_result_image(
+                long_post,
+                temp_path,
+                profile=RenderProfile(nickname="Coconut", time_text="06:34"),
+                width=700,
+            )
+
+            with Image.open(short_render) as short_image, Image.open(long_render) as long_image:
+                self.assertEqual(short_image.width, long_image.width)
+                self.assertGreater(long_image.height, short_image.height + 120 * RENDER_SCALE)
 
     def test_render_loads_multiple_previews_concurrently(self):
         with tempfile.TemporaryDirectory() as temp:
