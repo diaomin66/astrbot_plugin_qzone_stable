@@ -5,13 +5,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageDraw
 
 from qzone_bridge.media import PostMedia, PostPayload
 from qzone_bridge.publish_renderer import (
     ACTION_STRIP_ASSET,
     RenderProfile,
     _action_strip,
+    _draw_comment_box,
+    _font,
     _smooth_circle_image,
     cached_avatar_source,
     preload_publish_render_assets,
@@ -145,6 +147,9 @@ class PublishRendererTests(unittest.TestCase):
 
     def test_action_strip_loads_static_png_asset(self):
         self.assertTrue(ACTION_STRIP_ASSET.exists())
+        with Image.open(ACTION_STRIP_ASSET) as source:
+            self.assertGreaterEqual(source.width, 1000)
+            self.assertGreaterEqual(source.height, 250)
 
         strip = _action_strip()
         cached = _action_strip()
@@ -168,6 +173,16 @@ class PublishRendererTests(unittest.TestCase):
         self.assertEqual(alpha.getpixel((0, 0)), 0)
         self.assertEqual(alpha.getpixel((38, 38)), 255)
         self.assertTrue(any(0 < value < 255 for value in values))
+
+    def test_comment_box_has_no_camera_icon(self):
+        image = Image.new("RGB", (500, 80), "white")
+        draw = ImageDraw.Draw(image)
+
+        _draw_comment_box(draw, 20, 14, 460, 52, _font(18))
+
+        right_inside = image.crop((420, 24, 470, 56))
+        dark_pixels = sum(1 for pixel in right_inside.getdata() if max(pixel) < 80)
+        self.assertEqual(dark_pixels, 0)
 
     def test_render_loads_multiple_previews_concurrently(self):
         with tempfile.TemporaryDirectory() as temp:
