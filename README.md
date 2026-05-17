@@ -136,8 +136,6 @@ pip install -r requirements.txt
 - 自动评论去重记录。
 - 渲染临时文件和发布结果图。
 
-这些内容属于本地运行数据，不应该提交到 GitHub。仓库已通过 `.gitignore` 忽略 `data/`、缓存目录、虚拟环境和测试目录。
-
 ## 排障
 
 - `/qzone status` 显示未绑定：先执行 `/qzone autobind`，失败后使用 `/qzone bind <cookie>`。
@@ -146,18 +144,3 @@ pip install -r requirements.txt
 - 图片发布失败：确认图片可被 AstrBot 正常读取，远程图片地址可访问。
 - LLM 生成内容为空：检查 AstrBot 当前会话 provider，或分别配置 `llm.post_provider_id`、`llm.comment_provider_id`、`llm.reply_provider_id`。
 - 点赞成功但提示校验不确定：通常是 QQ 空间读回延迟，可稍后再查看目标说说。
-
-## 发布文件
-
-发布到 GitHub 的插件文件只保留运行必需内容：
-
-- `metadata.yaml`
-- `main.py`
-- `daemon_main.py`
-- `_conf_schema.json`
-- `requirements.txt`
-- `logo.png`
-- `qzone_bridge/`
-- `README.md`
-
-测试、缓存、运行数据、虚拟环境和临时文件不属于发布包。
