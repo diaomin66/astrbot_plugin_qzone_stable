@@ -11,11 +11,13 @@ from qzone_bridge.media import PostMedia, PostPayload
 from qzone_bridge.publish_renderer import (
     ACTION_STRIP_ASSET,
     BOLD_FONT_ASSET,
+    PREVIEW_MAX_EDGE,
     RenderProfile,
     REGULAR_FONT_ASSET,
     RENDER_SCALE,
     _action_strip,
     _font,
+    _load_image_preview,
     _smooth_circle_image,
     cached_avatar_source,
     preload_publish_render_assets,
@@ -27,6 +29,28 @@ class PublishRendererTests(unittest.TestCase):
     def make_image(self, path: Path, size: tuple[int, int], color: tuple[int, int, int]) -> None:
         image = Image.new("RGB", size, color)
         image.save(path)
+
+    def test_render_scale_keeps_text_hidpi(self):
+        self.assertGreaterEqual(RENDER_SCALE, 3)
+
+    def test_short_text_render_uses_compact_width_and_large_type(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            post = PostPayload(content="short sentence", media=[])
+
+            rendered = render_publish_result_image(
+                post,
+                temp_path,
+                profile=RenderProfile(nickname="Coconut", time_text="06:34"),
+                width=900,
+            )
+
+            with Image.open(rendered) as image:
+                self.assertLess(image.width, 900 * RENDER_SCALE)
+                self.assertGreaterEqual(image.width, 520 * RENDER_SCALE)
+
+        font = _font(30 * RENDER_SCALE)
+        self.assertIn("Alibaba PuHuiTi", font.getname()[0])
 
     def test_render_text_images_and_files_to_png(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -188,6 +212,22 @@ class PublishRendererTests(unittest.TestCase):
         self.assertEqual(alpha.getpixel((38, 38)), 255)
         self.assertTrue(any(0 < value < 255 for value in values))
 
+    def test_large_local_preview_keeps_high_resolution_detail(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            photo = temp_path / "large.jpg"
+            Image.new("RGB", (2300, 1900), (120, 180, 210)).save(photo, "JPEG", quality=96)
+
+            preview = _load_image_preview(
+                PostMedia(kind="image", source=str(photo), name="large.jpg"),
+                remote_timeout=0.01,
+            )
+
+            self.assertIsNotNone(preview.image)
+            assert preview.image is not None
+            self.assertGreater(max(preview.image.size), 1600)
+            self.assertLessEqual(max(preview.image.size), PREVIEW_MAX_EDGE)
+
     def test_render_omits_bottom_comment_bar(self):
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)
@@ -205,7 +245,7 @@ class PublishRendererTests(unittest.TestCase):
                     (
                         20 * RENDER_SCALE,
                         max(0, image.height - 72 * RENDER_SCALE),
-                        340 * RENDER_SCALE,
+                        240 * RENDER_SCALE,
                         image.height - 12 * RENDER_SCALE,
                     )
                 ).convert("RGB")
@@ -232,7 +272,7 @@ class PublishRendererTests(unittest.TestCase):
             )
 
             with Image.open(short_render) as short_image, Image.open(long_render) as long_image:
-                self.assertEqual(short_image.width, long_image.width)
+                self.assertGreaterEqual(long_image.width, short_image.width)
                 self.assertGreater(long_image.height, short_image.height + 120 * RENDER_SCALE)
 
     def test_render_loads_multiple_previews_concurrently(self):

@@ -25,8 +25,8 @@ from .media import PostMedia, PostPayload, source_name
 
 
 WHITE = (255, 255, 255)
-TEXT = (24, 24, 24)
-MUTED = (126, 132, 139)
+TEXT = (18, 18, 18)
+MUTED = (96, 104, 112)
 LINE = (226, 226, 226)
 ACTION = (24, 24, 24)
 CARD_BG = (250, 250, 250)
@@ -50,7 +50,9 @@ FILE_COLORS = {
 }
 FONT_CACHE: dict[tuple[int, bool], ImageFont.ImageFont] = {}
 QUALITY_RESAMPLE = Image.Resampling.LANCZOS
-RENDER_SCALE = 2
+RENDER_SCALE = 3
+PREVIEW_MAX_EDGE = 3200
+SOURCE_IMAGE_MAX_BYTES = 32 * 1024 * 1024
 ACTION_STRIP_DEFAULT_WIDTH = 260 * RENDER_SCALE
 PREVIEW_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="qzone-render")
 _THREAD_LOCAL = threading.local()
@@ -131,7 +133,7 @@ def preload_publish_render_assets(
         try:
             cache_dir.mkdir(parents=True, exist_ok=True)
             avatar = preview.image.copy()
-            avatar.thumbnail((1600, 1600), QUALITY_RESAMPLE)
+            avatar.thumbnail((PREVIEW_MAX_EDGE, PREVIEW_MAX_EDGE), QUALITY_RESAMPLE)
             avatar.save(cache_path, "PNG", optimize=False, compress_level=1)
         except OSError:
             continue
@@ -240,16 +242,22 @@ def render_publish_result_image(
     if not profile.nickname:
         profile.nickname = profile.user_id or "QQ Space"
 
-    logical_width = max(640, min(int(width or 900), 1280))
     render_scale = RENDER_SCALE
+    scratch = ImageDraw.Draw(Image.new("RGB", (1, 1), WHITE))
+    content_text = _render_content_text(post)
+    logical_width = _adaptive_logical_width(
+        post,
+        int(width or 900),
+        scratch,
+        content_text,
+        scale=render_scale,
+    )
     width = _scale_px(logical_width, render_scale)
     margin = _scale_px(24, render_scale)
     content_width = width - margin * 2
     meta_font = _font(_scale_px(18, render_scale))
     small_font = _font(_scale_px(17, render_scale))
 
-    scratch = ImageDraw.Draw(Image.new("RGB", (1, 1), WHITE))
-    content_text = _render_content_text(post)
     text_font, text_lines, line_spacing = _content_text_layout(
         scratch,
         content_text,
@@ -257,15 +265,17 @@ def render_publish_result_image(
         scale=render_scale,
     )
     dense_layout = len(text_lines) > 8 or len(post.media) + len(post.attachments) > 2
-    avatar_size = _scale_px(68 if len(text_lines) > 12 else 72 if dense_layout else 76, render_scale)
-    header_y = _scale_px(24 if dense_layout else 26, render_scale)
-    header_gap = _scale_px(18 if dense_layout else 22, render_scale)
+    compact_text_len = len(re.sub(r"\s+", "", content_text))
+    short_text_only = not post.media and not post.attachments and compact_text_len <= 45
+    avatar_size = _scale_px(70 if len(text_lines) > 12 else 76 if dense_layout else 80, render_scale)
+    header_y = _scale_px(22 if short_text_only else 24 if dense_layout else 26, render_scale)
+    header_gap = _scale_px(16 if short_text_only else 18 if dense_layout else 22, render_scale)
     content_y = header_y + avatar_size + header_gap
-    name_font = _font(_scale_px(25 if len(text_lines) > 12 else 26 if dense_layout else 27, render_scale), bold=True)
-    time_font = _font(_scale_px(18 if dense_layout else 19, render_scale))
-    block_gap = _scale_px(14 if dense_layout else 18, render_scale)
-    action_gap = _scale_px(6 if dense_layout else 8, render_scale)
-    bottom_padding = _scale_px(20 if dense_layout else 24, render_scale)
+    name_font = _font(_scale_px(28 if len(text_lines) > 12 else 30 if dense_layout else 31, render_scale), bold=True)
+    time_font = _font(_scale_px(19 if dense_layout else 20, render_scale))
+    block_gap = _scale_px(12 if short_text_only else 14 if dense_layout else 18, render_scale)
+    action_gap = _scale_px(4 if short_text_only else 6 if dense_layout else 8, render_scale)
+    bottom_padding = _scale_px(16 if short_text_only else 20 if dense_layout else 24, render_scale)
     line_height = _line_height(scratch, text_font, line_spacing)
     text_height = len(text_lines) * line_height if text_lines else 0
 
@@ -349,6 +359,49 @@ def _scale_px(value: int | float, scale: int = RENDER_SCALE) -> int:
     return max(1, int(round(float(value) * scale)))
 
 
+def _adaptive_logical_width(
+    post: PostPayload,
+    requested_width: int,
+    draw: ImageDraw.ImageDraw,
+    content_text: str,
+    *,
+    scale: int,
+) -> int:
+    requested = max(520, min(int(requested_width or 900), 1280))
+    if post.media or post.attachments:
+        return max(640, requested)
+
+    compact_len = len(re.sub(r"\s+", "", str(content_text or "")))
+    if compact_len <= 0:
+        return min(requested, 560)
+
+    text_size = _preferred_content_font_size(compact_len)
+    font = _font(_scale_px(text_size, scale))
+    paragraphs = [line.strip() for line in str(content_text).replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    longest_px = max((_measure(draw, line, font) for line in paragraphs if line), default=0)
+    natural = math.ceil(longest_px / max(1, scale)) + 76
+
+    if compact_len <= 18:
+        min_width, max_width = 520, 620
+    elif compact_len <= 45:
+        min_width, max_width = 560, 720
+    elif compact_len <= 90:
+        min_width, max_width = 640, 820
+    else:
+        min_width, max_width = 700, requested
+    return max(min_width, min(requested, max_width, natural))
+
+
+def _preferred_content_font_size(compact_len: int) -> int:
+    if compact_len <= 45:
+        return 30
+    if compact_len <= 120:
+        return 29
+    if compact_len <= 260:
+        return 27
+    return 25
+
+
 def _content_text_layout(
     draw: ImageDraw.ImageDraw,
     text: str,
@@ -358,13 +411,15 @@ def _content_text_layout(
 ) -> tuple[ImageFont.ImageFont, list[str], float]:
     compact_text = re.sub(r"\s+", "", str(text or ""))
     if not compact_text:
-        return _font(_scale_px(22, scale)), [], 1.32
-    if len(compact_text) <= 60:
-        candidates = ((24, 6, 1.32), (22, 9, 1.3), (20, 999, 1.28))
-    elif len(compact_text) <= 220:
-        candidates = ((22, 10, 1.3), (20, 16, 1.28), (19, 999, 1.27))
+        return _font(_scale_px(27, scale)), [], 1.26
+    if len(compact_text) <= 45:
+        candidates = ((30, 4, 1.2), (29, 6, 1.2), (28, 999, 1.2))
+    elif len(compact_text) <= 120:
+        candidates = ((29, 8, 1.22), (28, 11, 1.22), (27, 999, 1.22))
+    elif len(compact_text) <= 260:
+        candidates = ((27, 12, 1.24), (26, 17, 1.24), (25, 999, 1.24))
     else:
-        candidates = ((20, 16, 1.28), (19, 999, 1.27))
+        candidates = ((25, 18, 1.25), (24, 26, 1.25), (23, 999, 1.25))
     for size, line_limit, spacing in candidates:
         font = _font(_scale_px(size, scale))
         lines = _wrap_text(draw, text, font, max_width)
@@ -489,7 +544,7 @@ def _truncate_to_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.Ima
 
 
 def _load_image_preview(media: PostMedia, *, remote_timeout: float) -> _ImagePreview:
-    data = _read_source_bytes(media.source, max_bytes=12 * 1024 * 1024, remote_timeout=remote_timeout)
+    data = _read_source_bytes(media.source, max_bytes=SOURCE_IMAGE_MAX_BYTES, remote_timeout=remote_timeout)
     if not data:
         return _ImagePreview(media=media, image=None, failed=True)
     try:
@@ -504,7 +559,7 @@ def _load_image_preview(media: PostMedia, *, remote_timeout: float) -> _ImagePre
                 preview = base
             else:
                 preview = preview.copy()
-            preview.thumbnail((1600, 1600), QUALITY_RESAMPLE)
+            preview.thumbnail((PREVIEW_MAX_EDGE, PREVIEW_MAX_EDGE), QUALITY_RESAMPLE)
             return _ImagePreview(media=media, image=preview, failed=False)
     except (OSError, UnidentifiedImageError):
         return _ImagePreview(media=media, image=None, failed=True)
@@ -739,10 +794,9 @@ def _draw_avatar(
 
 
 def _smooth_circle_image(source: Image.Image, size: int, *, scale: int = 4) -> Image.Image:
-    large_size = max(size, int(size) * max(2, int(scale)))
-    avatar = ImageOps.fit(source.convert("RGB"), (large_size, large_size), method=QUALITY_RESAMPLE).convert("RGBA")
-    avatar.putalpha(_circle_mask(large_size))
-    return avatar.resize((size, size), QUALITY_RESAMPLE)
+    avatar = ImageOps.fit(source.convert("RGB"), (size, size), method=QUALITY_RESAMPLE).convert("RGBA")
+    avatar.putalpha(_circle_mask(size, scale_key=scale))
+    return avatar
 
 
 def _fallback_avatar_image(profile: RenderProfile, size: int, *, scale: int = 4) -> Image.Image:
@@ -766,14 +820,18 @@ def _fallback_avatar_image(profile: RenderProfile, size: int, *, scale: int = 4)
 
 
 def _circle_mask(size: int, *, scale_key: int = 1) -> Image.Image:
-    key = (int(size), int(scale_key))
+    key = (int(size), max(1, int(scale_key)))
     cached = _AVATAR_MASK_CACHE.get(key)
     if cached is not None:
         return cached
-    mask = Image.new("L", (size, size), 0)
+    scale = key[1]
+    large_size = int(size) * scale
+    mask = Image.new("L", (large_size, large_size), 0)
     mask_draw = ImageDraw.Draw(mask)
-    inset = max(1, size // 180)
-    mask_draw.ellipse((inset, inset, size - inset - 1, size - inset - 1), fill=255)
+    inset = max(1, large_size // 180)
+    mask_draw.ellipse((inset, inset, large_size - inset - 1, large_size - inset - 1), fill=255)
+    if scale > 1:
+        mask = mask.resize((int(size), int(size)), QUALITY_RESAMPLE)
     _AVATAR_MASK_CACHE[key] = mask
     return mask
 
