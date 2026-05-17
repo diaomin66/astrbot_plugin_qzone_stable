@@ -30,7 +30,6 @@ MUTED = (126, 132, 139)
 LINE = (226, 226, 226)
 ACTION = (24, 24, 24)
 CARD_BG = (250, 250, 250)
-COMMENT_BG = (247, 247, 247)
 FILE_COLORS = {
     ".pdf": (216, 74, 64),
     ".doc": (64, 112, 205),
@@ -51,6 +50,8 @@ FILE_COLORS = {
 }
 FONT_CACHE: dict[tuple[int, bool], ImageFont.ImageFont] = {}
 QUALITY_RESAMPLE = Image.Resampling.LANCZOS
+RENDER_SCALE = 2
+ACTION_STRIP_DEFAULT_WIDTH = 260 * RENDER_SCALE
 PREVIEW_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="qzone-render")
 _THREAD_LOCAL = threading.local()
 _BYTES_CACHE: dict[str, tuple[float, bytes]] = {}
@@ -62,6 +63,9 @@ _LAST_PRUNE_AT = 0.0
 _PRUNE_INTERVAL_SECONDS = 60.0
 ASSET_DIR = Path(__file__).with_name("assets")
 ACTION_STRIP_ASSET = ASSET_DIR / "publish_actions.png"
+FONT_ASSET_DIR = ASSET_DIR / "fonts"
+REGULAR_FONT_ASSET = FONT_ASSET_DIR / "AlibabaPuHuiTi-3-55-Regular.ttf"
+BOLD_FONT_ASSET = FONT_ASSET_DIR / "AlibabaPuHuiTi-3-75-SemiBold.ttf"
 _ACTION_STRIP_CACHE: dict[tuple[str, int], Image.Image] = {}
 _AVATAR_MASK_CACHE: dict[tuple[int, int], Image.Image] = {}
 
@@ -84,9 +88,10 @@ class _ImagePreview:
 def preload_static_render_assets() -> None:
     """Warm fonts and the static action-strip image before the first publish render."""
 
-    for size, bold in ((28, True), (24, False), (20, False), (18, False), (17, False), (34, True)):
-        _font(size, bold=bold)
-    _action_strip()
+    for size, bold in ((27, True), (25, True), (24, False), (22, False), (20, False), (18, False), (17, False), (34, True)):
+        _font(_scale_px(size), bold=bold)
+    for target_width in (220, 230, 240, 250, 260):
+        _action_strip(_scale_px(target_width))
 
 
 def preload_publish_render_assets(
@@ -235,18 +240,33 @@ def render_publish_result_image(
     if not profile.nickname:
         profile.nickname = profile.user_id or "QQ Space"
 
-    width = max(640, min(int(width or 900), 1280))
-    margin = 22
+    logical_width = max(640, min(int(width or 900), 1280))
+    render_scale = RENDER_SCALE
+    width = _scale_px(logical_width, render_scale)
+    margin = _scale_px(24, render_scale)
     content_width = width - margin * 2
-    name_font = _font(28, bold=True)
-    time_font = _font(20)
-    text_font = _font(24)
-    meta_font = _font(18)
-    small_font = _font(17)
+    meta_font = _font(_scale_px(18, render_scale))
+    small_font = _font(_scale_px(17, render_scale))
 
     scratch = ImageDraw.Draw(Image.new("RGB", (1, 1), WHITE))
-    text_lines = _wrap_text(scratch, _render_content_text(post), text_font, content_width)
-    line_height = _line_height(scratch, text_font, 1.34)
+    content_text = _render_content_text(post)
+    text_font, text_lines, line_spacing = _content_text_layout(
+        scratch,
+        content_text,
+        content_width,
+        scale=render_scale,
+    )
+    dense_layout = len(text_lines) > 8 or len(post.media) + len(post.attachments) > 2
+    avatar_size = _scale_px(68 if len(text_lines) > 12 else 72 if dense_layout else 76, render_scale)
+    header_y = _scale_px(24 if dense_layout else 26, render_scale)
+    header_gap = _scale_px(18 if dense_layout else 22, render_scale)
+    content_y = header_y + avatar_size + header_gap
+    name_font = _font(_scale_px(25 if len(text_lines) > 12 else 26 if dense_layout else 27, render_scale), bold=True)
+    time_font = _font(_scale_px(18 if dense_layout else 19, render_scale))
+    block_gap = _scale_px(14 if dense_layout else 18, render_scale)
+    action_gap = _scale_px(6 if dense_layout else 8, render_scale)
+    bottom_padding = _scale_px(20 if dense_layout else 24, render_scale)
+    line_height = _line_height(scratch, text_font, line_spacing)
     text_height = len(text_lines) * line_height if text_lines else 0
 
     preview_targets: list[PostMedia] = []
@@ -258,42 +278,63 @@ def render_publish_result_image(
     loaded_previews = _load_image_previews(preview_targets, remote_timeout=remote_timeout)
     avatar_preview = loaded_previews[0] if avatar_offset else None
     previews = loaded_previews[avatar_offset:]
-    image_height = _image_block_height(previews, content_width) if previews else 0
-    attachment_height = _attachment_block_height(post.attachments, content_width) if post.attachments else 0
+    image_height = _image_block_height(previews, content_width, scale=render_scale) if previews else 0
+    attachment_height = (
+        _attachment_block_height(post.attachments, content_width, scale=render_scale) if post.attachments else 0
+    )
 
-    y = 126
+    y = content_y
     if text_height:
-        y += text_height + 18
+        y += text_height + block_gap
     if image_height:
-        y += image_height + 18
+        y += image_height + block_gap
     if attachment_height:
-        y += attachment_height + 18
-    action_strip = _action_strip()
-    actions_y = y + 6
-    comment_y = actions_y + action_strip.height + 8
-    height = max(240, comment_y + 56 + 22)
+        y += attachment_height + block_gap
+    action_strip = _action_strip(
+        _action_strip_render_width(logical_width, dense_layout=dense_layout, scale=render_scale)
+    )
+    actions_y = y + action_gap
+    height = max(_scale_px(240, render_scale), actions_y + action_strip.height + bottom_padding)
 
     image = Image.new("RGB", (width, height), WHITE)
     draw = ImageDraw.Draw(image)
-    _draw_header(draw, image, profile, margin, name_font, time_font, avatar_preview=avatar_preview)
+    _draw_header(
+        draw,
+        image,
+        profile,
+        margin,
+        name_font,
+        time_font,
+        avatar_preview=avatar_preview,
+        avatar_size=avatar_size,
+        avatar_y=header_y,
+        scale=render_scale,
+    )
 
-    y = 126
+    y = content_y
     if text_lines:
         for line in text_lines:
             _safe_text(draw, (margin, y), line, text_font, TEXT)
             y += line_height
-        y += 18
+        y += block_gap
     if previews:
-        _draw_image_block(draw, image, previews, margin, y, content_width, small_font)
-        y += image_height + 18
+        _draw_image_block(draw, image, previews, margin, y, content_width, small_font, scale=render_scale)
+        y += image_height + block_gap
     if post.attachments:
-        _draw_attachment_block(draw, post.attachments, margin, y, content_width, meta_font, small_font)
-        y += attachment_height + 18
+        _draw_attachment_block(
+            draw,
+            post.attachments,
+            margin,
+            y,
+            content_width,
+            meta_font,
+            small_font,
+            scale=render_scale,
+        )
+        y += attachment_height + block_gap
 
-    actions_y = y + 6
-    _draw_actions(image, width, actions_y, strip=action_strip)
-    comment_y = actions_y + action_strip.height + 8
-    _draw_comment_box(draw, margin, comment_y, content_width, 52, meta_font)
+    actions_y = y + action_gap
+    _draw_actions(image, width, actions_y, strip=action_strip, scale=render_scale)
 
     path = output_dir / f"publish_result_{int(time.time())}_{uuid.uuid4().hex[:10]}.png"
     image.save(path, "PNG", optimize=False, compress_level=1)
@@ -304,6 +345,36 @@ def _render_content_text(post: PostPayload) -> str:
     return str(post.content or "").strip()
 
 
+def _scale_px(value: int | float, scale: int = RENDER_SCALE) -> int:
+    return max(1, int(round(float(value) * scale)))
+
+
+def _content_text_layout(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    max_width: int,
+    *,
+    scale: int = 1,
+) -> tuple[ImageFont.ImageFont, list[str], float]:
+    compact_text = re.sub(r"\s+", "", str(text or ""))
+    if not compact_text:
+        return _font(_scale_px(22, scale)), [], 1.32
+    if len(compact_text) <= 60:
+        candidates = ((24, 6, 1.32), (22, 9, 1.3), (20, 999, 1.28))
+    elif len(compact_text) <= 220:
+        candidates = ((22, 10, 1.3), (20, 16, 1.28), (19, 999, 1.27))
+    else:
+        candidates = ((20, 16, 1.28), (19, 999, 1.27))
+    for size, line_limit, spacing in candidates:
+        font = _font(_scale_px(size, scale))
+        lines = _wrap_text(draw, text, font, max_width)
+        if len(lines) <= line_limit:
+            return font, lines, spacing
+    size, _line_limit, spacing = candidates[-1]
+    font = _font(_scale_px(size, scale))
+    return font, _wrap_text(draw, text, font, max_width), spacing
+
+
 def _font(size: int, bold: bool = False) -> ImageFont.ImageFont:
     key = (int(size), bool(bold))
     cached = FONT_CACHE.get(key)
@@ -311,6 +382,7 @@ def _font(size: int, bold: bool = False) -> ImageFont.ImageFont:
         return cached
 
     regular = [
+        REGULAR_FONT_ASSET,
         r"C:\Windows\Fonts\msyh.ttc",
         r"C:\Windows\Fonts\simhei.ttf",
         r"C:\Windows\Fonts\simsun.ttc",
@@ -321,6 +393,7 @@ def _font(size: int, bold: bool = False) -> ImageFont.ImageFont:
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     ]
     bold_fonts = [
+        BOLD_FONT_ASSET,
         r"C:\Windows\Fonts\msyhbd.ttc",
         r"C:\Windows\Fonts\simhei.ttf",
         "/System/Library/Fonts/PingFang.ttc",
@@ -570,28 +643,31 @@ def _store_cached_bytes(key: str, data: bytes) -> None:
         _BYTES_CACHE[key] = (now + _BYTES_CACHE_TTL, data)
 
 
-def _image_block_height(previews: list[_ImagePreview], width: int) -> int:
+def _image_block_height(previews: list[_ImagePreview], width: int, *, scale: int = 1) -> int:
     if len(previews) == 1:
-        return _single_image_size(previews[0], width)[1]
+        return _single_image_size(previews[0], width, scale=scale)[1]
     cols = _grid_columns(len(previews))
-    gap = 8
+    gap = _scale_px(8, scale)
     tile = (width - gap * (cols - 1)) // cols
     rows = math.ceil(len(previews) / cols)
     return rows * tile + gap * (rows - 1)
 
 
-def _single_image_size(preview: _ImagePreview, width: int) -> tuple[int, int]:
-    max_w = min(width, 540)
-    max_h = 690
+def _single_image_size(preview: _ImagePreview, width: int, *, scale: int = 1) -> tuple[int, int]:
+    max_w = min(width, _scale_px(540, scale))
+    max_h = _scale_px(690, scale)
     if preview.image is None:
-        return min(max_w, 420), 280
+        return min(max_w, _scale_px(420, scale)), _scale_px(280, scale)
     source_w, source_h = preview.image.size
     if source_w <= 0 or source_h <= 0:
-        return min(max_w, 420), 280
-    scale = min(max_w / source_w, max_h / source_h)
-    if scale > 1:
-        scale = min(scale, 1.35)
-    return max(120, int(source_w * scale)), max(120, int(source_h * scale))
+        return min(max_w, _scale_px(420, scale)), _scale_px(280, scale)
+    fit_scale = min(max_w / source_w, max_h / source_h)
+    if fit_scale > 1:
+        fit_scale = min(fit_scale, 1.35)
+    return max(_scale_px(120, scale), int(source_w * fit_scale)), max(
+        _scale_px(120, scale),
+        int(source_h * fit_scale),
+    )
 
 
 def _grid_columns(count: int) -> int:
@@ -602,11 +678,11 @@ def _grid_columns(count: int) -> int:
     return 3
 
 
-def _attachment_block_height(attachments: list[PostMedia], width: int) -> int:
-    cols = 2 if width >= 620 else 1
+def _attachment_block_height(attachments: list[PostMedia], width: int, *, scale: int = 1) -> int:
+    cols = 2 if width >= _scale_px(620, scale) else 1
     rows = math.ceil(len(attachments) / cols)
-    gap = 10
-    card_h = 76
+    gap = _scale_px(10, scale)
+    card_h = _scale_px(76, scale)
     return rows * card_h + gap * (rows - 1)
 
 
@@ -619,18 +695,28 @@ def _draw_header(
     time_font: ImageFont.ImageFont,
     *,
     avatar_preview: _ImagePreview | None = None,
+    avatar_size: int = 76,
+    avatar_y: int = 26,
+    scale: int = 1,
 ) -> None:
-    avatar_size = 76
     avatar_x = margin
-    avatar_y = 26
     _draw_avatar(draw, image, profile, avatar_x, avatar_y, avatar_size, preview=avatar_preview)
-    text_x = avatar_x + avatar_size + 18
-    _safe_text(draw, (text_x, 32), profile.nickname, name_font, TEXT)
-    _safe_text(draw, (text_x, 72), profile.time_text, time_font, MUTED)
+    text_x = avatar_x + avatar_size + _scale_px(18, scale)
+    name_height = _line_height(draw, name_font, 1.0)
+    time_height = _line_height(draw, time_font, 1.0)
+    text_block_height = name_height + _scale_px(8, scale) + time_height
+    text_y = avatar_y + max(0, (avatar_size - text_block_height) // 2) - _scale_px(1, scale)
+    name = _truncate_to_width(draw, profile.nickname, name_font, max(_scale_px(20, scale), image.width - text_x - _scale_px(80, scale)))
+    _safe_text(draw, (text_x, text_y), name, name_font, TEXT)
+    _safe_text(draw, (text_x, text_y + name_height + _scale_px(8, scale)), profile.time_text, time_font, MUTED)
 
-    x = image.width - 44
-    y = 32
-    draw.line([(x, y), (x + 10, y + 10), (x + 20, y)], fill=ACTION, width=3)
+    x = image.width - _scale_px(44, scale)
+    y = avatar_y + _scale_px(8, scale)
+    draw.line(
+        [(x, y), (x + _scale_px(10, scale), y + _scale_px(10, scale)), (x + _scale_px(20, scale), y)],
+        fill=ACTION,
+        width=_scale_px(3, scale),
+    )
 
 
 def _draw_avatar(
@@ -711,21 +797,23 @@ def _draw_image_block(
     y: int,
     width: int,
     small_font: ImageFont.ImageFont,
+    *,
+    scale: int = 1,
 ) -> None:
     if len(previews) == 1:
-        target_w, target_h = _single_image_size(previews[0], width)
-        _draw_preview_tile(draw, image, previews[0], x, y, target_w, target_h, small_font, crop=False)
+        target_w, target_h = _single_image_size(previews[0], width, scale=scale)
+        _draw_preview_tile(draw, image, previews[0], x, y, target_w, target_h, small_font, crop=False, scale=scale)
         return
 
     cols = _grid_columns(len(previews))
-    gap = 8
+    gap = _scale_px(8, scale)
     tile = (width - gap * (cols - 1)) // cols
     for index, preview in enumerate(previews):
         col = index % cols
         row = index // cols
         tx = x + col * (tile + gap)
         ty = y + row * (tile + gap)
-        _draw_preview_tile(draw, image, preview, tx, ty, tile, tile, small_font, crop=True)
+        _draw_preview_tile(draw, image, preview, tx, ty, tile, tile, small_font, crop=True, scale=scale)
 
 
 def _draw_preview_tile(
@@ -739,6 +827,7 @@ def _draw_preview_tile(
     small_font: ImageFont.ImageFont,
     *,
     crop: bool,
+    scale: int = 1,
 ) -> None:
     if preview.image is not None:
         if crop:
@@ -749,16 +838,34 @@ def _draw_preview_tile(
         image.paste(rendered, (x, y))
         return
 
-    draw.rectangle((x, y, x + width, y + height), fill=(244, 245, 247), outline=LINE)
+    draw.rectangle((x, y, x + width, y + height), fill=(244, 245, 247), outline=LINE, width=_scale_px(1, scale))
     label = source_name(preview.media.source) or preview.media.name or "image"
-    label = _truncate_to_width(draw, label, small_font, max(20, width - 24))
-    icon_w = min(64, max(42, width // 5))
+    label = _truncate_to_width(draw, label, small_font, max(_scale_px(20, scale), width - _scale_px(24, scale)))
+    icon_w = min(_scale_px(64, scale), max(_scale_px(42, scale), width // 5))
     icon_x = x + (width - icon_w) // 2
-    icon_y = y + max(18, (height - icon_w) // 2 - 12)
-    draw.rectangle((icon_x, icon_y, icon_x + icon_w, icon_y + icon_w), outline=ACTION, width=2)
-    draw.line((icon_x + 10, icon_y + icon_w - 14, icon_x + 24, icon_y + icon_w - 30), fill=ACTION, width=2)
-    draw.line((icon_x + 24, icon_y + icon_w - 30, icon_x + icon_w - 12, icon_y + icon_w - 10), fill=ACTION, width=2)
-    _safe_text(draw, (x + 12, y + height - 30), label, small_font, MUTED)
+    icon_y = y + max(_scale_px(18, scale), (height - icon_w) // 2 - _scale_px(12, scale))
+    draw.rectangle((icon_x, icon_y, icon_x + icon_w, icon_y + icon_w), outline=ACTION, width=_scale_px(2, scale))
+    draw.line(
+        (
+            icon_x + _scale_px(10, scale),
+            icon_y + icon_w - _scale_px(14, scale),
+            icon_x + _scale_px(24, scale),
+            icon_y + icon_w - _scale_px(30, scale),
+        ),
+        fill=ACTION,
+        width=_scale_px(2, scale),
+    )
+    draw.line(
+        (
+            icon_x + _scale_px(24, scale),
+            icon_y + icon_w - _scale_px(30, scale),
+            icon_x + icon_w - _scale_px(12, scale),
+            icon_y + icon_w - _scale_px(10, scale),
+        ),
+        fill=ACTION,
+        width=_scale_px(2, scale),
+    )
+    _safe_text(draw, (x + _scale_px(12, scale), y + height - _scale_px(30, scale)), label, small_font, MUTED)
 
 
 def _draw_attachment_block(
@@ -769,17 +876,19 @@ def _draw_attachment_block(
     width: int,
     meta_font: ImageFont.ImageFont,
     small_font: ImageFont.ImageFont,
+    *,
+    scale: int = 1,
 ) -> None:
-    cols = 2 if width >= 620 else 1
-    gap = 10
-    card_h = 76
+    cols = 2 if width >= _scale_px(620, scale) else 1
+    gap = _scale_px(10, scale)
+    card_h = _scale_px(76, scale)
     card_w = (width - gap * (cols - 1)) // cols
     for index, item in enumerate(attachments):
         col = index % cols
         row = index // cols
         cx = x + col * (card_w + gap)
         cy = y + row * (card_h + gap)
-        _draw_file_card(draw, item, cx, cy, card_w, card_h, meta_font, small_font)
+        _draw_file_card(draw, item, cx, cy, card_w, card_h, meta_font, small_font, scale=scale)
 
 
 def _draw_file_card(
@@ -791,17 +900,25 @@ def _draw_file_card(
     height: int,
     meta_font: ImageFont.ImageFont,
     small_font: ImageFont.ImageFont,
+    *,
+    scale: int = 1,
 ) -> None:
-    draw.rounded_rectangle((x, y, x + width, y + height), radius=6, fill=CARD_BG, outline=LINE, width=1)
+    draw.rounded_rectangle(
+        (x, y, x + width, y + height),
+        radius=_scale_px(6, scale),
+        fill=CARD_BG,
+        outline=LINE,
+        width=_scale_px(1, scale),
+    )
     name = item.name or source_name(item.source) or item.kind or "file"
     suffix = Path(name).suffix.lower()
     color = FILE_COLORS.get(suffix, (91, 128, 167))
-    icon_x = x + 14
-    icon_y = y + 14
-    icon_w = 48
-    draw.rounded_rectangle((icon_x, icon_y, icon_x + icon_w, icon_y + icon_w), radius=5, fill=color)
+    icon_x = x + _scale_px(14, scale)
+    icon_y = y + _scale_px(14, scale)
+    icon_w = _scale_px(48, scale)
+    draw.rounded_rectangle((icon_x, icon_y, icon_x + icon_w, icon_y + icon_w), radius=_scale_px(5, scale), fill=color)
     ext = suffix[1:5].upper() if suffix else (item.kind or "FILE")[:4].upper()
-    ext_font = _font(13, bold=True)
+    ext_font = _font(_scale_px(13, scale), bold=True)
     box = draw.textbbox((0, 0), ext, font=ext_font)
     _safe_text(
         draw,
@@ -810,14 +927,14 @@ def _draw_file_card(
         ext_font,
         WHITE,
     )
-    text_x = icon_x + icon_w + 12
-    title = _truncate_to_width(draw, name, meta_font, max(20, width - (text_x - x) - 12))
-    _safe_text(draw, (text_x, y + 13), title, meta_font, TEXT)
+    text_x = icon_x + icon_w + _scale_px(12, scale)
+    title = _truncate_to_width(draw, name, meta_font, max(_scale_px(20, scale), width - (text_x - x) - _scale_px(12, scale)))
+    _safe_text(draw, (text_x, y + _scale_px(13, scale)), title, meta_font, TEXT)
     meta = item.mime_type or _format_size(item.size) or _kind_label(item.kind)
     if item.size and item.mime_type:
         meta = f"{item.mime_type} | {_format_size(item.size)}"
-    meta = _truncate_to_width(draw, meta, small_font, max(20, width - (text_x - x) - 12))
-    _safe_text(draw, (text_x, y + 43), meta, small_font, MUTED)
+    meta = _truncate_to_width(draw, meta, small_font, max(_scale_px(20, scale), width - (text_x - x) - _scale_px(12, scale)))
+    _safe_text(draw, (text_x, y + _scale_px(43, scale)), meta, small_font, MUTED)
 
 
 def _kind_label(kind: str) -> str:
@@ -843,13 +960,19 @@ def _format_size(size: int) -> str:
     return ""
 
 
-def _draw_actions(image: Image.Image, width: int, y: int, *, strip: Image.Image | None = None) -> None:
+def _draw_actions(image: Image.Image, width: int, y: int, *, strip: Image.Image | None = None, scale: int = 1) -> None:
     strip = strip or _action_strip()
-    start_x = max(22, width - strip.width - 22)
+    start_x = max(_scale_px(22, scale), width - strip.width - _scale_px(22, scale))
     image.paste(strip, (start_x, y), strip)
 
 
-def _action_strip(target_width: int = 300) -> Image.Image:
+def _action_strip_render_width(card_width: int, *, dense_layout: bool, scale: int = 1) -> int:
+    ratio = 0.34 if dense_layout else 0.36
+    target_width = int(round((max(1, card_width) * ratio) / 10.0) * 10)
+    return _scale_px(max(220, min(260, target_width)), scale)
+
+
+def _action_strip(target_width: int = ACTION_STRIP_DEFAULT_WIDTH) -> Image.Image:
     stat = ACTION_STRIP_ASSET.stat()
     key = (f"{ACTION_STRIP_ASSET.resolve()}:{stat.st_mtime_ns}:{stat.st_size}", int(target_width))
     cached = _ACTION_STRIP_CACHE.get(key)
@@ -862,19 +985,6 @@ def _action_strip(target_width: int = 300) -> Image.Image:
         strip = strip.resize((target_width, target_height), QUALITY_RESAMPLE)
     _ACTION_STRIP_CACHE[key] = strip
     return strip
-
-
-def _draw_comment_box(
-    draw: ImageDraw.ImageDraw,
-    x: int,
-    y: int,
-    width: int,
-    height: int,
-    font: ImageFont.ImageFont,
-) -> None:
-    radius = max(10, height // 2)
-    draw.rounded_rectangle((x, y, x + width, y + height), radius=radius, fill=COMMENT_BG, outline=LINE, width=1)
-    _safe_text(draw, (x + 20, y + 14), "\u8bc4\u8bba", font, MUTED)
 
 
 def _prune_output_dir(output_dir: Path, *, keep: int = 128, max_age_seconds: int = 3 * 24 * 3600) -> None:
