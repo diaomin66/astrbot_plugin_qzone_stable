@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+NUMERIC_FID_MIN_LENGTH = 12
+
 LATEST_ALIASES = {
     "",
     "0",
@@ -104,6 +106,8 @@ def _looks_like_fid(value: str) -> bool:
     text = str(value or "").strip()
     if not text:
         return False
+    if re.fullmatch(rf"\d{{{NUMERIC_FID_MIN_LENGTH},}}", text):
+        return True
     if _parse_selector(text) is not None:
         return False
     return bool(re.fullmatch(r"[A-Za-z0-9_.:-]{6,}", text))
@@ -115,10 +119,10 @@ def parse_post_selection(text: str, command_names: tuple[str, ...] = ()) -> Post
     tokens = raw.split()
 
     target_uin = at_targets[0] if at_targets else 0
-    if not target_uin and tokens and re.fullmatch(r"\d{5,}", tokens[0]):
+    if not target_uin and tokens and re.fullmatch(r"\d{5,}", tokens[0]) and not _looks_like_fid(tokens[0]):
         target_uin = int(tokens.pop(0))
 
-    if tokens and target_uin and _looks_like_fid(tokens[0]):
+    if tokens and _looks_like_fid(tokens[0]):
         fid = tokens.pop(0)
         appid = 311
         if tokens and tokens[0].isdigit():
@@ -170,15 +174,16 @@ def selection_from_tool_args(
     if index > 0:
         return PostSelection(target_uin=effective_target, start=int(index), end=int(index), selector="index")
 
-    parsed = _parse_selector(str(selector or "latest"))
+    selector_text = str(selector or "latest")
+    if _looks_like_fid(selector_text):
+        return PostSelection(
+            target_uin=effective_target,
+            fid=selector_text.strip(),
+            appid=int(appid or 311),
+            selector="fid",
+        )
+    parsed = _parse_selector(selector_text)
     if parsed is None:
-        if _looks_like_fid(str(selector or "")):
-            return PostSelection(
-                target_uin=effective_target,
-                fid=str(selector).strip(),
-                appid=int(appid or 311),
-                selector="fid",
-            )
         parsed = (1, 1, "latest")
     start, end, mode = parsed
     return PostSelection(target_uin=effective_target, start=start, end=end, selector=mode)

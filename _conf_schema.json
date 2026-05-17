@@ -238,12 +238,6 @@
     "default": "",
     "hint": "自定义 QQ 空间请求头里的 User-Agent。"
   },
-  "preview_writes": {
-    "description": "Preview write tools",
-    "type": "bool",
-    "default": true,
-    "hint": "兼容 LLM 写操作预览开关。"
-  },
   "render_publish_result": {
     "description": "Render publish result image",
     "type": "bool",

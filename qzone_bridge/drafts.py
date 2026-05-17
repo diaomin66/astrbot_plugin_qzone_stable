@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
+
+from .json_store import AtomicItemStoreFile
 
 DraftStatus = Literal["pending", "approved", "rejected", "recalled", "published"]
 
@@ -77,23 +78,13 @@ class DraftPost:
 class DraftStore:
     def __init__(self, path: Path):
         self.path = path
+        self._store = AtomicItemStoreFile(path)
 
     def _read_payload(self) -> dict[str, Any]:
-        if not self.path.exists():
-            return {"next_id": 1, "items": []}
-        try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
-            return {"next_id": 1, "items": []}
-        if not isinstance(payload, dict):
-            return {"next_id": 1, "items": []}
-        payload.setdefault("next_id", 1)
-        payload.setdefault("items", [])
-        return payload
+        return self._store.read()
 
     def _write_payload(self, payload: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self._store.write(payload)
 
     def list(self, *, status: str | None = None) -> list[DraftPost]:
         payload = self._read_payload()
@@ -103,16 +94,21 @@ class DraftStore:
         return sorted(items, key=lambda item: item.id)
 
     def get(self, draft_id: int | None = None) -> DraftPost | None:
-        items = self.list()
-        if not items:
+        try:
+            target_id = int(draft_id or 0)
+        except (TypeError, ValueError):
             return None
-        if not draft_id or draft_id < 0:
-            pending = [item for item in items if item.status == "pending"]
-            return pending[-1] if pending else items[-1]
+        if target_id <= 0:
+            return None
+        items = self.list()
         for item in items:
-            if item.id == draft_id:
+            if item.id == target_id:
                 return item
         return None
+
+    def latest_pending(self) -> DraftPost | None:
+        items = self.list(status="pending")
+        return items[-1] if items else None
 
     def add(
         self,
@@ -124,40 +120,70 @@ class DraftStore:
         media: list[dict[str, Any]] | None = None,
         anonymous: bool = False,
     ) -> DraftPost:
-        payload = self._read_payload()
-        draft_id = int(payload.get("next_id") or 1)
-        draft = DraftPost(
-            id=draft_id,
-            author_uin=author_uin,
-            author_name=author_name,
-            group_id=group_id,
-            content=content,
-            media=list(media or []),
-            anonymous=anonymous,
-        )
-        items = [item for item in payload.get("items") or [] if isinstance(item, dict)]
-        items.append(draft.to_dict())
-        payload["items"] = items
-        payload["next_id"] = draft_id + 1
-        self._write_payload(payload)
-        return draft
+        def update(payload: dict[str, Any]) -> DraftPost:
+            draft_id = int(payload.get("next_id") or 1)
+            draft = DraftPost(
+                id=draft_id,
+                author_uin=author_uin,
+                author_name=author_name,
+                group_id=group_id,
+                content=content,
+                media=list(media or []),
+                anonymous=anonymous,
+            )
+            items = [item for item in payload.get("items") or [] if isinstance(item, dict)]
+            items.append(draft.to_dict())
+            payload["items"] = items
+            payload["next_id"] = draft_id + 1
+            return draft
+
+        return self._store.transact(update)
 
     def save(self, draft: DraftPost) -> DraftPost:
         draft.updated_at = now_iso()
-        payload = self._read_payload()
-        items: list[dict[str, Any]] = []
-        found = False
-        for item in payload.get("items") or []:
-            if not isinstance(item, dict):
-                continue
-            if int(item.get("id") or 0) == draft.id:
+
+        def update(payload: dict[str, Any]) -> DraftPost:
+            items: list[dict[str, Any]] = []
+            found = False
+            for item in payload.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                if int(item.get("id") or 0) == draft.id:
+                    items.append(draft.to_dict())
+                    found = True
+                else:
+                    items.append(item)
+            if not found:
                 items.append(draft.to_dict())
-                found = True
-            else:
-                items.append(item)
-        if not found:
-            items.append(draft.to_dict())
-        payload["items"] = items
-        payload["next_id"] = max(int(payload.get("next_id") or 1), draft.id + 1)
-        self._write_payload(payload)
-        return draft
+            payload["items"] = items
+            payload["next_id"] = max(int(payload.get("next_id") or 1), draft.id + 1)
+            return draft
+
+        return self._store.transact(update)
+
+    def update(self, draft_id: int, mutator: Callable[[DraftPost], None]) -> DraftPost | None:
+        try:
+            target_id = int(draft_id or 0)
+        except (TypeError, ValueError):
+            return None
+        if target_id <= 0:
+            return None
+
+        def update_payload(payload: dict[str, Any]) -> DraftPost | None:
+            items: list[dict[str, Any]] = []
+            updated: DraftPost | None = None
+            for item in payload.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                if int(item.get("id") or 0) == target_id:
+                    draft = DraftPost.from_dict(item)
+                    mutator(draft)
+                    draft.updated_at = now_iso()
+                    updated = draft
+                    items.append(draft.to_dict())
+                else:
+                    items.append(item)
+            payload["items"] = items
+            return updated
+
+        return self._store.transact(update_payload)

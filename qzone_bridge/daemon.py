@@ -13,10 +13,16 @@ from datetime import datetime, timezone
 
 from aiohttp import web
 
-from .client import FeedPageResult, QzoneClient
+from .client import QzoneClient
 from .errors import QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
-from .media import QZONE_MAX_IMAGES, media_reference_text, normalize_media_list, split_publishable_images, strip_command_prefix
-from .models import BridgeState, FeedEntry, SessionState
+from .media import (
+    QZONE_MAX_IMAGES,
+    media_reference_text,
+    normalize_media_list,
+    sanitize_publish_content,
+    split_publishable_images,
+)
+from .models import FeedEntry, SessionState
 from .parser import (
     compute_unikey,
     extract_feed_page,
@@ -27,12 +33,15 @@ from .parser import (
     unwrap_payload,
 )
 from .protocol import SECRET_HEADER, fail, ok
+from .selection import NUMERIC_FID_MIN_LENGTH
 from .social import extract_comments
 from .storage import StateStore, ensure_state_secret
 from .utils import now_iso, from_iso
 
 log = logging.getLogger(__name__)
 LIKE_VERIFY_RETRY_DELAYS_SECONDS = (0.35, 0.85, 1.6)
+TRUE_TEXT_VALUES = {"1", "true", "yes", "y", "on"}
+FALSE_TEXT_VALUES = {"0", "false", "no", "n", "off", ""}
 LATEST_FEED_REFERENCES = {
     "latest",
     "newest",
@@ -46,6 +55,52 @@ LATEST_FEED_REFERENCES = {
 FEED_REFERENCE_PREFIXES = ("\u7b2c",)
 FEED_REFERENCE_SUFFIXES = ("\u6761",)
 LOSSY_LATEST_FEED_REFERENCES = {"最新", "最近"}
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in TRUE_TEXT_VALUES:
+            return True
+        if normalized in FALSE_TEXT_VALUES:
+            return False
+    return bool(value)
+
+
+def _coerce_int(value: Any, default: int = 0, *, field: str = "value") -> int:
+    if value in (None, ""):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise QzoneParseError(f"{field} 必须是整数") from exc
+
+
+def _query_int(request: web.Request, key: str, default: int = 0) -> int:
+    return _coerce_int(request.query.get(key), default, field=key)
+
+
+def _body_int(body: dict[str, Any], key: str, default: int = 0) -> int:
+    return _coerce_int(body.get(key), default, field=key)
+
+
+def _body_bool(body: dict[str, Any], key: str, default: bool = False) -> bool:
+    return _coerce_bool(body.get(key), default)
+
+
+async def _bridge_response(service: "QzoneDaemonService", action) -> web.Response:
+    try:
+        payload = await action()
+    except QzoneBridgeError as exc:
+        service._set_error(exc)
+        return fail(exc.code, exc.message, detail=_error_detail(exc))
+    return ok(payload)
 
 
 class QzoneDaemonService:
@@ -79,6 +134,7 @@ class QzoneDaemonService:
 
     def save(self) -> None:
         self.store.write(self.state)
+        self.state = ensure_state_secret(self.store.read())
         self.client.update_session(self.state.session)
 
     def touch(self) -> None:
@@ -430,9 +486,7 @@ class QzoneDaemonService:
         media: list[dict[str, Any]] | None = None,
         content_sanitized: bool = False,
     ) -> dict[str, Any]:
-        content = str(content or "")
-        if not content_sanitized:
-            content = strip_command_prefix(content, ("qzone post",)).strip()
+        content = sanitize_publish_content(content, content_sanitized=content_sanitized)
         normalized_media = normalize_media_list(media)
         photos, fallback_media = split_publishable_images(normalized_media)
         if len(photos) > QZONE_MAX_IMAGES:
@@ -549,7 +603,7 @@ class QzoneDaemonService:
         fid_text = str(fid or "").strip()
         if not fid_text:
             return 0
-        if not hostuin and fid_text.isdigit():
+        if not hostuin and fid_text.isdigit() and len(fid_text) < NUMERIC_FID_MIN_LENGTH:
             return int(fid_text)
         if fid_text.lower() in LATEST_FEED_REFERENCES or fid_text in LATEST_FEED_REFERENCES:
             return 1
@@ -841,15 +895,19 @@ def _error_detail(exc: QzoneBridgeError):
     return {"status_code": status_code, "detail": detail}
 
 
+SERVICE_APP_KEY = web.AppKey("qzone_service", QzoneDaemonService)
+SHUTDOWN_EVENT_APP_KEY = web.AppKey("qzone_shutdown_event", asyncio.Event)
+
+
 def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None = None) -> web.Application:
     app = web.Application(client_max_size=32 * 1024 * 1024)
-    app["service"] = service
+    app[SERVICE_APP_KEY] = service
     if shutdown_event is not None:
-        app["shutdown_event"] = shutdown_event
+        app[SHUTDOWN_EVENT_APP_KEY] = shutdown_event
 
     @web.middleware
     async def auth_middleware(request: web.Request, handler):
-        secret = request.headers.get(SECRET_HEADER) or request.query.get("secret") or ""
+        secret = request.headers.get(SECRET_HEADER) or ""
         if secret != service.state.runtime.secret:
             return fail("UNAUTHORIZED", "secret 不正确", status=401)
         return await handler(request)
@@ -868,139 +926,128 @@ def create_app(service: QzoneDaemonService, shutdown_event: asyncio.Event | None
     async def bind(request: web.Request) -> web.Response:
         body = await _json_body(request)
         cookie_text = str(body.get("cookie_text") or body.get("cookie") or "")
-        uin = int(body.get("uin") or 0)
         source = str(body.get("source") or "manual")
-        try:
-            payload = await service.bind_cookie(cookie_text, uin=uin, source=source)
-        except QzoneBridgeError as exc:
-            service._set_error(exc)
-            return fail(exc.code, exc.message, detail=_error_detail(exc))
-        return ok(payload)
+        return await _bridge_response(
+            service,
+            lambda: service.bind_cookie(cookie_text, uin=_body_int(body, "uin", 0), source=source),
+        )
 
     async def unbind(request: web.Request) -> web.Response:
-        payload = await service.unbind()
-        return ok(payload)
+        return await _bridge_response(service, service.unbind)
 
     async def feeds(request: web.Request) -> web.Response:
-        hostuin = int(request.query.get("hostuin") or 0)
-        limit = int(request.query.get("limit") or 5)
         cursor = request.query.get("cursor") or ""
         scope = request.query.get("scope") or ""
-        try:
-            payload = await service.list_feeds(hostuin=hostuin, limit=limit, cursor=cursor, scope=scope)
-        except QzoneBridgeError as exc:
-            service._set_error(exc)
-            return fail(exc.code, exc.message, detail=_error_detail(exc))
-        return ok(payload)
+        return await _bridge_response(
+            service,
+            lambda: service.list_feeds(
+                hostuin=_query_int(request, "hostuin", 0),
+                limit=_query_int(request, "limit", 5),
+                cursor=cursor,
+                scope=scope,
+            ),
+        )
 
     async def detail(request: web.Request) -> web.Response:
-        hostuin = int(request.query.get("hostuin") or 0)
         fid = request.query.get("fid") or ""
-        appid = int(request.query.get("appid") or 311)
         busi_param = request.query.get("busi_param") or ""
-        try:
-            payload = await service.detail_feed(hostuin=hostuin, fid=fid, appid=appid, busi_param=busi_param)
-        except QzoneBridgeError as exc:
-            service._set_error(exc)
-            return fail(exc.code, exc.message, detail=_error_detail(exc))
-        return ok(payload)
+        return await _bridge_response(
+            service,
+            lambda: service.detail_feed(
+                hostuin=_query_int(request, "hostuin", 0),
+                fid=fid,
+                appid=_query_int(request, "appid", 311),
+                busi_param=busi_param,
+            ),
+        )
 
     async def visitors(request: web.Request) -> web.Response:
-        page = int(request.query.get("page") or 1)
-        count = int(request.query.get("count") or 20)
-        try:
-            payload = await service.view_visitors(page=page, count=count)
-        except QzoneBridgeError as exc:
-            service._set_error(exc)
-            return fail(exc.code, exc.message, detail=_error_detail(exc))
-        return ok(payload)
+        return await _bridge_response(
+            service,
+            lambda: service.view_visitors(
+                page=_query_int(request, "page", 1),
+                count=_query_int(request, "count", 20),
+            ),
+        )
 
     async def post(request: web.Request) -> web.Response:
         body = await _json_body(request)
         content = str(body.get("content") or "")
-        sync_weibo = bool(body.get("sync_weibo") or False)
         media = body.get("media") or body.get("attachments") or body.get("photos") or []
-        content_sanitized = bool(body.get("content_sanitized") or False)
-        try:
-            payload = await service.publish_post(
+        return await _bridge_response(
+            service,
+            lambda: service.publish_post(
                 content=content,
-                sync_weibo=sync_weibo,
+                sync_weibo=_body_bool(body, "sync_weibo", False),
                 media=media,
-                content_sanitized=content_sanitized,
-            )
-        except QzoneBridgeError as exc:
-            service._set_error(exc)
-            return fail(exc.code, exc.message, detail=_error_detail(exc))
-        return ok(payload)
+                content_sanitized=_body_bool(body, "content_sanitized", False),
+            ),
+        )
 
     async def comment(request: web.Request) -> web.Response:
         body = await _json_body(request)
         busi_param = body.get("busi_param")
         if not isinstance(busi_param, dict):
             busi_param = {}
-        try:
-            payload = await service.comment_post(
-                hostuin=int(body.get("hostuin") or 0),
+        return await _bridge_response(
+            service,
+            lambda: service.comment_post(
+                hostuin=_body_int(body, "hostuin", 0),
                 fid=str(body.get("fid") or ""),
                 content=str(body.get("content") or ""),
-                appid=int(body.get("appid") or 311),
-                private=bool(body.get("private") or False),
+                appid=_body_int(body, "appid", 311),
+                private=_body_bool(body, "private", False),
                 busi_param=busi_param,
-            )
-        except QzoneBridgeError as exc:
-            service._set_error(exc)
-            return fail(exc.code, exc.message, detail=_error_detail(exc))
-        return ok(payload)
+            ),
+        )
 
     async def reply(request: web.Request) -> web.Response:
         body = await _json_body(request)
-        try:
-            payload = await service.reply_comment(
-                hostuin=int(body.get("hostuin") or 0),
+        return await _bridge_response(
+            service,
+            lambda: service.reply_comment(
+                hostuin=_body_int(body, "hostuin", 0),
                 fid=str(body.get("fid") or ""),
                 commentid=str(body.get("commentid") or body.get("commentId") or ""),
-                comment_uin=int(body.get("comment_uin") or body.get("commentUin") or 0),
+                comment_uin=_coerce_int(
+                    body.get("comment_uin") or body.get("commentUin"),
+                    0,
+                    field="comment_uin",
+                ),
                 content=str(body.get("content") or ""),
-                appid=int(body.get("appid") or 311),
-            )
-        except QzoneBridgeError as exc:
-            service._set_error(exc)
-            return fail(exc.code, exc.message, detail=_error_detail(exc))
-        return ok(payload)
+                appid=_body_int(body, "appid", 311),
+            ),
+        )
 
     async def delete(request: web.Request) -> web.Response:
         body = await _json_body(request)
-        try:
-            payload = await service.delete_post(
+        return await _bridge_response(
+            service,
+            lambda: service.delete_post(
                 fid=str(body.get("fid") or ""),
-                appid=int(body.get("appid") or 311),
-            )
-        except QzoneBridgeError as exc:
-            service._set_error(exc)
-            return fail(exc.code, exc.message, detail=_error_detail(exc))
-        return ok(payload)
+                appid=_body_int(body, "appid", 311),
+            ),
+        )
 
     async def like(request: web.Request) -> web.Response:
         body = await _json_body(request)
-        try:
-            payload = await service.like_post(
-                hostuin=int(body.get("hostuin") or 0),
+        return await _bridge_response(
+            service,
+            lambda: service.like_post(
+                hostuin=_body_int(body, "hostuin", 0),
                 fid=str(body.get("fid") or ""),
-                appid=int(body.get("appid") or 311),
+                appid=_body_int(body, "appid", 311),
                 curkey=str(body.get("curkey") or ""),
-                unlike=bool(body.get("unlike") or False),
-                latest=bool(body.get("latest") or False),
-                index=int(body.get("index") or 0),
-            )
-        except QzoneBridgeError as exc:
-            service._set_error(exc)
-            return fail(exc.code, exc.message, detail=_error_detail(exc))
-        return ok(payload)
+                unlike=_body_bool(body, "unlike", False),
+                latest=_body_bool(body, "latest", False),
+                index=_body_int(body, "index", 0),
+            ),
+        )
 
     async def shutdown(request: web.Request) -> web.Response:
         service.touch()
         service.save()
-        event = request.app.get("shutdown_event")
+        event = request.app.get(SHUTDOWN_EVENT_APP_KEY)
         if isinstance(event, asyncio.Event):
             asyncio.get_running_loop().call_later(0.1, event.set)
         return ok({"stopping": True})

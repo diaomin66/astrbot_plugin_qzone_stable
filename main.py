@@ -10,7 +10,7 @@ import random
 import re
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -116,6 +116,54 @@ def _redact_for_log(value: Any) -> Any:
     return value
 
 
+TOOL_LOG_REDACT_KEYS = {
+    "busi_param",
+    "comment",
+    "comments",
+    "content",
+    "curkey",
+    "fid",
+    "images",
+    "items",
+    "media",
+    "post",
+    "raw",
+    "summary",
+    "text",
+    "unikey",
+}
+TOOL_LOG_COUNT_KEYS = {"comments", "images", "items", "media"}
+
+
+def _safe_for_tool_log(value: Any, *, key: str = "") -> Any:
+    lowered = key.lower()
+    if lowered in TOOL_LOG_COUNT_KEYS and isinstance(value, (list, tuple)):
+        return {"count": len(value)}
+    if (
+        lowered in TOOL_LOG_REDACT_KEYS
+        or lowered in SENSITIVE_LOG_KEYS
+        or "cookie" in lowered
+        or "skey" in lowered
+        or "secret" in lowered
+        or "token" in lowered
+    ):
+        if isinstance(value, (dict, list, tuple)):
+            try:
+                return {"redacted": True, "count": len(value)}
+            except Exception:
+                return "[redacted]"
+        return "[redacted]"
+    if isinstance(value, dict):
+        return {str(item_key): _safe_for_tool_log(item, key=str(item_key)) for item_key, item in value.items()}
+    if isinstance(value, list):
+        return [_safe_for_tool_log(item) for item in value]
+    if isinstance(value, tuple):
+        return [_safe_for_tool_log(item) for item in value]
+    if isinstance(value, str):
+        return truncate(_redact_url(value), 180)
+    return value
+
+
 def _safe_for_llm(value: Any) -> Any:
     if isinstance(value, dict):
         visible: dict[str, Any] = {}
@@ -199,6 +247,7 @@ from qzone_bridge.render import (
     format_llm_feed_list,
     format_status,
 )
+from qzone_bridge.scheduler import cron_delay_seconds
 from qzone_bridge.selection import PostSelection, parse_post_selection, selection_from_tool_args
 from qzone_bridge.settings import PluginSettings
 from qzone_bridge.social import QzoneComment, QzonePost, post_from_entry
@@ -296,7 +345,10 @@ class QzoneStablePlugin(Star):
 
     @staticmethod
     def _onebot_file_uri(path: Path) -> str:
-        return "file:///" + path.resolve().as_posix().lstrip("/")
+        try:
+            return path.resolve().as_uri()
+        except ValueError:
+            return "file:///" + path.resolve().as_posix().lstrip("/")
 
     async def _render_markdown_image(self, text: str, subdir: str = "markdown") -> Path | None:
         style_dir = str(self.settings.pillowmd_style_dir or "").strip()
@@ -571,15 +623,16 @@ class QzoneStablePlugin(Star):
         return f"{exc.message}\n{exc.detail}"
 
     def _log_tool_call_result(self, payload: dict[str, Any]) -> None:
+        safe_payload = _safe_for_tool_log(payload)
         try:
             data = json.dumps(
-                _redact_for_log(payload),
+                _redact_for_log(safe_payload),
                 ensure_ascii=False,
                 sort_keys=True,
                 default=str,
             )
         except Exception:
-            data = str(_redact_for_log(payload))
+            data = str(_redact_for_log(safe_payload))
         if payload.get("ok"):
             logger.info("qzone llm tool result: %s", data)
         else:
@@ -1037,11 +1090,56 @@ class QzoneStablePlugin(Star):
         return deduped
 
     def _parse_target_range(self, event: AstrMessageEvent, names: tuple[str, ...]) -> tuple[int, int, int]:
-        selection = parse_post_selection(self._event_text(event), names)
+        selection = self._selection_for_event(event, names)
         return selection.target_uin, selection.start, selection.end
 
     def _selection_for_event(self, event: AstrMessageEvent, names: tuple[str, ...]) -> PostSelection:
-        return parse_post_selection(self._event_text(event), names)
+        text = self._event_text(event)
+        selection = parse_post_selection(text, names)
+        if not selection.target_uin:
+            at_uins = self._at_uins(event, text)
+            if at_uins:
+                selection.target_uin = at_uins[0]
+        return selection
+
+    def _tool_target_uin(self, event: AstrMessageEvent, *values: Any, fallback: int = 0) -> int:
+        for value in values:
+            try:
+                target = int(value or 0)
+            except (TypeError, ValueError):
+                target = 0
+            if target > 0:
+                return target
+        at_uins = self._at_uins(event, self._event_text(event))
+        if at_uins:
+            return at_uins[0]
+        return int(fallback or 0)
+
+    def _selection_from_tool_args(
+        self,
+        event: AstrMessageEvent,
+        *,
+        target_uin: int = 0,
+        selector: str = "latest",
+        hostuin: int = 0,
+        fid: str = "",
+        appid: int = 311,
+        latest: bool = False,
+        index: int = 0,
+        use_event_target: bool = True,
+    ) -> PostSelection:
+        selection = selection_from_tool_args(
+            target_uin=target_uin,
+            selector=selector,
+            hostuin=hostuin,
+            fid=fid,
+            appid=appid,
+            latest=latest,
+            index=index,
+        )
+        if use_event_target and not selection.target_uin:
+            selection.target_uin = self._tool_target_uin(event)
+        return selection
 
     async def _posts_for_selection(
         self,
@@ -1213,11 +1311,11 @@ class QzoneStablePlugin(Star):
         raw = self._message_after_command(self._event_text(event), names)
         parts = raw.split(maxsplit=1)
         if not parts:
-            return -1, ""
+            return 0, ""
         try:
             return int(parts[0]), parts[1] if len(parts) > 1 else ""
         except ValueError:
-            return -1, raw
+            return 0, raw
 
     def _collect_target_post_payload(self, event: AstrMessageEvent, content: str, prefixes: tuple[str, ...]) -> PostPayload:
         return collect_post_payload(
@@ -1432,24 +1530,7 @@ class QzoneStablePlugin(Star):
 
     @staticmethod
     def _cron_delay_seconds(cron: str, offset_seconds: int) -> float:
-        parts = str(cron or "").split()
-        if len(parts) < 2:
-            return 0.0
-        try:
-            minute = int(parts[0])
-            hour = int(parts[1])
-        except ValueError:
-            return 0.0
-        now = datetime.now()
-        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        offset = int(offset_seconds or 0)
-        if offset > 0:
-            target += timedelta(seconds=random.randint(-offset, offset))
-            if target <= now:
-                target = now + timedelta(seconds=1)
-        return max(1.0, (target - now).total_seconds())
+        return cron_delay_seconds(cron, offset_seconds, now=datetime.now(), randint=random.randint)
 
     def _start_scheduled_tasks(self) -> None:
         if self._scheduled_tasks:
@@ -1875,8 +1956,19 @@ class QzoneStablePlugin(Star):
     async def reply_comment(self, event: AstrMessageEvent):
         raw = self._message_after_command(self._event_text(event), ("回评", "回复评论"))
         parts = raw.split()
-        post_id = int(parts[0]) if parts and re.fullmatch(r"-?\d+", parts[0]) else -1
-        comment_index = int(parts[1]) if len(parts) > 1 and re.fullmatch(r"-?\d+", parts[1]) else -1
+        post_id = int(parts[0]) if parts and re.fullmatch(r"-?\d+", parts[0]) else 0
+        if post_id <= 0:
+            yield self._command_result(event, "请提供要回评的稿件ID，例如：回评 3。")
+            return
+        comment_position = 0
+        if len(parts) > 1:
+            if not re.fullmatch(r"\d+", parts[1]):
+                yield self._command_result(event, "评论序号需要是从 1 开始的数字。")
+                return
+            comment_position = int(parts[1])
+            if comment_position <= 0:
+                yield self._command_result(event, "评论序号需要从 1 开始。")
+                return
         saved = self._post_store().get(post_id)
         draft = None if saved else self.drafts.get(post_id)
         if saved is None and (draft is None or not draft.published_fid):
@@ -1914,7 +2006,10 @@ class QzoneStablePlugin(Star):
             if not comments:
                 yield self._command_result(event, "这条说说暂时没有可回复的评论。")
                 return
-            comment = comments[comment_index] if 0 <= comment_index < len(comments) else comments[-1]
+            if comment_position > len(comments):
+                yield self._command_result(event, f"这条说说只有 {len(comments)} 条可回复评论。")
+                return
+            comment = comments[comment_position - 1] if comment_position else comments[-1]
             content = await self._generate_reply_text(event, post, comment)
             if not content.strip():
                 content = "收到啦。"
@@ -1954,6 +2049,9 @@ class QzoneStablePlugin(Star):
     @filter.command("撤稿")
     async def recall_post(self, event: AstrMessageEvent):
         draft_id, _ = self._draft_id_from_event(event, ("撤稿",))
+        if draft_id <= 0:
+            yield self._command_result(event, "请提供要撤回的稿件ID，例如：撤稿 3。")
+            return
         draft = self.drafts.get(draft_id)
         if draft is None:
             yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
@@ -1964,9 +2062,29 @@ class QzoneStablePlugin(Star):
         if draft.status != "pending":
             yield self._command_result(event, f"稿件 #{draft.id} 当前是 {draft.status}，不能撤回。")
             return
-        draft.status = "recalled"
-        self.drafts.save(draft)
-        yield await self._markdown_result(event, f"稿件 #{draft.id} 已撤回。", subdir="drafts")
+        failure = ""
+
+        def recall(current: DraftPost) -> None:
+            nonlocal failure
+            if current.author_uin != self._sender_id(event) and not self._is_admin(event):
+                failure = "permission"
+                return
+            if current.status != "pending":
+                failure = current.status
+                return
+            current.status = "recalled"
+
+        updated = self.drafts.update(draft.id, recall)
+        if updated is None:
+            yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
+            return
+        if failure == "permission":
+            yield self._command_result(event, "只能撤回自己的投稿。")
+            return
+        if failure:
+            yield self._command_result(event, f"稿件 #{updated.id} 当前是 {failure}，不能撤回。")
+            return
+        yield await self._markdown_result(event, f"稿件 #{updated.id} 已撤回。", subdir="drafts")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("看稿", alias={"查看稿件"})
@@ -1984,6 +2102,9 @@ class QzoneStablePlugin(Star):
     @filter.command("过稿", alias={"通过稿件", "通过投稿"})
     async def approve_post(self, event: AstrMessageEvent):
         draft_id, _ = self._draft_id_from_event(event, ("过稿", "通过稿件", "通过投稿"))
+        if draft_id <= 0:
+            yield self._command_result(event, "请提供要通过的稿件ID，例如：过稿 3。")
+            return
         draft = self.drafts.get(draft_id)
         if draft is None:
             yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
@@ -1991,6 +2112,23 @@ class QzoneStablePlugin(Star):
         if draft.status != "pending":
             yield self._command_result(event, f"稿件 #{draft.id} 当前是 {draft.status}，不能过稿。")
             return
+        failure = ""
+
+        def claim_approved(current: DraftPost) -> None:
+            nonlocal failure
+            if current.status != "pending":
+                failure = current.status
+                return
+            current.status = "approved"
+
+        claimed = self.drafts.update(draft.id, claim_approved)
+        if claimed is None:
+            yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
+            return
+        if failure:
+            yield self._command_result(event, f"稿件 #{claimed.id} 当前是 {failure}，不能过稿。")
+            return
+        draft = claimed
         post = PostPayload(content=self._draft_publish_content(draft), media=normalize_media_list(draft.media))
         profile_task: asyncio.Task | None = None
         try:
@@ -2001,10 +2139,14 @@ class QzoneStablePlugin(Star):
                 media=[item.to_dict() for item in post.media],
                 content_sanitized=True,
             )
-            draft.status = "published"
-            draft.published_fid = str(payload.get("fid") or "")
-            self.drafts.save(draft)
-            if draft.published_fid:
+            published_fid = str(payload.get("fid") or "")
+
+            def mark_published(current: DraftPost) -> None:
+                current.status = "published"
+                current.published_fid = published_fid
+
+            updated_draft = self.drafts.update(draft.id, mark_published) or draft
+            if published_fid:
                 login_uin = 0
                 try:
                     login_uin = int((await self.controller.get_status(probe_daemon=False)).get("login_uin") or 0)
@@ -2012,17 +2154,23 @@ class QzoneStablePlugin(Star):
                     login_uin = self._self_id(event)
                 saved_post = QzonePost(
                     hostuin=login_uin,
-                    fid=draft.published_fid,
+                    fid=published_fid,
                     appid=311,
                     summary=post.content,
                     nickname="",
                     images=[str(item.source) for item in post.media],
                 )
                 self._post_store().upsert(saved_post)
-            await self._notify_draft_author(event, draft, f"你的投稿 #{draft.id} 已通过并发布。")
+            await self._notify_draft_author(event, updated_draft, f"你的投稿 #{updated_draft.id} 已通过并发布。")
         except QzoneBridgeError as exc:
             if profile_task is not None:
                 profile_task.cancel()
+
+            def rollback_approved(current: DraftPost) -> None:
+                if current.status == "approved":
+                    current.status = "pending"
+
+            self.drafts.update(draft.id, rollback_approved)
             yield self._command_result(event, self._error_text(exc))
             return
         yield await self._publish_result(event, post, payload, profile_task=profile_task)
@@ -2031,6 +2179,9 @@ class QzoneStablePlugin(Star):
     @filter.command("拒稿", alias={"拒绝稿件", "拒绝投稿"})
     async def reject_post(self, event: AstrMessageEvent):
         draft_id, reason = self._draft_id_from_event(event, ("拒稿", "拒绝稿件", "拒绝投稿"))
+        if draft_id <= 0:
+            yield self._command_result(event, "请提供要拒绝的稿件ID，例如：拒稿 3 原因。")
+            return
         draft = self.drafts.get(draft_id)
         if draft is None:
             yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
@@ -2038,11 +2189,25 @@ class QzoneStablePlugin(Star):
         if draft.status != "pending":
             yield self._command_result(event, f"稿件 #{draft.id} 当前是 {draft.status}，不能拒稿。")
             return
-        draft.status = "rejected"
-        draft.reject_reason = reason or "未填写原因"
-        self.drafts.save(draft)
-        await self._notify_draft_author(event, draft, f"你的投稿 #{draft.id} 未通过：{draft.reject_reason}")
-        yield await self._markdown_result(event, f"稿件 #{draft.id} 已拒绝。", subdir="drafts")
+        failure = ""
+
+        def reject(current: DraftPost) -> None:
+            nonlocal failure
+            if current.status != "pending":
+                failure = current.status
+                return
+            current.status = "rejected"
+            current.reject_reason = reason or "未填写原因"
+
+        updated = self.drafts.update(draft.id, reject)
+        if updated is None:
+            yield self._command_result(event, f"稿件 #{draft_id} 不存在。")
+            return
+        if failure:
+            yield self._command_result(event, f"稿件 #{updated.id} 当前是 {failure}，不能拒稿。")
+            return
+        await self._notify_draft_author(event, updated, f"你的投稿 #{updated.id} 未通过：{updated.reject_reason}")
+        yield await self._markdown_result(event, f"稿件 #{updated.id} 已拒绝。", subdir="drafts")
 
     @qzone.command("help")
     async def qzone_help(self, event: AstrMessageEvent):
@@ -2249,7 +2414,7 @@ class QzoneStablePlugin(Star):
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
-            hostuin = int(user_id or self._sender_id(event) or 0)
+            hostuin = self._tool_target_uin(event, user_id, fallback=self._sender_id(event))
             wants_comment = bool(reply or self._event_text_has_comment_intent(event))
             wants_like = bool(like or self._event_text_has_like_intent(event))
             selection = PostSelection(
@@ -2398,7 +2563,7 @@ class QzoneStablePlugin(Star):
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
-            effective_hostuin = int(target_uin or hostuin or 0)
+            effective_hostuin = self._tool_target_uin(event, target_uin, hostuin)
             effective_scope = "" if scope == "auto" else scope
             payload = await self.controller.list_feeds(
                 hostuin=effective_hostuin,
@@ -2454,7 +2619,8 @@ class QzoneStablePlugin(Star):
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
-            selection = selection_from_tool_args(
+            selection = self._selection_from_tool_args(
+                event,
                 target_uin=target_uin,
                 selector=selector,
                 hostuin=hostuin,
@@ -2478,6 +2644,8 @@ class QzoneStablePlugin(Star):
                     )
                     yield event.plain_result(text)
                     return
+                if not posts:
+                    raise QzoneBridgeError("没有找到可操作的说说")
                 if wants_comment:
                     if not detail:
                         posts = await self._posts_for_selection(selection, with_detail=True, login_uin=self._self_id(event))
@@ -2493,7 +2661,7 @@ class QzoneStablePlugin(Star):
                         "tool": "qzone_comment_post",
                         "result": {"message": "评论发好了。", "count": len(results)},
                     }
-                    self._log_tool_call_result({**payload, "arguments": {"target_uin": target_uin, "selector": selector}})
+                    self._log_tool_call_result({**payload, "arguments": {"target_uin": selection.target_uin, "selector": selector}})
                     text = await self._ask_llm_tool_reply(event, payload, "评论发好了。")
                     yield event.plain_result(text)
                     return
@@ -2507,7 +2675,7 @@ class QzoneStablePlugin(Star):
                         else {"message": f"{len(like_payloads)} 条说说点好了。", "count": len(like_payloads)}
                     ),
                 }
-                self._log_tool_call_result({**payload, "arguments": {"target_uin": target_uin, "selector": selector}})
+                self._log_tool_call_result({**payload, "arguments": {"target_uin": selection.target_uin, "selector": selector}})
                 text = await self._ask_llm_tool_reply(event, self._llm_like_payload(payload["result"]), "点好了。")
                 yield event.plain_result(text)
                 return
@@ -2528,7 +2696,6 @@ class QzoneStablePlugin(Star):
         self,
         event: AstrMessageEvent,
         content: str,
-        confirm: bool = False,
         sync_weibo: bool = False,
         media: list[str] | None = None,
     ):
@@ -2536,7 +2703,6 @@ class QzoneStablePlugin(Star):
 
         Args:
             content (string): 说说内容。
-            confirm (boolean): 是否确认发布。
             sync_weibo (boolean): 是否同步到微博。
         """
         if not self._is_admin(event):
@@ -2554,20 +2720,6 @@ class QzoneStablePlugin(Star):
             command_prefixes=("qzone post",),
             extra_media=media,
         )
-        if self.settings.preview_writes and not confirm:
-            draft = truncate(post.content or "空内容", 120)
-            suffix = f"，附带 {len(post.media)} 个媒体" if post.media else ""
-            text = await self._ask_llm_tool_reply(
-                event,
-                {
-                    "ok": True,
-                    "tool": "qzone_publish_post",
-                    "result": {"message": f"这条还在预览里：{draft}{suffix}"},
-                },
-                f"这条先给你留在预览里：{draft}{suffix}。",
-            )
-            yield event.plain_result(text)
-            return
         try:
             await self._ensure_cookie_ready(event)
             payload = await self.controller.publish_post(
@@ -2614,7 +2766,6 @@ class QzoneStablePlugin(Star):
         like_after_comment: bool = False,
         hostuin: int = 0,
         fid: str = "",
-        confirm: bool = False,
         appid: int = 311,
         latest: bool = False,
         index: int = 0,
@@ -2630,7 +2781,6 @@ class QzoneStablePlugin(Star):
             like_after_comment (boolean): 评论后是否顺手点赞。
             hostuin (number): 兼容旧参数，目标 QQ 号。
             fid (string): 兼容旧参数，说说 fid。
-            confirm (boolean): 兼容旧参数，目前不会拦截执行。
             appid (number): 兼容旧参数，说说 appid，默认 311。
             latest (boolean): 兼容旧参数，为 true 时操作最新一条说说。
             index (number): 兼容旧参数，操作最近列表第 N 条。
@@ -2644,7 +2794,6 @@ class QzoneStablePlugin(Star):
             "like_after_comment": like_after_comment,
             "hostuin": hostuin,
             "fid": fid,
-            "confirm": confirm,
             "appid": appid,
             "latest": latest,
             "index": index,
@@ -2662,7 +2811,8 @@ class QzoneStablePlugin(Star):
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
-            selection = selection_from_tool_args(
+            selection = self._selection_from_tool_args(
+                event,
                 target_uin=target_uin,
                 selector=selector,
                 hostuin=hostuin,
@@ -2711,7 +2861,6 @@ class QzoneStablePlugin(Star):
         selector: str = "latest",
         hostuin: int = 0,
         fid: str = "",
-        confirm: bool = False,
         appid: int = 311,
         latest: bool = False,
         index: int = 0,
@@ -2723,7 +2872,6 @@ class QzoneStablePlugin(Star):
             selector (string): latest、最新、第2条、1~3 或 fid。
             hostuin (number): 兼容旧参数；删除只允许当前登录账号自己的说说。
             fid (string): 兼容旧参数，说说 fid。
-            confirm (boolean): 兼容旧参数，目前不会拦截执行。
             appid (number): 说说 appid，默认 311。
             latest (boolean): 为 true 时删除最新一条说说。
             index (number): 删除最近列表第 N 条，1 表示第一条。
@@ -2733,7 +2881,6 @@ class QzoneStablePlugin(Star):
             "selector": selector,
             "hostuin": hostuin,
             "fid": fid,
-            "confirm": confirm,
             "appid": appid,
             "latest": latest,
             "index": index,
@@ -2818,7 +2965,6 @@ class QzoneStablePlugin(Star):
         selector: str = "latest",
         hostuin: int = 0,
         fid: str = "",
-        confirm: bool = False,
         appid: int = 311,
         unlike: bool = False,
         latest: bool = False,
@@ -2831,7 +2977,6 @@ class QzoneStablePlugin(Star):
             selector (string): latest、最新、第2条、2、1~3 或 fid。
             hostuin (number): 兼容旧参数，目标 QQ 号。
             fid (string): 兼容旧参数，说说 fid，也可以用最近列表的序号。
-            confirm (boolean): 兼容旧参数，目前不会拦截执行。
             appid (number): 说说 appid，默认 `311`。
             unlike (boolean): 为 `true` 时取消点赞。
             latest (boolean): 为 `true` 时操作最新一条说说。
@@ -2842,7 +2987,6 @@ class QzoneStablePlugin(Star):
             "selector": selector,
             "hostuin": hostuin,
             "fid": fid,
-            "confirm": confirm,
             "appid": appid,
             "unlike": unlike,
             "latest": latest,
@@ -2876,7 +3020,7 @@ class QzoneStablePlugin(Star):
             await self._ensure_daemon()
             legacy_direct = bool(fid or latest or index)
             if legacy_direct:
-                effective_hostuin = int(hostuin or target_uin or 0)
+                effective_hostuin = self._tool_target_uin(event, hostuin, target_uin)
                 payload = await self.controller.like_post(
                     hostuin=effective_hostuin,
                     fid=fid,
@@ -2886,7 +3030,8 @@ class QzoneStablePlugin(Star):
                     index=index,
                 )
             else:
-                selection = selection_from_tool_args(
+                selection = self._selection_from_tool_args(
+                    event,
                     target_uin=target_uin,
                     selector=selector,
                     hostuin=hostuin,

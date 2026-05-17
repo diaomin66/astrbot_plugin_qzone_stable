@@ -39,7 +39,6 @@ INSTRUCTION_MARKERS = (
     "target_uin",
     "selector",
     "appid",
-    "confirm",
     "auto_generate",
     "private=",
     "sync_weibo",

@@ -16,8 +16,8 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 
-from .errors import DaemonUnavailableError, QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
-from .media import strip_command_prefix
+from .errors import DaemonUnavailableError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
+from .media import sanitize_publish_content
 from .models import SessionState
 from .parser import normalize_uin, parse_cookie_text
 from .protocol import SECRET_HEADER
@@ -222,19 +222,12 @@ class QzoneDaemonController:
         self._health_cache_ttl = 1.0
 
     def _runtime(self):
-        state = self.store.read()
-        original_secret = state.runtime.secret
-        original_started_at = state.runtime.started_at
-        original_port = state.runtime.daemon_port
-        state = ensure_state_secret(state)
-        if not state.runtime.daemon_port:
-            state.runtime.daemon_port = self.default_port
-        if (
-            state.runtime.secret != original_secret
-            or state.runtime.started_at != original_started_at
-            or state.runtime.daemon_port != original_port
-        ):
-            self.store.write(state)
+        def update(state):
+            ensure_state_secret(state)
+            if not state.runtime.daemon_port:
+                state.runtime.daemon_port = self.default_port
+
+        state = self.store.update(update)
         return state.runtime
 
     def _base_url(self, port: int | None = None) -> str:
@@ -281,15 +274,17 @@ class QzoneDaemonController:
 
     def _record_daemon_start_error(self, exc: DaemonUnavailableError, *, port: int) -> None:
         self._invalidate_health_cache()
-        state = self.store.read()
-        state.runtime.daemon_pid = 0
-        state.runtime.daemon_port = int(port or state.runtime.daemon_port or self.default_port or 0)
-        state.session.last_error = {
-            "type": type(exc).__name__,
-            "message": exc.message,
-            "detail": exc.detail,
-        }
-        self.store.write(state)
+
+        def update(state):
+            state.runtime.daemon_pid = 0
+            state.runtime.daemon_port = int(port or state.runtime.daemon_port or self.default_port or 0)
+            state.session.last_error = {
+                "type": type(exc).__name__,
+                "message": exc.message,
+                "detail": exc.detail,
+            }
+
+        self.store.update(update)
 
     def _invalidate_health_cache(self) -> None:
         self._health_cache = None
@@ -422,9 +417,7 @@ class QzoneDaemonController:
                     self._record_daemon_start_error(exc, port=port)
                     raise exc
                 port = found_port
-                state = self.store.read()
-                state.runtime.daemon_port = port
-                self.store.write(state)
+                self.store.update(lambda state: setattr(state.runtime, "daemon_port", port))
 
             if not self._daemon_script().exists():
                 exc = DaemonUnavailableError(
@@ -451,11 +444,12 @@ class QzoneDaemonController:
                     runtime.daemon_pid = self._process.pid if self._process else 0
                     runtime.started_at = now_iso()
                     runtime.last_seen_at = now_iso()
-                    state = self.store.read()
-                    state.runtime = runtime
-                    if isinstance(state.session.last_error, dict) and state.session.last_error.get("type") == "DaemonUnavailableError":
-                        state.session.last_error = None
-                    self.store.write(state)
+                    def update(state):
+                        state.runtime = runtime
+                        if isinstance(state.session.last_error, dict) and state.session.last_error.get("type") == "DaemonUnavailableError":
+                            state.session.last_error = None
+
+                    state = self.store.update(update)
                     self._health_cache = (
                         port,
                         runtime.secret,
@@ -573,21 +567,23 @@ class QzoneDaemonController:
             if not resolved_uin:
                 raise QzoneParseError("Cookie 缺少 uin / p_uin，无法识别登录 QQ")
 
-            state = self.store.read()
-            runtime = self._runtime()
-            state.runtime = runtime
-            state.session = SessionState(
-                uin=resolved_uin,
-                cookies=cookies,
-                qzonetokens={},
-                source=source,
-                updated_at=now_iso(),
-                last_ok_at="",
-                last_error=None,
-                revision=state.session.revision + 1,
-                needs_rebind=False,
-            )
-            self.store.write(state)
+            def update(state):
+                ensure_state_secret(state)
+                if not state.runtime.daemon_port:
+                    state.runtime.daemon_port = self.default_port
+                state.session = SessionState(
+                    uin=resolved_uin,
+                    cookies=cookies,
+                    qzonetokens={},
+                    source=source,
+                    updated_at=now_iso(),
+                    last_ok_at="",
+                    last_error=None,
+                    revision=state.session.revision + 1,
+                    needs_rebind=False,
+                )
+
+            self.store.update(update)
             return await self.get_status()
 
     async def unbind(self) -> dict[str, Any]:
@@ -599,21 +595,23 @@ class QzoneDaemonController:
         try:
             return await self.unbind()
         except DaemonUnavailableError:
-            state = self.store.read()
-            runtime = self._runtime()
-            state.runtime = runtime
-            state.session = SessionState(
-                uin=0,
-                cookies={},
-                qzonetokens={},
-                source="manual",
-                updated_at=now_iso(),
-                last_ok_at="",
-                last_error=None,
-                revision=state.session.revision + 1,
-                needs_rebind=True,
-            )
-            self.store.write(state)
+            def update(state):
+                ensure_state_secret(state)
+                if not state.runtime.daemon_port:
+                    state.runtime.daemon_port = self.default_port
+                state.session = SessionState(
+                    uin=0,
+                    cookies={},
+                    qzonetokens={},
+                    source="manual",
+                    updated_at=now_iso(),
+                    last_ok_at="",
+                    last_error=None,
+                    revision=state.session.revision + 1,
+                    needs_rebind=True,
+                )
+
+            self.store.update(update)
             return await self.get_status()
 
     async def list_feeds(self, *, hostuin: int = 0, limit: int = 5, cursor: str = "", scope: str = "") -> dict[str, Any]:
@@ -645,9 +643,7 @@ class QzoneDaemonController:
         media: list[dict[str, Any]] | None = None,
         content_sanitized: bool = False,
     ) -> dict[str, Any]:
-        content = str(content or "")
-        if not content_sanitized:
-            content = strip_command_prefix(content, ("qzone post",)).strip()
+        content = sanitize_publish_content(content, content_sanitized=content_sanitized)
         return await self._request(
             "POST",
             "/post",
@@ -818,11 +814,13 @@ class QzoneDaemonController:
 
     def _clear_runtime_process_state(self) -> None:
         self._invalidate_health_cache()
-        state = self.store.read()
-        state.runtime.daemon_pid = 0
-        state.runtime.started_at = ""
-        state.runtime.last_seen_at = ""
-        self.store.write(state)
+
+        def update(state):
+            state.runtime.daemon_pid = 0
+            state.runtime.started_at = ""
+            state.runtime.last_seen_at = ""
+
+        self.store.update(update)
 
     async def stop_daemon(self) -> None:
         state = self.store.read()

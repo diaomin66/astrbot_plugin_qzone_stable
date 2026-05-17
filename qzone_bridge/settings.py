@@ -92,7 +92,6 @@ class PluginSettings:
     cookie_domain: str = "user.qzone.qq.com"
     admin_uins: list[int] = field(default_factory=list)
     user_agent: str = DEFAULT_USER_AGENT
-    preview_writes: bool = True
     render_publish_result: bool = True
     render_result_width: int = 900
     render_remote_timeout: float = 0.35
@@ -142,7 +141,6 @@ class PluginSettings:
             or "user.qzone.qq.com",
             admin_uins=[int(v) for v in admin_uins if str(v).isdigit()],
             user_agent=str(_pick(mapping, "user_agent", DEFAULT_USER_AGENT) or DEFAULT_USER_AGENT),
-            preview_writes=_as_bool(_pick(mapping, "preview_writes", True), True),
             render_publish_result=_as_bool(_pick(mapping, "render_publish_result", True), True),
             render_result_width=int(_pick(mapping, "render_result_width", 900) or 900),
             render_remote_timeout=float(_pick(mapping, "render_remote_timeout", 0.35) or 0.35),
