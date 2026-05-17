@@ -27,7 +27,7 @@ pip install -r requirements.txt
 3. 重启 AstrBot，或在 AstrBot 管理面板重新加载插件。
 4. 在 QQ 私聊或群聊里发送 `/qzone status` 检查 daemon 和 Cookie 状态。
 
-插件会在首次使用时按需启动本地 daemon。daemon 只监听 `127.0.0.1`，用于隔离 QQ 空间请求、Cookie 管理和渲染逻辑。
+插件会在首次使用时按需启动本地 daemon。daemon 默认使用 `18999` 端口并只监听 `127.0.0.1`，用于隔离 QQ 空间请求、Cookie 管理和渲染逻辑。除非端口被占用，不建议修改默认端口；如果系统防火墙或安全软件拦截本地连接，请放行本插件的 `18999` 端口。
 
 ## Cookie 绑定
 
@@ -111,7 +111,7 @@ pip install -r requirements.txt
 | --- | --- | --- |
 | `admin_uins` | 空 | 管理员 QQ 号，多个用英文逗号分隔 |
 | `cookies_str` | 空 | 可选 Cookie 字符串，用于初始化自动绑定 |
-| `daemon_port` | `18999` | 本地 daemon 端口 |
+| `daemon_port` | `18999` | 本地 daemon 端口；不建议修改，需在防火墙或安全软件中放行 |
 | `auto_start_daemon` | `true` | 首次使用时自动启动 daemon |
 | `auto_bind_cookie` | `true` | 登录态缺失时尝试从 OneBot 自动获取 Cookie |
 | `manage_group` | 空 | 投稿审核通知群；为空时尝试私发管理员 |
@@ -141,7 +141,7 @@ pip install -r requirements.txt
 ## 排障
 
 - `/qzone status` 显示未绑定：先执行 `/qzone autobind`，失败后使用 `/qzone bind <cookie>`。
-- daemon 无法启动：确认 `daemon_port` 没有被占用，并检查 AstrBot 日志。
+- daemon 无法启动：确认默认 `18999` 端口没有被占用，防火墙或安全软件已放行本地连接，并检查 AstrBot 日志。
 - 自动绑定失败：确认 AstrBot 使用的是 OneBot v11 / aiocqhttp，且适配器允许获取 Cookie。
 - 图片发布失败：确认图片可被 AstrBot 正常读取，远程图片地址可访问。
 - LLM 生成内容为空：检查 AstrBot 当前会话 provider，或分别配置 `llm.post_provider_id`、`llm.comment_provider_id`、`llm.reply_provider_id`。
