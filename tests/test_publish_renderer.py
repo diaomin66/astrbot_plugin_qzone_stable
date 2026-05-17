@@ -5,13 +5,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from PIL import Image, ImageChops, ImageDraw
+from PIL import Image, ImageChops
 
 from qzone_bridge.media import PostMedia, PostPayload
 from qzone_bridge.publish_renderer import (
-    ACTION,
+    ACTION_STRIP_ASSET,
     RenderProfile,
-    _draw_share_icon,
+    _action_strip,
+    _smooth_circle_image,
     cached_avatar_source,
     preload_publish_render_assets,
     render_publish_result_image,
@@ -142,19 +143,31 @@ class PublishRendererTests(unittest.TestCase):
             with Image.open(without_result) as base, Image.open(with_result) as rendered:
                 self.assertEqual(rendered.size, base.size)
 
-    def test_share_icon_stays_within_action_bounds(self):
-        image = Image.new("RGB", (70, 60), "white")
-        draw = ImageDraw.Draw(image)
+    def test_action_strip_loads_static_png_asset(self):
+        self.assertTrue(ACTION_STRIP_ASSET.exists())
 
-        _draw_share_icon(draw, 10, 10)
+        strip = _action_strip()
+        cached = _action_strip()
 
-        mask = ImageChops.difference(image, Image.new("RGB", image.size, "white"))
-        bbox = mask.getbbox()
-        self.assertIsNotNone(bbox)
-        self.assertGreater(bbox[2] - bbox[0], 28)
-        self.assertLessEqual(bbox[2], 64)
-        self.assertLessEqual(bbox[3], 52)
-        self.assertIn(ACTION, image.getdata())
+        self.assertIs(strip, cached)
+        self.assertEqual(strip.mode, "RGBA")
+        self.assertEqual(strip.width, 300)
+        self.assertGreater(strip.height, 40)
+        diff = ImageChops.difference(strip.convert("RGB"), Image.new("RGB", strip.size, "white"))
+        self.assertIsNotNone(diff.getbbox())
+
+    def test_avatar_circle_mask_has_smooth_antialiased_edge(self):
+        source = Image.new("RGB", (512, 512), (120, 180, 210))
+
+        avatar = _smooth_circle_image(source, 76)
+        alpha = avatar.getchannel("A")
+        values = list(alpha.getdata())
+
+        self.assertEqual(avatar.mode, "RGBA")
+        self.assertEqual(avatar.size, (76, 76))
+        self.assertEqual(alpha.getpixel((0, 0)), 0)
+        self.assertEqual(alpha.getpixel((38, 38)), 255)
+        self.assertTrue(any(0 < value < 255 for value in values))
 
     def test_render_loads_multiple_previews_concurrently(self):
         with tempfile.TemporaryDirectory() as temp:
