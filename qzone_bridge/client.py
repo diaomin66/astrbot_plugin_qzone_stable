@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -16,6 +15,7 @@ from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlun
 import httpx
 
 from .errors import QzoneNeedsRebind, QzoneParseError, QzoneRequestError
+from .astrbot_logging import logger as log
 from .media import QZONE_MAX_IMAGES, is_supported_image, normalize_media_item, source_name
 from .models import FeedEntry, SessionState
 from .parser import (
@@ -31,8 +31,6 @@ from .parser import (
 )
 from .render import cookie_summary
 from .utils import extract_callback_json, json_loads, now_iso
-
-log = logging.getLogger(__name__)
 
 AUTH_ERROR_CODES = {-3000}
 AUTH_ERROR_KEYWORDS = (

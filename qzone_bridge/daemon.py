@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
 import os
 from dataclasses import asdict
 from pathlib import Path
@@ -13,6 +12,7 @@ from datetime import datetime, timezone
 
 from aiohttp import web
 
+from .astrbot_logging import configure_standalone_logging, logger as log
 from .client import QzoneClient
 from .errors import QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
 from .media import (
@@ -37,8 +37,6 @@ from .selection import NUMERIC_FID_MIN_LENGTH
 from .social import extract_comments
 from .storage import StateStore, ensure_state_secret
 from .utils import now_iso, from_iso
-
-log = logging.getLogger(__name__)
 LIKE_VERIFY_RETRY_DELAYS_SECONDS = (0.35, 0.85, 1.6)
 TRUE_TEXT_VALUES = {"1", "true", "yes", "y", "on"}
 FALSE_TEXT_VALUES = {"0", "false", "no", "n", "off", ""}
@@ -1119,7 +1117,7 @@ def main() -> None:
     parser.add_argument("--version", default="0.1.0")
     args = parser.parse_args()
 
-    logging.basicConfig(level=os.getenv("QZONE_DAEMON_LOG_LEVEL", "INFO"))
+    configure_standalone_logging()
     asyncio.run(
         run_daemon(
             data_dir=Path(args.data_dir),

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
 import os
 import signal
 import socket
@@ -16,6 +15,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 
+from .astrbot_logging import logger as log
 from .errors import DaemonUnavailableError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
 from .media import sanitize_publish_content
 from .models import SessionState
@@ -24,8 +24,6 @@ from .protocol import SECRET_HEADER
 from .storage import StateStore, ensure_state_secret
 from .utils import now_iso
 
-
-log = logging.getLogger(__name__)
 SENSITIVE_DETAIL_KEYS = {"cookie", "cookies", "p_skey", "skey", "pt4_token", "pt_key", "qzonetoken", "secret", "token"}
 SENSITIVE_URL_QUERY_KEYS = {"g_tk", "gtk", "p_skey", "skey", "pt4_token", "pt_key", "qzonetoken", "token", "secret"}
 
@@ -38,6 +36,10 @@ def _port_is_free(port: int) -> bool:
         except OSError:
             return False
     return True
+
+
+async def _port_is_free_async(port: int) -> bool:
+    return await asyncio.to_thread(_port_is_free, port)
 
 
 def _run_quiet(args: list[str], *, timeout: float = 5.0) -> subprocess.CompletedProcess:
@@ -401,12 +403,12 @@ class QzoneDaemonController:
             if await self._probe_health(port):
                 return self._status_from_state(self.store.read(), daemon_state="ready")
 
-            if not _port_is_free(port):
+            if not await _port_is_free_async(port):
                 candidate = port
                 found_port = 0
                 for _ in range(32):
                     candidate += 1
-                    if _port_is_free(candidate):
+                    if await _port_is_free_async(candidate):
                         found_port = candidate
                         break
                 if not found_port:
@@ -770,10 +772,10 @@ class QzoneDaemonController:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while loop.time() < deadline:
-            if _port_is_free(port):
+            if await _port_is_free_async(port):
                 return True
             await asyncio.sleep(0.2)
-        return _port_is_free(port)
+        return await _port_is_free_async(port)
 
     async def _terminate_tracked_process(self) -> None:
         process = self._process

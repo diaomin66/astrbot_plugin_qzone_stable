@@ -8,6 +8,7 @@ import importlib
 import json
 import random
 import re
+import shutil
 import sys
 import time
 from datetime import datetime
@@ -17,9 +18,10 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star
+from astrbot.api.star import Context, Star, StarTools
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
+PLUGIN_DATA_NAME = "astrbot_plugin_qzone_ultra"
 
 SENSITIVE_LOG_KEYS = {
     "cookie",
@@ -219,6 +221,41 @@ def _prepare_local_qzone_bridge_imports() -> None:
             sys.modules.pop(name, None)
 
 
+def _migrate_legacy_data_dir(legacy_dir: Path, data_dir: Path) -> None:
+    try:
+        legacy = legacy_dir.resolve()
+        target = data_dir.resolve()
+    except Exception:
+        legacy = legacy_dir
+        target = data_dir
+    if legacy == target or not legacy_dir.exists() or not legacy_dir.is_dir():
+        return
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.warning("qzone standard data dir is not writable: %s", exc)
+        return
+    for item in legacy_dir.iterdir():
+        if item.name in {"__pycache__", ".pytest_cache"}:
+            continue
+        target_item = data_dir / item.name
+        if target_item.exists():
+            continue
+        try:
+            if item.is_dir():
+                shutil.copytree(item, target_item)
+            elif item.is_file():
+                shutil.copy2(item, target_item)
+        except Exception as exc:
+            logger.warning("qzone legacy data migration skipped %s: %s", item.name, exc)
+
+
+def _standard_data_dir(plugin_root: Path) -> Path:
+    data_dir = Path(StarTools.get_data_dir(PLUGIN_DATA_NAME))
+    _migrate_legacy_data_dir(plugin_root / "data" / "qzone", data_dir)
+    return data_dir
+
+
 _prepare_local_qzone_bridge_imports()
 
 from qzone_bridge.controller import QzoneDaemonController
@@ -276,7 +313,7 @@ class QzoneStablePlugin(Star):
         raw_config = config if config is not None else getattr(context, "get_config", lambda: {})()
         self.settings = PluginSettings.from_mapping(raw_config)
         self.root = Path(__file__).resolve().parent
-        self.data_dir = self.root / "data" / "qzone"
+        self.data_dir = _standard_data_dir(self.root)
         self._onebot_client: Any | None = None
         self._cookie_lock: asyncio.Lock | None = None
         self.controller = QzoneDaemonController(
