@@ -102,7 +102,10 @@ def normalize_source(value: Any) -> str:
         parsed = urlparse(source)
         if parsed.netloc and parsed.path:
             return unquote(f"//{parsed.netloc}{parsed.path}")
-        return unquote(parsed.path)
+        path = unquote(parsed.path)
+        if re.match(r"^/[A-Za-z]:[\\/]", path):
+            return path[1:]
+        return path
     return source
 
 
@@ -110,8 +113,7 @@ def source_name(source: str) -> str:
     if not source:
         return ""
     if _is_url(source) or source.startswith("file://"):
-        parsed = urlparse(source)
-        name = Path(unquote(parsed.path)).name
+        name = Path(normalize_source(source)).name
     elif _is_base64_source(source):
         name = ""
     else:
@@ -579,6 +581,18 @@ def strip_command_prefix_from_parts(text: str, parts: Iterable[str], prefixes: I
         if stripped_spaced != spaced:
             return stripped_spaced
     return stripped
+
+
+def sanitize_publish_content(
+    content: Any,
+    *,
+    content_sanitized: bool = False,
+    command_prefixes: Iterable[str] = ("qzone post",),
+) -> str:
+    value = str(content or "")
+    if not content_sanitized:
+        value = strip_command_prefix(value, command_prefixes).strip()
+    return value
 
 
 def collect_post_payload(

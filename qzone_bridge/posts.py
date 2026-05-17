@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .json_store import AtomicItemStoreFile
 from .social import QzoneComment, QzonePost
 
 
@@ -94,23 +94,13 @@ class SavedPost:
 class PostStore:
     def __init__(self, path: Path):
         self.path = path
+        self._store = AtomicItemStoreFile(path)
 
     def _read_payload(self) -> dict[str, Any]:
-        if not self.path.exists():
-            return {"next_id": 1, "items": []}
-        try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
-            return {"next_id": 1, "items": []}
-        if not isinstance(payload, dict):
-            return {"next_id": 1, "items": []}
-        payload.setdefault("next_id", 1)
-        payload.setdefault("items", [])
-        return payload
+        return self._store.read()
 
     def _write_payload(self, payload: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self._store.write(payload)
 
     def list(self) -> list[SavedPost]:
         payload = self._read_payload()
@@ -120,40 +110,47 @@ class PostStore:
         )
 
     def get(self, post_id: int | None = None) -> SavedPost | None:
-        items = self.list()
-        if not items:
+        try:
+            target_id = int(post_id or 0)
+        except (TypeError, ValueError):
             return None
-        if not post_id or post_id < 0:
-            return items[-1]
+        if target_id <= 0:
+            return None
+        items = self.list()
         for item in items:
-            if item.id == post_id:
+            if item.id == target_id:
                 return item
         return None
 
+    def latest(self) -> SavedPost | None:
+        items = self.list()
+        return items[-1] if items else None
+
     def upsert(self, post: QzonePost) -> SavedPost:
-        payload = self._read_payload()
-        items = [item for item in payload.get("items") or [] if isinstance(item, dict)]
-        next_id = int(payload.get("next_id") or 1)
-        matched_id = 0
-        updated_items: list[dict[str, Any]] = []
-        for item in items:
-            if (
-                str(item.get("fid") or "") == str(post.fid or "")
-                and int(item.get("hostuin") or 0) == int(post.hostuin or 0)
-                and str(post.fid or "")
-            ):
-                matched_id = int(item.get("id") or 0) or next_id
+        def update(payload: dict[str, Any]) -> SavedPost:
+            items = [item for item in payload.get("items") or [] if isinstance(item, dict)]
+            next_id = int(payload.get("next_id") or 1)
+            matched_id = 0
+            updated_items: list[dict[str, Any]] = []
+            for item in items:
+                if (
+                    str(item.get("fid") or "") == str(post.fid or "")
+                    and int(item.get("hostuin") or 0) == int(post.hostuin or 0)
+                    and str(post.fid or "")
+                ):
+                    matched_id = int(item.get("id") or 0) or next_id
+                    updated_items.append(SavedPost.from_post(post, matched_id).to_dict())
+                else:
+                    updated_items.append(item)
+
+            if not matched_id:
+                matched_id = next_id
                 updated_items.append(SavedPost.from_post(post, matched_id).to_dict())
-            else:
-                updated_items.append(item)
+                next_id += 1
 
-        if not matched_id:
-            matched_id = next_id
-            updated_items.append(SavedPost.from_post(post, matched_id).to_dict())
-            next_id += 1
+            payload["items"] = updated_items
+            payload["next_id"] = max(next_id, matched_id + 1)
+            post.saved_id = matched_id
+            return SavedPost.from_post(post, matched_id)
 
-        payload["items"] = updated_items
-        payload["next_id"] = max(next_id, matched_id + 1)
-        self._write_payload(payload)
-        post.saved_id = matched_id
-        return SavedPost.from_post(post, matched_id)
+        return self._store.transact(update)

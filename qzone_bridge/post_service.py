@@ -117,6 +117,8 @@ class QzonePostService:
         login_uin: int = 0,
     ) -> list[QzonePost]:
         if selection.is_fid:
+            if not selection.target_uin and login_uin:
+                selection.target_uin = login_uin
             post = await self._post_from_fid(selection, with_detail=with_detail or no_commented)
             if no_self and login_uin and post.hostuin == login_uin:
                 return []
