@@ -920,6 +920,65 @@ class MainPublishTests(unittest.TestCase):
         for name in ("hostuin", "fid", "confirm", "appid", "latest", "index"):
             self.assertRegex(doc, rf"(?m)^\s*{name}\s+\([^)]+\):")
 
+    def test_llm_delete_tool_deletes_semantic_selector_with_natural_reply(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        plugin._context = types.SimpleNamespace(
+            get_current_chat_provider_id=AsyncMock(return_value="provider-1"),
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="删好了，第二条已经拿掉了。")),
+        )
+        entries = [
+            module.FeedEntry(hostuin=123456, fid="fid-1", appid=311, summary="one"),
+            module.FeedEntry(hostuin=123456, fid="fid-2", appid=311, summary="two"),
+        ]
+        plugin.controller.get_status = AsyncMock(return_value={"login_uin": 123456})
+        plugin.controller.list_feeds = AsyncMock(return_value={"items": [asdict(item) for item in entries]})
+        plugin.controller.delete_post = AsyncMock(return_value={"fid": "fid-2", "message": "ok"})
+        event = Event([])
+
+        results = asyncio.run(
+            collect_async_generator(plugin.tool_delete_post(event, selector="2"))
+        )
+
+        plugin.controller.list_feeds.assert_awaited_once_with(hostuin=123456, limit=2, scope="profile")
+        plugin.controller.delete_post.assert_awaited_once_with(fid="fid-2", appid=311)
+        self.assertEqual(results[0], "删好了，第二条已经拿掉了。")
+        prompt = plugin._context.llm_generate.await_args.kwargs["prompt"]
+        self.assertIn("two", prompt)
+        self.assertNotIn("fid-2", prompt)
+        self.assertNotIn("qzone_delete_post", results[0])
+        self.assertFalse(str(results[0]).lstrip().startswith("{"))
+
+    def test_llm_delete_tool_rejects_other_target_uin(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        plugin._context = types.SimpleNamespace(
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="这个我现在不能直接动。")),
+        )
+        plugin.controller.get_status = AsyncMock(return_value={"login_uin": 123456})
+        plugin.controller.list_feeds = AsyncMock(return_value={"items": []})
+        plugin.controller.delete_post = AsyncMock(return_value={"message": "ok"})
+        event = Event([])
+
+        results = asyncio.run(
+            collect_async_generator(plugin.tool_delete_post(event, target_uin=998877, selector="1"))
+        )
+
+        plugin.controller.delete_post.assert_not_awaited()
+        self.assertEqual(results[0], "这个我现在不能直接动。")
+        prompt = plugin._context.llm_generate.await_args.kwargs["prompt"]
+        self.assertIn("只能删除当前登录账号自己的说说", prompt)
+        self.assertNotIn("998877", results[0])
+
+    def test_qzone_help_lists_delete_llm_tool(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        event = Event([])
+
+        results = asyncio.run(collect_async_generator(plugin.qzone_help(event)))
+
+        self.assertIn("qzone_delete_post", results[0])
+
     def test_comment_feed_uses_explicit_comment_text_without_llm(self):
         module = self.load_main_module()
         plugin = self.make_plugin(module)

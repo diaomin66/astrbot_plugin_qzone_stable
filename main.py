@@ -44,6 +44,7 @@ LLM_REPLY_FORBIDDEN_TERMS = (
     "qzone_comment_post",
     "qzone_publish_post",
     "qzone_view_post",
+    "qzone_delete_post",
     "JSON",
     "json",
     "Markdown",
@@ -750,6 +751,13 @@ class QzoneStablePlugin(Star):
                     return f"{target}这次已经{pending}，QQ 空间显示可能会慢一点。"
                 done = "取消掉了" if unlike else "点好了"
                 return f"{target}这次已经{done}。"
+            if payload.get("tool") == "qzone_delete_post" and isinstance(result, dict):
+                count = int(result.get("count") or 0)
+                summary = truncate(str(result.get("summary") or "").strip(), 60)
+                if count > 1:
+                    return f"{count} 条说说已经删好了。"
+                target = f"「{summary}」" if summary else "这条说说"
+                return f"{target}已经删好了。"
             visible = _safe_for_llm(result)
             if isinstance(visible, dict):
                 message = visible.get("message") or visible.get("summary") or visible.get("text")
@@ -1856,7 +1864,7 @@ class QzoneStablePlugin(Star):
                 return
             lines: list[str] = []
             for post in posts:
-                payload = await self.controller.delete_post(fid=post.fid, appid=post.appid)
+                payload = await self._post_service().delete_post(post)
                 lines.append(format_action_result("删除结果", payload))
         except QzoneBridgeError as exc:
             yield self._command_result(event, self._error_text(exc))
@@ -2073,6 +2081,7 @@ class QzoneStablePlugin(Star):
                 "qzone_publish_post",
                 "qzone_comment_post",
                 "qzone_like_post",
+                "qzone_delete_post",
             ]
         )
         yield self._command_result(event, text)
@@ -2691,6 +2700,113 @@ class QzoneStablePlugin(Star):
             event,
             {"ok": True, "tool": "qzone_comment_post", "result": {"message": "评论发好了。", "count": len(results)}},
             "评论发好了。",
+        )
+        yield event.plain_result(text)
+
+    @filter.llm_tool(name="qzone_delete_post")
+    async def tool_delete_post(
+        self,
+        event: AstrMessageEvent,
+        target_uin: int = 0,
+        selector: str = "latest",
+        hostuin: int = 0,
+        fid: str = "",
+        confirm: bool = False,
+        appid: int = 311,
+        latest: bool = False,
+        index: int = 0,
+    ):
+        """删除当前登录 QQ 空间的一条或多条说说。
+
+        Args:
+            target_uin (number): 兼容参数；删除只允许当前登录账号自己的说说。
+            selector (string): latest、最新、第2条、1~3 或 fid。
+            hostuin (number): 兼容旧参数；删除只允许当前登录账号自己的说说。
+            fid (string): 兼容旧参数，说说 fid。
+            confirm (boolean): 兼容旧参数，目前不会拦截执行。
+            appid (number): 说说 appid，默认 311。
+            latest (boolean): 为 true 时删除最新一条说说。
+            index (number): 删除最近列表第 N 条，1 表示第一条。
+        """
+        arguments = {
+            "target_uin": target_uin,
+            "selector": selector,
+            "hostuin": hostuin,
+            "fid": fid,
+            "confirm": confirm,
+            "appid": appid,
+            "latest": latest,
+            "index": index,
+        }
+        if not self._is_admin(event):
+            payload = {"ok": False, "tool": "qzone_delete_post", "public_reason": "没有权限"}
+            self._log_tool_call_result({**payload, "arguments": arguments})
+            text = await self._ask_llm_tool_reply(
+                event,
+                payload,
+                self._llm_error_fallback_text("没有权限"),
+            )
+            yield event.plain_result(text)
+            return
+        try:
+            await self._ensure_cookie_ready(event)
+            await self._ensure_daemon()
+            status = await self.controller.get_status(probe_daemon=False)
+            login_uin = int(status.get("login_uin") or self._self_id(event) or 0)
+            requested_target = int(target_uin or hostuin or 0)
+            if requested_target and login_uin and requested_target != login_uin:
+                raise QzoneBridgeError("只能删除当前登录账号自己的说说")
+
+            selection = selection_from_tool_args(
+                target_uin=login_uin or requested_target,
+                selector=selector,
+                hostuin=0,
+                fid=fid,
+                appid=appid,
+                latest=latest,
+                index=index,
+            )
+            results: list[dict[str, Any]] = []
+            if selection.is_fid and not selection.target_uin:
+                result = await self.controller.delete_post(fid=selection.fid, appid=selection.appid)
+                results.append({"post": {"summary": ""}, "result": result})
+            else:
+                posts = await self._posts_for_selection(selection, login_uin=login_uin)
+                if not posts:
+                    raise QzoneBridgeError("没有找到可删除的说说")
+                for post in posts:
+                    result = await self._post_service().delete_post(post)
+                    results.append({"post": QzonePostService.post_payload(post), "result": result})
+        except QzoneBridgeError as exc:
+            log_payload = self._bridge_error_log_payload("qzone_delete_post", exc, arguments)
+            self._log_tool_call_result(log_payload)
+            text = await self._ask_llm_tool_reply(
+                event,
+                self._llm_error_payload("qzone_delete_post", exc),
+                self._llm_error_fallback_text(exc.message),
+            )
+            yield event.plain_result(text)
+            return
+
+        count = len(results)
+        first_post = results[0].get("post") if results else {}
+        summary = truncate(str(first_post.get("summary") or "").strip(), 80) if isinstance(first_post, dict) else ""
+        message = f"{count} 条说说删好了。" if count != 1 else "说说删好了。"
+        llm_payload = {"ok": True, "tool": "qzone_delete_post", "result": {"message": message, "count": count}}
+        if summary:
+            llm_payload["result"]["summary"] = summary
+        self._log_tool_call_result(
+            {
+                "ok": True,
+                "tool": "qzone_delete_post",
+                "arguments": arguments,
+                "result": results,
+            }
+        )
+        text = await self._ask_llm_tool_reply(
+            event,
+            llm_payload,
+            f"「{summary}」删好了。" if summary else "删好了。",
         )
         yield event.plain_result(text)
 
