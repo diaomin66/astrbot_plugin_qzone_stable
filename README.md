@@ -60,6 +60,8 @@
 
 `qzone_view_post`、`qzone_comment_post`、`qzone_like_post` 优先使用 `target_uin` + `selector`，其中 `selector` 可写 `latest`、`最新`、`第2条`、`2`、`1~3` 或真实 `fid`。旧的 `hostuin/fid/appid/latest/index` 仍保留兼容。
 
+LLM 生成说说、评论和工具结果回复时，会强制走当前 AstrBot 会话 provider/人设；如果模型误输出 `qzone_publish_post(...)`、JSON、参数或“发布预览/发布结果”这类工具化文本，插件会先抽取真正正文并过滤内部字段。旧版 `llm_view_feed` / `llm_publish_feed` 仍可用，但已经收口为兼容壳：用户原话是评论/点赞时会直接接上动作，最终回复交给 LLM 用自然中文组织。
+
 `qzone_like_post` 会继续区分“请求已被 QQ 空间接受”和“读回校验暂未同步”，不会因为 QQ 空间显示滞后把成功操作误报成失败；用户可见回复会交给 LLM 组织成自然语言，避免泄露 raw JSON、fid、cursor、status_code 等内部字段。
 
 ## 配置

@@ -427,6 +427,39 @@ class MainPublishTests(unittest.TestCase):
         self.assertNotIn("has_more", results[0])
         self.assertNotIn("fid=", results[0])
 
+    def test_llm_view_post_uses_persona_reply_and_keeps_visible_numbering(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        plugin._context = types.SimpleNamespace(
+            get_current_chat_provider_id=AsyncMock(return_value="provider-1"),
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="第 2 条是：two，Alice 也回了 nice。")),
+        )
+        entries = [
+            module.FeedEntry(hostuin=123456, fid="fid-1", appid=311, summary="one"),
+            module.FeedEntry(hostuin=123456, fid="fid-2", appid=311, summary="two"),
+        ]
+        plugin.controller.list_feeds = AsyncMock(return_value={"items": [asdict(item) for item in entries]})
+        plugin.controller.detail_feed = AsyncMock(
+            return_value={
+                "entry": asdict(entries[1]),
+                "comments": [{"commentid": "c1", "uin": 9988, "nickname": "Alice", "content": "nice"}],
+                "raw": {},
+            }
+        )
+        event = Event([])
+
+        results = asyncio.run(
+            collect_async_generator(plugin.tool_view_post(event, target_uin=123456, selector="2", detail=True))
+        )
+
+        self.assertEqual(results[0], "第 2 条是：two，Alice 也回了 nice。")
+        prompt = plugin._context.llm_generate.await_args.kwargs["prompt"]
+        self.assertIn("第 2 条", prompt)
+        self.assertIn("two", prompt)
+        self.assertIn("Alice: nice", prompt)
+        self.assertNotIn("fid-2", prompt)
+        self.assertNotIn("fid-2", results[0])
+
     def test_llm_like_tool_asks_llm_for_natural_result_reply(self):
         module = self.load_main_module()
         plugin = self.make_plugin(module)
@@ -1058,6 +1091,178 @@ class MainPublishTests(unittest.TestCase):
         self.assertIn("聊天记录参考", prompt)
         self.assertIn("Alice: 今天真热", prompt)
         self.assertNotIn("跳过我", prompt)
+
+    def test_write_feed_saves_clean_draft_when_model_returns_tool_call(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        plugin.drafts = module.DraftStore(plugin.data_dir / "drafts.json")
+        plugin._context = types.SimpleNamespace(
+            get_current_chat_provider_id=AsyncMock(return_value="provider-1"),
+            llm_generate=AsyncMock(
+                return_value=types.SimpleNamespace(
+                    completion_text='qzone_publish_post(content="把晚风装进口袋", confirm=true)'
+                )
+            ),
+        )
+        event = Event([Plain("写说说 晚风")], message_str="写说说 晚风")
+
+        asyncio.run(collect_async_generator(plugin.write_feed(event)))
+
+        drafts = plugin.drafts.list(status="pending")
+        self.assertEqual(len(drafts), 1)
+        self.assertEqual(drafts[0].content, "把晚风装进口袋")
+        prompt = plugin._context.llm_generate.await_args.kwargs["prompt"]
+        self.assertIn("只输出最终可发布的说说正文", prompt)
+        self.assertNotIn("qzone_publish_post", drafts[0].content)
+
+    def test_legacy_llm_publish_feed_uses_persona_reply_without_action_dump(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        plugin._context = types.SimpleNamespace(
+            get_current_chat_provider_id=AsyncMock(return_value="provider-1"),
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="发好啦，刚刚那句挺顺的。")),
+        )
+        event = Event([])
+
+        result = asyncio.run(plugin.llm_publish_feed(event, text="hello", get_image=False))
+
+        plugin.controller.publish_post.assert_awaited_once()
+        self.assertEqual(result, "发好啦，刚刚那句挺顺的。")
+        self.assertNotIn("发布结果", result)
+        self.assertNotIn("fid", result)
+        self.assertFalse(result.lstrip().startswith("{"))
+
+    def test_semantic_publish_tool_uses_persona_reply_without_render_dump(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        plugin._context = types.SimpleNamespace(
+            get_current_chat_provider_id=AsyncMock(return_value="provider-1"),
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="发好了，这条很像你。")),
+        )
+        event = Event([])
+
+        results = asyncio.run(
+            collect_async_generator(plugin.tool_publish_post(event, content="hello", confirm=True))
+        )
+
+        plugin.controller.publish_post.assert_awaited_once()
+        self.assertEqual(results[0], "发好了，这条很像你。")
+        self.assertNotIn("发布结果", results[0])
+        self.assertNotIn("fid", results[0])
+        self.assertFalse(str(results[0]).lstrip().startswith("{"))
+
+    def test_legacy_llm_view_feed_comments_when_user_intent_is_comment(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        plugin._context = types.SimpleNamespace(
+            get_current_chat_provider_id=AsyncMock(return_value="provider-1"),
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="评论好了，这句接得挺自然。")),
+        )
+        entries = [
+            module.FeedEntry(hostuin=123456, fid="fid-1", appid=311, summary="one"),
+            module.FeedEntry(hostuin=123456, fid="fid-2", appid=311, summary="two"),
+        ]
+        plugin.controller.list_feeds = AsyncMock(return_value={"items": [asdict(item) for item in entries]})
+        plugin.controller.detail_feed = AsyncMock(return_value={"entry": asdict(entries[1]), "comments": [], "raw": {}})
+        plugin.controller.comment_post = AsyncMock(return_value={"commentid": "c2", "message": "ok"})
+        plugin._generate_comment_text = AsyncMock(return_value="真不错")
+        event = Event([], message_str="帮我评论 123456 的第二条说说")
+
+        result = asyncio.run(plugin.llm_view_feed(event, user_id="123456", pos=1, reply=False))
+
+        plugin.controller.comment_post.assert_awaited_once_with(
+            hostuin=123456,
+            fid="fid-2",
+            content="真不错",
+            appid=311,
+            private=False,
+            busi_param={},
+        )
+        self.assertEqual(result, "评论好了，这句接得挺自然。")
+        self.assertNotIn("fid-2", result)
+        self.assertNotIn("qzone_comment_post", result)
+
+    def test_semantic_view_tool_comments_when_user_intent_is_comment(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        plugin._context = types.SimpleNamespace(
+            get_current_chat_provider_id=AsyncMock(return_value="provider-1"),
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="评论接上了。")),
+        )
+        entries = [
+            module.FeedEntry(hostuin=123456, fid="fid-1", appid=311, summary="one"),
+            module.FeedEntry(hostuin=123456, fid="fid-2", appid=311, summary="two"),
+        ]
+        plugin.controller.list_feeds = AsyncMock(return_value={"items": [asdict(item) for item in entries]})
+        plugin.controller.detail_feed = AsyncMock(return_value={"entry": asdict(entries[1]), "comments": [], "raw": {}})
+        plugin.controller.comment_post = AsyncMock(return_value={"commentid": "c2", "message": "ok"})
+        plugin._generate_comment_text = AsyncMock(return_value="真不错")
+        event = Event([], message_str="帮我评论第二条说说")
+
+        results = asyncio.run(
+            collect_async_generator(plugin.tool_view_post(event, target_uin=123456, selector="2", detail=True))
+        )
+
+        plugin.controller.comment_post.assert_awaited_once_with(
+            hostuin=123456,
+            fid="fid-2",
+            content="真不错",
+            appid=311,
+            private=False,
+            busi_param={},
+        )
+        self.assertEqual(results[0], "评论接上了。")
+        self.assertNotIn("fid-2", results[0])
+        self.assertNotIn("qzone_comment_post", results[0])
+
+    def test_semantic_view_tool_does_not_comment_when_user_only_wants_comments_shown(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        plugin._context = types.SimpleNamespace(
+            get_current_chat_provider_id=AsyncMock(return_value="provider-1"),
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="第 2 条下面 Alice 说 nice。")),
+        )
+        entries = [
+            module.FeedEntry(hostuin=123456, fid="fid-1", appid=311, summary="one"),
+            module.FeedEntry(hostuin=123456, fid="fid-2", appid=311, summary="two"),
+        ]
+        plugin.controller.list_feeds = AsyncMock(return_value={"items": [asdict(item) for item in entries]})
+        plugin.controller.detail_feed = AsyncMock(
+            return_value={
+                "entry": asdict(entries[1]),
+                "comments": [{"commentid": "c1", "uin": 9988, "nickname": "Alice", "content": "nice"}],
+                "raw": {},
+            }
+        )
+        plugin.controller.comment_post = AsyncMock(return_value={"commentid": "c2", "message": "ok"})
+        event = Event([], message_str="帮我看看第二条说说的评论区")
+
+        results = asyncio.run(
+            collect_async_generator(plugin.tool_view_post(event, target_uin=123456, selector="2", detail=True))
+        )
+
+        plugin.controller.comment_post.assert_not_awaited()
+        self.assertEqual(results[0], "第 2 条下面 Alice 说 nice。")
+
+    def test_semantic_view_tool_does_not_like_when_user_only_wants_like_count(self):
+        module = self.load_main_module()
+        plugin = self.make_plugin(module)
+        plugin._context = types.SimpleNamespace(
+            get_current_chat_provider_id=AsyncMock(return_value="provider-1"),
+            llm_generate=AsyncMock(return_value=types.SimpleNamespace(completion_text="第 1 条现在有 3 个赞。")),
+        )
+        entry = module.FeedEntry(hostuin=123456, fid="fid-1", appid=311, summary="one", like_count=3)
+        plugin.controller.list_feeds = AsyncMock(return_value={"items": [asdict(entry)]})
+        plugin.controller.detail_feed = AsyncMock(return_value={"entry": asdict(entry), "comments": [], "raw": {}})
+        plugin.controller.like_post = AsyncMock(return_value={"action": "like", "liked": True})
+        event = Event([], message_str="帮我看看第一条说说的点赞数")
+
+        results = asyncio.run(
+            collect_async_generator(plugin.tool_view_post(event, target_uin=123456, selector="1", detail=True))
+        )
+
+        plugin.controller.like_post.assert_not_awaited()
+        self.assertEqual(results[0], "第 1 条现在有 3 个赞。")
 
     def test_llm_like_tool_strips_tool_error_prefix_and_rejects_unsafe_error_reply(self):
         module = self.load_main_module()

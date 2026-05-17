@@ -39,7 +39,18 @@ LLM_REPLY_FORBIDDEN_TERMS = (
     "result:",
     "[TOOL_",
     "TOOL_",
+    "qzone_",
     "qzone_like_post",
+    "qzone_comment_post",
+    "qzone_publish_post",
+    "qzone_view_post",
+    "JSON",
+    "json",
+    "Markdown",
+    "markdown",
+    "字段",
+    "fid",
+    "hostuin",
     "status_code",
     "diagnostic",
     "API",
@@ -969,6 +980,107 @@ class QzoneStablePlugin(Star):
         if detail:
             return "\n\n".join(post.detail_text(post.local_id) for post in posts)
         return "\n\n".join(post.brief(post.local_id) for post in posts)
+
+    def _event_text_has_comment_intent(self, event: AstrMessageEvent) -> bool:
+        text = self._event_text(event)
+        if not text:
+            return False
+        if re.search(r"(不要|别|先别|不用|无需).{0,4}(评论|评|回复)", text):
+            return False
+        if re.search(r"(评论区|评论列表|看.{0,6}评论|看看.{0,6}评论|查看.{0,6}评论|读.{0,6}评论)", text):
+            return False
+        return bool(
+            re.search(
+                r"(评说说|评论说说|帮.{0,8}评论|给.{0,8}评论|评论一下|评一下|评一评|"
+                r"留个言|留句话|回一句|回评|回复评论)",
+                text,
+            )
+        )
+
+    def _event_text_has_like_intent(self, event: AstrMessageEvent) -> bool:
+        text = self._event_text(event)
+        if not text:
+            return False
+        if re.search(r"(不要|别|先别|不用|无需).{0,4}(赞|点赞)", text):
+            return False
+        if re.search(r"(点赞数|赞数|谁点赞|谁赞|看.{0,6}赞|看看.{0,6}赞|查看.{0,6}赞)", text):
+            return False
+        return bool(re.search(r"(赞说说|帮.{0,8}点赞|给.{0,8}点赞|点个赞|点赞一下|赞一下)", text))
+
+    async def _comment_posts_for_tool(
+        self,
+        event: AstrMessageEvent,
+        posts: list[QzonePost],
+        *,
+        content: str = "",
+        auto_generate: bool = True,
+        private: bool = False,
+        like_after_comment: bool = False,
+    ) -> list[dict[str, Any]]:
+        if not posts:
+            raise QzoneBridgeError("没有找到可评论的说说")
+        results: list[dict[str, Any]] = []
+        for post in posts:
+            comment_text = content.strip()
+            if not comment_text and auto_generate:
+                comment_text = await self._generate_comment_text(event, post)
+            if not comment_text:
+                raise QzoneBridgeError("评论内容为空")
+            payload = await self._post_service().comment_post(post, comment_text, private=private)
+            item: dict[str, Any] = {
+                "post": QzonePostService.post_payload(post),
+                "comment": comment_text,
+                "result": payload,
+            }
+            if like_after_comment:
+                item["like_result"] = await self._post_service().like_post(post)
+            results.append(item)
+        return results
+
+    async def _ask_llm_view_reply(
+        self,
+        event: AstrMessageEvent,
+        posts: list[QzonePost],
+        *,
+        detail: bool,
+        fallback: str,
+    ) -> str:
+        if not posts:
+            return fallback
+        lines = ["下面是刚才查到的 QQ 空间说说内容，只能用这些可见信息回复用户："]
+        for post in posts[:5]:
+            index = post.local_id or 1
+            lines.append(f"第 {index} 条：{truncate(post.summary or '(空)', 220)}")
+            if detail and post.images:
+                lines.append(f"图片：{len(post.images[:9])} 张")
+            if detail and post.comments:
+                lines.append("评论：")
+                for comment in post.comments[:5]:
+                    name = comment.nickname or str(comment.uin or "用户")
+                    if comment.content:
+                        lines.append(f"- {name}: {truncate(comment.content, 80)}")
+        prompt = (
+            "\n".join(lines)
+            + "\n\n请沿用当前 AstrBot 人格和当前聊天语气，把这些内容自然告诉用户。"
+            "保留“第 N 条”这种可见编号，方便用户继续说“评论第 N 条”或“赞第 N 条”。"
+            "不要输出 JSON、Markdown 代码块、工具名、字段名、fid、hostuin、参数或内部流程。"
+        )
+        payload = {"ok": True, "tool": "qzone_view_post", "result": {"message": fallback}}
+        try:
+            text = await self._llm_adapter().generate_text(
+                event,
+                prompt,
+                system_prompt="沿用当前聊天角色和语气。你只负责把查看到的说说变成自然中文回复。",
+                prefer_current_provider=True,
+            )
+        except Exception as exc:
+            logger.debug("qzone llm view reply failed: %s", exc)
+        else:
+            if self._llm_tool_reply_is_safe(text, payload):
+                return text
+            if text:
+                logger.warning("discarded unsafe qzone llm view reply: %s", truncate(text, 300))
+        return fallback
 
     @staticmethod
     def _format_visitors(payload: dict[str, Any]) -> str:
@@ -2008,11 +2120,17 @@ class QzoneStablePlugin(Star):
         like: bool = False,
         reply: bool = False,
     ):
-        """查看、点赞、评论某位用户 QQ 空间的一条说说。"""
+        """旧版兼容工具：查看某位用户 QQ 空间的一条说说。
+
+        新流程中，点赞请优先使用 qzone_like_post；评论请优先使用 qzone_comment_post。
+        如果用户原话已经明确要评论或点赞，本兼容工具会直接完成对应动作。
+        """
         try:
             await self._ensure_cookie_ready(event)
             await self._ensure_daemon()
             hostuin = int(user_id or self._sender_id(event) or 0)
+            wants_comment = bool(reply or self._event_text_has_comment_intent(event))
+            wants_like = bool(like or self._event_text_has_like_intent(event))
             selection = PostSelection(
                 target_uin=hostuin,
                 start=(pos + 1 if pos >= 0 else -1),
@@ -2023,21 +2141,48 @@ class QzoneStablePlugin(Star):
             if not posts:
                 return "查询结果为空。"
             post = posts[0]
-            actions: list[str] = []
-            if reply:
-                content = await self._generate_comment_text(event, post)
-                if not content.strip():
-                    content = "挺有意思的。"
-                await self._post_service().comment_post(post, content.strip())
-                actions.append("已评论")
-            if like:
-                await self._post_service().like_post(post)
-                actions.append("已点赞")
-            prefix = "，".join(actions)
-            return "\n".join(part for part in (prefix, post.detail_text(post.local_id)) if part)
+            results: list[dict[str, Any]] = []
+            if wants_comment:
+                results.extend(
+                    await self._comment_posts_for_tool(
+                        event,
+                        [post],
+                        auto_generate=True,
+                        private=False,
+                        like_after_comment=wants_like,
+                    )
+                )
+            elif wants_like:
+                result = await self._post_service().like_post(post)
+                results.append({"action": "like", "result": result})
+            if results:
+                tool = "qzone_comment_post" if wants_comment else "qzone_like_post"
+                payload = {
+                    "ok": True,
+                    "tool": tool,
+                    "result": {
+                        "message": "评论发好了。" if wants_comment else "点赞点好了。",
+                        "summary": truncate(post.summary or "", 80),
+                        "count": len(results),
+                    },
+                }
+                self._log_tool_call_result({**payload, "arguments": {"user_id": user_id, "pos": pos}})
+                return await self._ask_llm_tool_reply(
+                    event,
+                    payload,
+                    "评论好了。" if wants_comment else "点好了。",
+                )
+            fallback = post.detail_text(post.local_id)
+            return await self._ask_llm_view_reply(event, [post], detail=True, fallback=fallback)
         except Exception as exc:
             logger.warning("llm_view_feed failed: %s", exc)
-            return str(getattr(exc, "message", str(exc)))
+            if isinstance(exc, QzoneBridgeError):
+                payload = self._llm_error_payload("llm_view_feed", exc)
+                fallback = self._llm_error_fallback_text(exc.message)
+            else:
+                payload = {"ok": False, "public_reason": _public_error_reason(str(exc))}
+                fallback = self._llm_error_fallback_text(str(exc))
+            return await self._ask_llm_tool_reply(event, payload, fallback)
 
     @filter.llm_tool()
     async def llm_publish_feed(
@@ -2048,7 +2193,11 @@ class QzoneStablePlugin(Star):
     ):
         """发布一条 QQ 空间说说。"""
         if not self._is_admin(event):
-            return "只有管理员可以发说说。"
+            return await self._ask_llm_tool_reply(
+                event,
+                {"ok": False, "tool": "qzone_publish_post", "public_reason": "没有权限"},
+                self._llm_error_fallback_text("没有权限"),
+            )
         post = collect_post_payload(
             event,
             fallback_content=text,
@@ -2066,8 +2215,28 @@ class QzoneStablePlugin(Star):
                 content_sanitized=True,
             )
         except QzoneBridgeError as exc:
-            return self._error_text(exc)
-        return f"已发布说说到 QQ 空间：\n{post.content}\n{format_action_result('发布结果', payload)}"
+            llm_payload = self._llm_error_payload("qzone_publish_post", exc)
+            return await self._ask_llm_tool_reply(
+                event,
+                llm_payload,
+                self._llm_error_fallback_text(exc.message),
+            )
+        log_payload = {
+            "ok": True,
+            "tool": "qzone_publish_post",
+            "arguments": {"text": truncate(post.content, 120), "media_count": len(post.media)},
+            "result": payload,
+        }
+        self._log_tool_call_result(log_payload)
+        return await self._ask_llm_tool_reply(
+            event,
+            {
+                "ok": True,
+                "tool": "qzone_publish_post",
+                "result": {"message": "说说发好了。", "summary": truncate(post.content, 80)},
+            },
+            "发好了。",
+        )
 
     @filter.llm_tool(name="qzone_get_status")
     async def tool_get_status(self, event: AstrMessageEvent):
@@ -2172,10 +2341,66 @@ class QzoneStablePlugin(Star):
                 appid=appid,
             )
             posts = await self._posts_for_selection(selection, with_detail=detail, login_uin=self._self_id(event))
+            wants_comment = self._event_text_has_comment_intent(event)
+            wants_like = self._event_text_has_like_intent(event)
+            if wants_comment or wants_like:
+                if not self._is_admin(event):
+                    payload = {
+                        "ok": False,
+                        "tool": "qzone_comment_post" if wants_comment else "qzone_like_post",
+                        "public_reason": "没有权限",
+                    }
+                    text = await self._ask_llm_tool_reply(
+                        event,
+                        payload,
+                        self._llm_error_fallback_text("没有权限"),
+                    )
+                    yield event.plain_result(text)
+                    return
+                if wants_comment:
+                    if not detail:
+                        posts = await self._posts_for_selection(selection, with_detail=True, login_uin=self._self_id(event))
+                    results = await self._comment_posts_for_tool(
+                        event,
+                        posts,
+                        auto_generate=True,
+                        private=False,
+                        like_after_comment=wants_like,
+                    )
+                    payload = {
+                        "ok": True,
+                        "tool": "qzone_comment_post",
+                        "result": {"message": "评论发好了。", "count": len(results)},
+                    }
+                    self._log_tool_call_result({**payload, "arguments": {"target_uin": target_uin, "selector": selector}})
+                    text = await self._ask_llm_tool_reply(event, payload, "评论发好了。")
+                    yield event.plain_result(text)
+                    return
+                like_payloads = [await self._post_service().like_post(post) for post in posts]
+                payload = {
+                    "ok": True,
+                    "tool": "qzone_like_post",
+                    "result": (
+                        like_payloads[0]
+                        if len(like_payloads) == 1
+                        else {"message": f"{len(like_payloads)} 条说说点好了。", "count": len(like_payloads)}
+                    ),
+                }
+                self._log_tool_call_result({**payload, "arguments": {"target_uin": target_uin, "selector": selector}})
+                text = await self._ask_llm_tool_reply(event, self._llm_like_payload(payload["result"]), "点好了。")
+                yield event.plain_result(text)
+                return
         except QzoneBridgeError as exc:
-            yield event.plain_result(self._error_text(exc))
+            text = await self._ask_llm_tool_reply(
+                event,
+                self._llm_error_payload("qzone_view_post", exc),
+                self._llm_error_fallback_text(exc.message),
+            )
+            yield event.plain_result(text)
             return
-        yield event.plain_result(self._format_posts(posts, detail=detail))
+        fallback = self._format_posts(posts, detail=detail)
+        text = await self._ask_llm_view_reply(event, posts, detail=detail, fallback=fallback)
+        yield event.plain_result(text)
 
     @filter.llm_tool(name="qzone_publish_post")
     async def tool_publish_post(
@@ -2194,7 +2419,12 @@ class QzoneStablePlugin(Star):
             sync_weibo (boolean): 是否同步到微博。
         """
         if not self._is_admin(event):
-            yield event.plain_result("只有管理员可以发说说。")
+            text = await self._ask_llm_tool_reply(
+                event,
+                {"ok": False, "tool": "qzone_publish_post", "public_reason": "没有权限"},
+                self._llm_error_fallback_text("没有权限"),
+            )
+            yield event.plain_result(text)
             return
         post = collect_post_payload(
             event,
@@ -2206,12 +2436,19 @@ class QzoneStablePlugin(Star):
         if self.settings.preview_writes and not confirm:
             draft = truncate(post.content or "空内容", 120)
             suffix = f"，附带 {len(post.media)} 个媒体" if post.media else ""
-            yield event.plain_result(f"发布预览: {draft}{suffix}。确认后再发布。")
+            text = await self._ask_llm_tool_reply(
+                event,
+                {
+                    "ok": True,
+                    "tool": "qzone_publish_post",
+                    "result": {"message": f"这条还在预览里：{draft}{suffix}"},
+                },
+                f"这条先给你留在预览里：{draft}{suffix}。",
+            )
+            yield event.plain_result(text)
             return
-        profile_task: asyncio.Task | None = None
         try:
             await self._ensure_cookie_ready(event)
-            profile_task = self._schedule_publisher_profile(event)
             payload = await self.controller.publish_post(
                 content=post.content,
                 sync_weibo=sync_weibo,
@@ -2219,11 +2456,30 @@ class QzoneStablePlugin(Star):
                 content_sanitized=True,
             )
         except QzoneBridgeError as exc:
-            if profile_task is not None:
-                profile_task.cancel()
-            yield event.plain_result(self._error_text(exc))
+            text = await self._ask_llm_tool_reply(
+                event,
+                self._llm_error_payload("qzone_publish_post", exc),
+                self._llm_error_fallback_text(exc.message),
+            )
+            yield event.plain_result(text)
             return
-        yield await self._publish_result(event, post, payload, profile_task=profile_task)
+        log_payload = {
+            "ok": True,
+            "tool": "qzone_publish_post",
+            "arguments": {"content": truncate(post.content, 120), "media_count": len(post.media)},
+            "result": payload,
+        }
+        self._log_tool_call_result(log_payload)
+        text = await self._ask_llm_tool_reply(
+            event,
+            {
+                "ok": True,
+                "tool": "qzone_publish_post",
+                "result": {"message": "说说发好了。", "summary": truncate(post.content, 80)},
+            },
+            "发好了。",
+        )
+        yield event.plain_result(text)
 
     @filter.llm_tool(name="qzone_comment_post")
     async def tool_comment_post(
@@ -2299,19 +2555,14 @@ class QzoneStablePlugin(Star):
                 with_detail=auto_generate and not content.strip(),
                 login_uin=self._self_id(event),
             )
-            if not posts:
-                raise QzoneBridgeError("没有找到可评论的说说")
-            results: list[dict[str, Any]] = []
-            for post in posts:
-                comment_text = content.strip()
-                if not comment_text and auto_generate:
-                    comment_text = await self._generate_comment_text(event, post)
-                if not comment_text:
-                    raise QzoneBridgeError("评论内容为空")
-                payload = await self._post_service().comment_post(post, comment_text, private=private)
-                results.append({"post": QzonePostService.post_payload(post), "comment": comment_text, "result": payload})
-                if like_after_comment:
-                    await self._post_service().like_post(post)
+            results = await self._comment_posts_for_tool(
+                event,
+                posts,
+                content=content,
+                auto_generate=auto_generate,
+                private=private,
+                like_after_comment=like_after_comment,
+            )
         except QzoneBridgeError as exc:
             log_payload = self._bridge_error_log_payload("qzone_comment_post", exc, arguments)
             self._log_tool_call_result(log_payload)
