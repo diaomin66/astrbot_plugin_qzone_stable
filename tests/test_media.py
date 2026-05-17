@@ -23,6 +23,13 @@ class File:
         self.name = name
 
 
+class Reply:
+    type = "reply"
+
+    def __init__(self, message):
+        self.message = message
+
+
 class ObjText:
     type = "text"
 
@@ -358,6 +365,68 @@ class MediaPayloadTests(unittest.TestCase):
 
         self.assertEqual(payload.content, "")
         self.assertEqual(len(payload.media), 1)
+
+    def test_collects_image_from_reply_component_without_reply_text(self):
+        payload = collect_post_payload(
+            self.event([Plain("帮我发这张图"), Reply([Plain("原图说明"), Image(url="https://example.com/quoted.png")])]),
+            fallback_content="配文",
+            include_event_text=False,
+        )
+
+        self.assertEqual(payload.content, "配文")
+        self.assertEqual(len(payload.media), 1)
+        self.assertEqual(payload.media[0].source, "https://example.com/quoted.png")
+
+    def test_collects_image_from_message_object_quote(self):
+        event = self.event([Plain("发说说 这张")])
+        event.message_obj.quote = types.SimpleNamespace(message=[Plain("原图说明"), Image(url="https://example.com/q.png")])
+
+        payload = collect_post_payload(
+            event,
+            include_event_text=True,
+            command_prefixes=("发说说",),
+        )
+
+        self.assertEqual(payload.content, "这张")
+        self.assertEqual(len(payload.media), 1)
+        self.assertEqual(payload.media[0].source, "https://example.com/q.png")
+
+    def test_collects_image_from_dict_reply_component(self):
+        payload = collect_post_payload(
+            self.event(
+                [
+                    {"type": "text", "data": {"text": "发说说"}},
+                    {
+                        "type": "reply",
+                        "data": {
+                            "message": [
+                                {"type": "image", "data": {"url": "https://example.com/dict.png"}},
+                            ]
+                        },
+                    },
+                ]
+            ),
+            include_event_text=True,
+            command_prefixes=("发说说",),
+        )
+
+        self.assertEqual(payload.content, "")
+        self.assertEqual(len(payload.media), 1)
+        self.assertEqual(payload.media[0].source, "https://example.com/dict.png")
+
+    def test_deduplicates_image_seen_in_message_and_reply(self):
+        payload = collect_post_payload(
+            self.event(
+                [
+                    Image(url="https://example.com/same.png"),
+                    Reply([Image(url="https://example.com/same.png")]),
+                ]
+            ),
+            include_event_text=False,
+        )
+
+        self.assertEqual(len(payload.media), 1)
+        self.assertEqual(payload.media[0].source, "https://example.com/same.png")
 
 
 if __name__ == "__main__":

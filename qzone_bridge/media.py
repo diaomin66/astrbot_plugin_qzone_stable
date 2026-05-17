@@ -15,6 +15,34 @@ QZONE_MAX_IMAGES = 9
 QZONE_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 TEXT_KINDS = {"plain", "text"}
 MEDIA_KINDS = {"image", "file", "video", "record", "audio", "voice"}
+REFERENCE_KINDS = {"reply", "quote", "quoted", "reference"}
+REFERENCE_OWNER_KEYS = (
+    "quote",
+    "quoted",
+    "quoted_message",
+    "reply",
+    "reply_message",
+    "reply_msg",
+    "referenced",
+    "referenced_message",
+    "reference",
+    "origin",
+    "original",
+    "original_message",
+    "source_message",
+)
+MESSAGE_CHAIN_KEYS = (
+    "message",
+    "messages",
+    "chain",
+    "message_chain",
+    "raw_message",
+    "raw_messages",
+    "message_list",
+    "message_segments",
+)
+REFERENCE_MEDIA_KEYS = ("image", "images", "media", "medias", "attachment", "attachments", "files")
+REFERENCE_MAX_DEPTH = 6
 COMPONENT_STRING_RE = re.compile(r"\b(?:Image|Video|File|Record|Plain)\s*\(|\[CQ:(?:image|video|file|record)\b", re.I)
 COMMAND_SEPARATOR_CHARS = ":\uFF1A,\uFF0C;\uFF1B"
 COMMAND_PREFIX_CHARS = "/\uFF0F!\uFF01#\uFF03.\uFF0E\u3002~\uFF5E?\uFF1F"
@@ -158,12 +186,12 @@ def normalize_media_item(item: Any, *, default_kind: str = "file") -> PostMedia 
     return None
 
 
-def normalize_media_list(items: Iterable[Any] | None) -> list[PostMedia]:
+def normalize_media_list(items: Iterable[Any] | None, *, default_kind: str = "file") -> list[PostMedia]:
     if isinstance(items, (str, dict, PostMedia)):
         items = [items]
     media: list[PostMedia] = []
     for item in items or []:
-        normalized = normalize_media_item(item)
+        normalized = normalize_media_item(item, default_kind=default_kind)
         if normalized:
             media.append(normalized)
     return media
@@ -222,6 +250,14 @@ def _component_kind(component: Any) -> str:
         "record": "record",
         "voice": "audio",
         "audio": "audio",
+        "reply": "reply",
+        "replymessage": "reply",
+        "reply_message": "reply",
+        "quote": "quote",
+        "quotemessage": "quote",
+        "quote_message": "quote",
+        "quoted": "quote",
+        "reference": "reference",
     }
     return aliases.get(kind, kind)
 
@@ -253,6 +289,35 @@ def _component_mapping(component: Any) -> dict[str, Any]:
         if hasattr(component, attr):
             data[attr] = getattr(component, attr)
     return data
+
+
+def _mapping_value(owner: Any, key: str) -> Any:
+    if owner is None:
+        return None
+    if isinstance(owner, dict):
+        if key in owner:
+            return owner.get(key)
+        data = owner.get("data")
+        if isinstance(data, dict):
+            return data.get(key)
+        return None
+    if hasattr(owner, key):
+        return getattr(owner, key)
+    data = getattr(owner, "data", None)
+    if isinstance(data, dict):
+        return data.get(key)
+    return None
+
+
+def _iter_mapping_values(owner: Any, keys: Iterable[str]) -> Iterable[Any]:
+    for key in keys:
+        value = _mapping_value(owner, key)
+        if value not in (None, "", [], (), {}):
+            yield value
+
+
+def _is_traversable_reference_value(value: Any) -> bool:
+    return value is not None and not isinstance(value, (str, bytes, bytearray, int, float, bool))
 
 
 def _component_text(component: Any) -> str:
@@ -347,6 +412,105 @@ def iter_event_components(event: Any) -> list[Any]:
     return []
 
 
+def _media_from_reference_field(value: Any, *, key: str) -> list[PostMedia]:
+    if value in (None, "", [], (), {}):
+        return []
+    default_kind = "image" if key in {"image", "images"} else "file"
+    if isinstance(value, dict):
+        values: Iterable[Any] = [value]
+    elif isinstance(value, (list, tuple, set)):
+        values = value
+    else:
+        values = [value]
+    return normalize_media_list(values, default_kind=default_kind)
+
+
+def _collect_referenced_media(value: Any, *, seen: set[int], depth: int = 0) -> list[PostMedia]:
+    if depth > REFERENCE_MAX_DEPTH or not _is_traversable_reference_value(value):
+        return []
+
+    marker = id(value)
+    if marker in seen:
+        return []
+    seen.add(marker)
+
+    media: list[PostMedia] = []
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            media.extend(_collect_referenced_media(item, seen=seen, depth=depth + 1))
+        return media
+
+    kind = _component_kind(value)
+    if kind in MEDIA_KINDS:
+        item = _component_media(value, kind)
+        if item:
+            media.append(item)
+
+    for key in REFERENCE_MEDIA_KEYS:
+        for nested in _iter_mapping_values(value, (key,)):
+            media.extend(_media_from_reference_field(nested, key=key))
+
+    for nested in _iter_mapping_values(value, MESSAGE_CHAIN_KEYS):
+        if _is_traversable_reference_value(nested):
+            media.extend(_collect_referenced_media(nested, seen=seen, depth=depth + 1))
+
+    for nested in _iter_mapping_values(value, REFERENCE_OWNER_KEYS):
+        if _is_traversable_reference_value(nested):
+            media.extend(_collect_referenced_media(nested, seen=seen, depth=depth + 1))
+
+    return media
+
+
+def iter_referenced_media(event: Any) -> list[PostMedia]:
+    """Return media attached to quoted/replied messages without importing their text."""
+
+    seen: set[int] = set()
+    media: list[PostMedia] = []
+    message_obj = getattr(event, "message_obj", None)
+    for owner in (message_obj, event):
+        for value in _iter_mapping_values(owner, REFERENCE_OWNER_KEYS):
+            media.extend(_collect_referenced_media(value, seen=seen))
+
+    raw = getattr(message_obj, "raw_message", None) or getattr(event, "raw_message", None)
+    if _is_traversable_reference_value(raw):
+        media.extend(_collect_referenced_media(raw, seen=seen))
+
+    for component in iter_event_components(event):
+        kind = _component_kind(component)
+        if kind in REFERENCE_KINDS:
+            media.extend(_collect_referenced_media(component, seen=seen))
+            continue
+        for value in _iter_mapping_values(component, REFERENCE_OWNER_KEYS):
+            media.extend(_collect_referenced_media(value, seen=seen))
+
+    return media
+
+
+def _media_dedupe_key(item: PostMedia) -> tuple[str, str]:
+    return (item.kind, item.source)
+
+
+def _append_collected_media(
+    item: PostMedia,
+    *,
+    media: list[PostMedia],
+    attachments: list[PostMedia],
+    reference_parts: list[str],
+    seen: set[tuple[str, str]],
+    add_attachment_reference: bool,
+) -> None:
+    key = _media_dedupe_key(item)
+    if key in seen:
+        return
+    seen.add(key)
+    if item.kind == "image":
+        media.append(item)
+        return
+    attachments.append(item)
+    if add_attachment_reference:
+        reference_parts.append(media_reference_text(item))
+
+
 def _strip_leading_command_noise(text: str) -> tuple[str, bool]:
     stripped_noise = False
     value = text.lstrip(LEADING_SPACE_CHARS)
@@ -429,6 +593,7 @@ def collect_post_payload(
     reference_parts: list[str] = []
     media: list[PostMedia] = []
     attachments: list[PostMedia] = []
+    seen_media: set[tuple[str, str]] = set()
     first_text = True
     event_prefix_stripped = False
     components = iter_event_components(event)
@@ -451,18 +616,34 @@ def collect_post_payload(
             item = _component_media(component, kind)
             if not item:
                 continue
-            if item.kind == "image":
-                media.append(item)
-            else:
-                attachments.append(item)
-                reference_parts.append(media_reference_text(item))
+            _append_collected_media(
+                item,
+                media=media,
+                attachments=attachments,
+                reference_parts=reference_parts,
+                seen=seen_media,
+                add_attachment_reference=True,
+            )
+
+    for item in iter_referenced_media(event):
+        _append_collected_media(
+            item,
+            media=media,
+            attachments=attachments,
+            reference_parts=reference_parts,
+            seen=seen_media,
+            add_attachment_reference=True,
+        )
 
     for item in normalize_media_list(extra_media):
-        if item.kind == "image":
-            media.append(item)
-        else:
-            attachments.append(item)
-            reference_parts.append(media_reference_text(item))
+        _append_collected_media(
+            item,
+            media=media,
+            attachments=attachments,
+            reference_parts=reference_parts,
+            seen=seen_media,
+            add_attachment_reference=True,
+        )
     if include_event_text and command_prefixes and event_text:
         event_content = strip_command_prefix(event_text, command_prefixes).strip()
         if event_content != event_text.strip():
