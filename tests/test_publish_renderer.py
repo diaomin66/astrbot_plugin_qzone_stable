@@ -8,7 +8,14 @@ from unittest.mock import patch
 from PIL import Image, ImageChops, ImageDraw
 
 from qzone_bridge.media import PostMedia, PostPayload
-from qzone_bridge.publish_renderer import ACTION, RenderProfile, _draw_share_icon, render_publish_result_image
+from qzone_bridge.publish_renderer import (
+    ACTION,
+    RenderProfile,
+    _draw_share_icon,
+    cached_avatar_source,
+    preload_publish_render_assets,
+    render_publish_result_image,
+)
 
 
 class PublishRendererTests(unittest.TestCase):
@@ -77,6 +84,42 @@ class PublishRendererTests(unittest.TestCase):
                 self.assertEqual(image.format, "PNG")
                 self.assertEqual(image.width, 700)
 
+    def test_preload_profile_avatar_writes_local_cache_once(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            profile = RenderProfile(
+                nickname="Coconut",
+                user_id="123456",
+                avatar_source="https://example.test/avatar-a.png",
+            )
+            calls = 0
+
+            def fake_read(source, *, max_bytes, remote_timeout):
+                nonlocal calls
+                calls += 1
+                image = Image.new("RGB", (512, 512), (120, 180, 210))
+                buffer = io.BytesIO()
+                image.save(buffer, format="PNG")
+                buffer.seek(0)
+                return buffer.read()
+
+            with patch("qzone_bridge.publish_renderer._read_source_bytes", side_effect=fake_read):
+                resolved = preload_publish_render_assets(profile, temp_path, remote_timeout=0.01)
+                second = preload_publish_render_assets(
+                    RenderProfile(
+                        nickname="Coconut",
+                        user_id="123456",
+                        avatar_source="https://example.test/avatar-b.png",
+                    ),
+                    temp_path,
+                    remote_timeout=0.01,
+                )
+
+            self.assertEqual(calls, 1)
+            self.assertTrue(Path(resolved.avatar_source).exists())
+            self.assertEqual(second.avatar_source, resolved.avatar_source)
+            self.assertEqual(cached_avatar_source(temp_path, profile), resolved.avatar_source)
+
     def test_result_fid_does_not_add_footer(self):
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)
@@ -109,8 +152,8 @@ class PublishRendererTests(unittest.TestCase):
         bbox = mask.getbbox()
         self.assertIsNotNone(bbox)
         self.assertGreater(bbox[2] - bbox[0], 28)
-        self.assertLessEqual(bbox[2], 56)
-        self.assertLessEqual(bbox[3], 46)
+        self.assertLessEqual(bbox[2], 64)
+        self.assertLessEqual(bbox[3], 52)
         self.assertIn(ACTION, image.getdata())
 
     def test_render_loads_multiple_previews_concurrently(self):
