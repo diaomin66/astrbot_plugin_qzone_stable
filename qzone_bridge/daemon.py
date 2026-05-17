@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 
 from aiohttp import web
 
-from .astrbot_logging import configure_standalone_logging, logger as log
+from .astrbot_logging import configure_standalone_logging, get_logger
 from .client import QzoneClient
 from .errors import QzoneAuthError, QzoneBridgeError, QzoneNeedsRebind, QzoneParseError, QzoneRequestError
 from .media import (
@@ -37,6 +37,8 @@ from .selection import NUMERIC_FID_MIN_LENGTH
 from .social import extract_comments
 from .storage import StateStore, ensure_state_secret
 from .utils import now_iso, from_iso
+
+log = get_logger(__name__)
 LIKE_VERIFY_RETRY_DELAYS_SECONDS = (0.35, 0.85, 1.6)
 TRUE_TEXT_VALUES = {"1", "true", "yes", "y", "on"}
 FALSE_TEXT_VALUES = {"0", "false", "no", "n", "off", ""}

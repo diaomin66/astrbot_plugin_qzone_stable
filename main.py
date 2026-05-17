@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import inspect
 import importlib
 import json
@@ -11,17 +12,21 @@ import re
 import shutil
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, StarTools
+from astrbot.api.star import Context, Star
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
-PLUGIN_DATA_NAME = "astrbot_plugin_qzone_ultra"
+PLUGIN_DATA_NAME_FALLBACK = "astrbot_plugin_qzone_ultra"
+LEGACY_MIGRATION_FILES = ("state.json", "drafts.json", "posts.json")
+LEGACY_MIGRATION_SENTINEL = ".legacy-qzone-migration.json"
+LEGACY_MIGRATION_LOCK = ".legacy-qzone-migration.lock"
 
 SENSITIVE_LOG_KEYS = {
     "cookie",
@@ -221,6 +226,127 @@ def _prepare_local_qzone_bridge_imports() -> None:
             sys.modules.pop(name, None)
 
 
+def _chmod_private(path: Path) -> None:
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _chmod_private_dir(path: Path) -> None:
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
+def _path_contains(parent: Path, child: Path) -> bool:
+    try:
+        child.resolve(strict=False).relative_to(parent.resolve(strict=False))
+        return True
+    except Exception:
+        return False
+
+
+@contextmanager
+def _migration_lock(data_dir: Path) -> Iterator[None]:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    _chmod_private_dir(data_dir)
+    lock_path = data_dir / LEGACY_MIGRATION_LOCK
+    with lock_path.open("a+b") as lock_file:
+        lock_file.seek(0)
+        if not lock_file.read(1):
+            lock_file.write(b"\0")
+            lock_file.flush()
+        lock_file.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _read_plugin_name(plugin_root: Path) -> str:
+    metadata = plugin_root / "metadata.yaml"
+    try:
+        for line in metadata.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("name:"):
+                continue
+            value = stripped.split(":", 1)[1].strip().strip("'\"")
+            if value:
+                return value
+    except Exception:
+        pass
+    return PLUGIN_DATA_NAME_FALLBACK
+
+
+def _star_tools_data_dir(plugin_name: str) -> Path | None:
+    try:
+        from astrbot.api.star import StarTools
+    except ImportError as exc:
+        logger.warning("qzone StarTools unavailable; using legacy data dir: %s", exc)
+        return None
+    try:
+        return Path(StarTools.get_data_dir(plugin_name))
+    except Exception as exc:
+        logger.warning("qzone StarTools data dir unavailable; using legacy data dir: %s", exc)
+        return None
+
+
+def _safe_copy_legacy_file(source: Path, target: Path, *, legacy_root: Path, data_dir: Path) -> str:
+    if source.is_symlink():
+        return "skipped_symlink"
+    if not source.is_file():
+        return "skipped_not_file"
+    if not _path_contains(legacy_root, source):
+        return "skipped_source_outside_legacy"
+    if not _path_contains(data_dir, target):
+        return "skipped_target_outside_data_dir"
+    if target.exists():
+        return "skipped_target_exists"
+    tmp = target.with_name(f"{target.name}.tmp.{int(time.time() * 1000)}.{random.randrange(1000000):06d}")
+    try:
+        shutil.copyfile(source, tmp)
+        _chmod_private(tmp)
+        tmp.replace(target)
+        _chmod_private(target)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+    return "copied"
+
+
+def _write_json_private(path: Path, payload: dict[str, Any]) -> None:
+    tmp = path.with_name(f"{path.name}.tmp.{int(time.time() * 1000)}.{random.randrange(1000000):06d}")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        _chmod_private(tmp)
+        tmp.replace(path)
+        _chmod_private(path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+
+
 def _migrate_legacy_data_dir(legacy_dir: Path, data_dir: Path) -> None:
     try:
         legacy = legacy_dir.resolve()
@@ -232,26 +358,64 @@ def _migrate_legacy_data_dir(legacy_dir: Path, data_dir: Path) -> None:
         return
     try:
         data_dir.mkdir(parents=True, exist_ok=True)
+        _chmod_private_dir(data_dir)
     except Exception as exc:
         logger.warning("qzone standard data dir is not writable: %s", exc)
         return
-    for item in legacy_dir.iterdir():
-        if item.name in {"__pycache__", ".pytest_cache"}:
-            continue
-        target_item = data_dir / item.name
-        if target_item.exists():
-            continue
-        try:
-            if item.is_dir():
-                shutil.copytree(item, target_item)
-            elif item.is_file():
-                shutil.copy2(item, target_item)
-        except Exception as exc:
-            logger.warning("qzone legacy data migration skipped %s: %s", item.name, exc)
+    try:
+        with _migration_lock(data_dir):
+            sentinel = data_dir / LEGACY_MIGRATION_SENTINEL
+            if sentinel.exists():
+                try:
+                    marker = json.loads(sentinel.read_text(encoding="utf-8"))
+                    if isinstance(marker, dict) and marker.get("complete") is True:
+                        return
+                except Exception:
+                    pass
+            results: dict[str, str] = {}
+            for name in LEGACY_MIGRATION_FILES:
+                source = legacy_dir / name
+                if not source.exists():
+                    results[name] = "skipped_missing"
+                    continue
+                try:
+                    results[name] = _safe_copy_legacy_file(
+                        source,
+                        data_dir / name,
+                        legacy_root=legacy_dir,
+                        data_dir=data_dir,
+                    )
+                except Exception as exc:
+                    results[name] = f"failed_{type(exc).__name__}"
+                    logger.warning("qzone legacy data migration skipped %s: %s", name, exc)
+            payload = {
+                "complete": not any(status.startswith("failed_") for status in results.values()),
+                "completed_at": datetime.now().isoformat(timespec="seconds"),
+                "legacy_dir": str(legacy_dir),
+                "data_dir": str(data_dir),
+                "files": results,
+                "legacy_cleanup_recommended": True,
+            }
+            _write_json_private(sentinel, payload)
+            try:
+                (legacy_dir / ".migrated-to-astrbot-data").write_text(
+                    f"Copied supported Qzone data files to {data_dir} at {payload['completed_at']}.\n"
+                    "Review the standard data directory, then remove old sensitive files here if no rollback is needed.\n",
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+            if any(status == "copied" for status in results.values()):
+                logger.warning("qzone legacy data copied to AstrBot data dir; review and remove old data/qzone when safe")
+    except Exception as exc:
+        logger.warning("qzone legacy data migration failed: %s", exc)
 
 
 def _standard_data_dir(plugin_root: Path) -> Path:
-    data_dir = Path(StarTools.get_data_dir(PLUGIN_DATA_NAME))
+    plugin_name = _read_plugin_name(plugin_root)
+    data_dir = _star_tools_data_dir(plugin_name)
+    if data_dir is None:
+        return plugin_root / "data" / "qzone"
     _migrate_legacy_data_dir(plugin_root / "data" / "qzone", data_dir)
     return data_dir
 

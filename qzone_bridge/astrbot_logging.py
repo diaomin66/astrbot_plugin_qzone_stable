@@ -5,14 +5,25 @@ from __future__ import annotations
 import os
 
 try:
-    from astrbot.api import logger
+    from astrbot.api import logger as _astrbot_logger
 
     USING_ASTRBOT_LOGGER = True
-except Exception:
+except ImportError:
     import logging
 
-    logger = logging.getLogger("qzone_bridge")
+    _astrbot_logger = None
     USING_ASTRBOT_LOGGER = False
+
+
+def get_logger(name: str = "qzone_bridge"):
+    if USING_ASTRBOT_LOGGER and _astrbot_logger is not None:
+        return _astrbot_logger
+    import logging
+
+    return logging.getLogger(name)
+
+
+logger = get_logger("qzone_bridge")
 
 
 def configure_standalone_logging(default_level: str = "INFO") -> None:
