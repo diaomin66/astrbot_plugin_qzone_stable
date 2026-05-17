@@ -82,7 +82,7 @@ class _ImagePreview:
 
 
 def preload_static_render_assets() -> None:
-    """Warm fonts and cached action glyphs before the first publish render."""
+    """Warm fonts and the static action-strip image before the first publish render."""
 
     for size, bold in ((28, True), (24, False), (20, False), (18, False), (17, False), (34, True)):
         _font(size, bold=bold)
@@ -875,11 +875,6 @@ def _draw_comment_box(
     radius = max(10, height // 2)
     draw.rounded_rectangle((x, y, x + width, y + height), radius=radius, fill=COMMENT_BG, outline=LINE, width=1)
     _safe_text(draw, (x + 20, y + 14), "\u8bc4\u8bba", font, MUTED)
-    camera_x = x + width - 52
-    camera_y = y + 13
-    draw.rounded_rectangle((camera_x, camera_y + 8, camera_x + 30, camera_y + 26), radius=4, outline=ACTION, width=2)
-    draw.rectangle((camera_x + 9, camera_y + 4, camera_x + 21, camera_y + 10), outline=ACTION, width=2)
-    draw.ellipse((camera_x + 10, camera_y + 12, camera_x + 20, camera_y + 22), outline=ACTION, width=2)
 
 
 def _prune_output_dir(output_dir: Path, *, keep: int = 128, max_age_seconds: int = 3 * 24 * 3600) -> None:
